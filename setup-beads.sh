@@ -17,6 +17,12 @@
 #     snapstore-types (incl. error enum), synthgen, and the clippy CI gate. The fio
 #     baseline, healthz/metrics stub, config loader, JSON tracing, and nightly scaffold
 #     are parallel M0 work that must NOT block M1.
+#   - Reviewed 2026-06-09 by two independent agents; applied fixes: skeleton bead
+#     ordered after dependency pinning (shared root Cargo.toml), module skeletons +
+#     snapstore-tests dev-deps pre-wired in M0 to kill the src/lib.rs and Cargo.toml
+#     merge seams, per-test-file reservations in crates/snapstore-tests, fuzz dir
+#     disambiguated to repo root, and description corrections (10 crates, GetNode,
+#     commit/resolve histograms, re-prune semantics flagged as a decision).
 
 set -euo pipefail
 
@@ -31,12 +37,13 @@ echo "Creating snapshot-store Phase 1 (M0-M3) beads..."
 # ============================================================
 
 M0_CRATES=$(bd create "Add skeleton crates: pagestore, meta, localpath, cli, tests" \
-  -d 'Create crates/snapstore-pagestore, crates/snapstore-meta, crates/snapstore-localpath, crates/snapstore-cli, and crates/snapstore-tests (workspace-member integration-test crate; a bare root tests/ dir is NOT a Cargo compile target). Each crate: Cargo.toml inheriting workspace edition/version/license, stub lib.rs (main.rs for cli) that compiles clean under clippy -D warnings. snapstore-cli is minimal: its only working M0 subcommand will be bench fio-baseline (separate bead); the full snapstorectl subcommand set is an M4 deliverable (deliberate carve-out). Respect dependency rules: types <- {pagestore, manifest, meta, localpath} <- server; pagestore and meta know nothing about gRPC. Do NOT create a local proto file - determinism-proto from ../control-plane is the canonical seam. Ref: ARCHITECTURE.md section 1. Reserves: crates/**, Cargo.toml.' \
+  -d 'Create crates/snapstore-pagestore, crates/snapstore-meta, crates/snapstore-localpath, crates/snapstore-cli, and crates/snapstore-tests (workspace-member integration-test crate; a bare root tests/ dir is NOT a Cargo compile target). Each crate: Cargo.toml inheriting workspace edition/version/license, stub lib.rs (main.rs for cli) that compiles clean under clippy -D warnings. The workspace members glob crates/* picks new crates up automatically - do NOT edit the root Cargo.toml; the dependency-pinning bead owns it and this bead depends on it. Pre-declare module skeletons (mod lines + empty stub files) so later parallel beads never edit src/lib.rs concurrently: pagestore (root, pack, sidecar, index, writer, rebuild, ingest, manifest_io, commit, resolve) and meta (schema, actor, counter, logs, nodes, queries, updates, kv, prune). Pre-wire crates/snapstore-tests/Cargo.toml dev-dependencies on snapstore-types, snapstore-pagestore, snapstore-manifest, and snapstore-meta so AC-test beads only add files under crates/snapstore-tests/tests/ (the synthgen bead adds its own dev-dep line). snapstore-cli is minimal: its only working M0 subcommand will be bench fio-baseline (separate bead); the full snapstorectl subcommand set is an M4 deliverable (deliberate carve-out). Respect dependency rules: types <- {pagestore, manifest, meta, localpath} <- server; pagestore and meta know nothing about gRPC. Do NOT create a local proto file - determinism-proto from ../control-plane is the canonical seam. Ref: ARCHITECTURE.md section 1. Reserves: crates/snapstore-pagestore/**, crates/snapstore-meta/**, crates/snapstore-localpath/**, crates/snapstore-cli/**, crates/snapstore-tests/** - NOT the root Cargo.toml and NOT crates/snapstore-types.' \
   -p 0 -l m0 --silent)
 
 M0_PIN=$(bd create "Pin key dependencies in [workspace.dependencies]" \
   -d 'Workspace Cargo.toml currently pins only determinism-proto - this is an explicit task, not done state. Add pinned versions for: tokio (rt-multi-thread), rusqlite (bundled SQLite, serde_json feature OFF), blake3 (rayon feature for batch hashing), zstd, postcard, serde, tracing + tracing-subscriber (json), prometheus, nix, crossbeam-channel, parking_lot, hashbrown, crc32c, toml; dev-deps: proptest, criterion. tonic/prost transport enters at M4. Ref: ARCHITECTURE.md section 1 key-dependency list, plan Technical Stack. Reserves: Cargo.toml, Cargo.lock.' \
   -p 0 -l m0 --silent)
+bd dep add "$M0_CRATES" "$M0_PIN"
 
 M0_TYPES=$(bd create "Complete snapstore-types incl. library error enum" \
   -d 'Per ARCHITECTURE.md section 1 core types: PageHash([u8;32] BLAKE3-256 of exactly 4096 bytes), SnapshotRef, LogId, NodeId (caller-assigned u64, root=0), ExperimentId (1..=128 UTF-8 bytes, validated), PAGE_SIZE=4096, NodeStatus (Frontier/Expanded/Pruned/Goal), PackLoc{pack_id,offset}. Keep the existing re-export of determinism_proto snapstore v1 NodeMeta. LIBRARY ERROR ENUM with documented 1:1 mapping to eventual gRPC codes: InvalidArgument, NotFound, AlreadyExists (CreateNode key reuse), FailedPrecondition carrying structured details (MissingPages{page_hashes,parent_ref}, MissingNodes{node_ids}, CurrentGeneration{generation}, pruned-parent/root conflicts, CAS mismatch), ResourceExhausted, Unavailable. M2/M3 acceptance tests assert these library errors; gRPC statuses do not exist until M4. Unit tests for invariants and detail payloads. Ref: API.md section 1.7. Reserves: crates/snapstore-types/**.' \
@@ -44,9 +51,10 @@ M0_TYPES=$(bd create "Complete snapstore-types incl. library error enum" \
 bd dep add "$M0_TYPES" "$M0_PIN"
 
 M0_SYNTHGEN=$(bd create "Build snapstore-synthgen deterministic guest generator" \
-  -d 'New workspace library crate crates/snapstore-synthgen (NOT a bare root tests/ dir - that is not a Cargo compile target). Deterministic 128 MiB guest images seeded by u64 (seeded PRNG, no ambient randomness or time), plus seeded burst mutation dirtying 256-2048 random-but-seeded pages per burst. API: generate image, iterate (page_index, page bytes), apply burst returning the dirty page set; helpers to emit page batches for ingest tests and entry lists for manifest tests. Consumed as a dev-dependency by all downstream M1-M3 test work; zero hypervisor dependency anywhere in this phase. CI AC test: same u64 seed produces bit-identical guests and identical burst sequences. Reserves: crates/snapstore-synthgen/**.' \
+  -d 'New workspace library crate crates/snapstore-synthgen (NOT a bare root tests/ dir - that is not a Cargo compile target). Deterministic 128 MiB guest images seeded by u64 (seeded PRNG, no ambient randomness or time), plus seeded burst mutation dirtying 256-2048 random-but-seeded pages per burst. API: generate image, iterate (page_index, page bytes), apply burst returning the dirty page set; helpers to emit page batches for ingest tests and entry lists for manifest tests. Consumed as a dev-dependency by all downstream M1-M3 test work; zero hypervisor dependency anywhere in this phase. CI AC test: same u64 seed produces bit-identical guests and identical burst sequences. Also add snapstore-synthgen as a dev-dependency of crates/snapstore-tests (the other dev-deps are pre-wired by the skeleton bead). Reserves: crates/snapstore-synthgen/**, plus the single snapstore-synthgen dev-dep line in crates/snapstore-tests/Cargo.toml.' \
   -p 0 -l m0 --silent)
 bd dep add "$M0_SYNTHGEN" "$M0_TYPES"
+bd dep add "$M0_SYNTHGEN" "$M0_CRATES"
 
 M0_CONFIG=$(bd create "config.toml loader in snapstore-server" \
   -d 'Config loading per ARCHITECTURE.md section 9 defaults: data_root, grpc_tcp_addr, grpc_uds_path, page_channel_path, http_addr; [pagestore] pack_max_bytes/ingest_queue_pages/ingest_hash_threads/flatten_cache_entries/mmap_sealed_packs; [meta] input_log_max_bytes (4 MiB)/metadata_value_max_bytes (16 MiB)/read_connections/write_batch_max; [gc]; [backup]. serde+toml, defaults applied for absent fields, loud typed errors on invalid values. Unit tests. Parallel M0 work - must NOT block M1 or the M0 gate. Reserves: crates/snapstore-server/src/config*.' \
@@ -79,7 +87,7 @@ M0_NIGHTLY=$(bd create "Nightly CI workflow scaffold" \
 bd dep add "$M0_NIGHTLY" "$M0_CLIPPY"
 
 M0_GATE=$(bd create "M0 acceptance gate: CI-correctness ACs green" \
-  -d 'Verify in hosted CI: workspace builds all 9 crates; fmt + clippy -D warnings + tests green; synthgen bit-identical AC test passes. Deliberately excludes (minimal M0->M1 edge set): fio baseline (manual Intel-box, label bench, non-blocking), healthz/metrics stub, config loader, JSON tracing, nightly scaffold - parallel M0 work verified before a human declares M0 closed, never blockers. ALL M1 beads depend on this gate and on nothing else in M0.' \
+  -d 'Verify in hosted CI: workspace builds all 10 crates (4 pre-existing + 5 skeletons + synthgen); fmt + clippy -D warnings + tests green; synthgen bit-identical AC test passes. Deliberately excludes (minimal M0->M1 edge set): fio baseline (manual Intel-box, label bench, non-blocking), healthz/metrics stub, config loader, JSON tracing, nightly scaffold - parallel M0 work verified before a human declares M0 closed, never blockers. ALL M1 beads depend on this gate and on nothing else in M0.' \
   -p 0 -l m0 --silent)
 bd dep add "$M0_GATE" "$M0_CRATES"
 bd dep add "$M0_GATE" "$M0_PIN"
@@ -126,19 +134,19 @@ M1_INGEST=$(bd create "Ingest pipeline: rayon batch hashing, dedup, zero-page sh
 bd dep add "$M1_INGEST" "$M1_WRITER"
 
 M1_TEST_RESTART=$(bd create "M1 AC test: 1M-page ingest, restart, index identical" \
-  -d 'In crates/snapstore-tests using snapstore-synthgen: ingest 1M synthetic pages, snapshot the full index contents, drop the store, reopen (startup rebuild), full compare - rebuilt index identical to pre-restart (every hash, PackLoc, count). Tmpdir on CI runner disk; keep runtime CI-feasible but do NOT shrink below 1M pages (the AC is explicit). CI-correctness AC - gates M1.' \
+  -d 'In crates/snapstore-tests using snapstore-synthgen: ingest 1M synthetic pages, snapshot the full index contents, drop the store, reopen (startup rebuild), full compare - rebuilt index identical to pre-restart (every hash, PackLoc, count). Tmpdir on CI runner disk; keep runtime CI-feasible but do NOT shrink below 1M pages (the AC is explicit). CI-correctness AC - gates M1. Lives in crates/snapstore-tests/tests/m1_restart_index.rs (own compile target - do not edit snapstore-tests src/ or Cargo.toml; dev-deps pre-wired by the skeleton bead). Reserves: crates/snapstore-tests/tests/m1_restart_index.rs.' \
   -p 0 -l m1 --silent)
 bd dep add "$M1_TEST_RESTART" "$M1_INGEST"
 bd dep add "$M1_TEST_RESTART" "$M1_REBUILD"
 
 M1_TEST_TORN=$(bd create "M1 AC test: torn-tail truncation matrix" \
-  -d 'Parameterized matrix test: write an open pack with known records, then for EVERY byte offset within the last record (all 4144 offsets, plus header-boundary edge cases) truncate the file there and run startup recovery: always recovers to the last whole record, never panics, index matches exactly the surviving whole records, file truncated to the good boundary. CI-correctness AC - gates M1.' \
+  -d 'Parameterized matrix test: write an open pack with known records, then for EVERY byte offset within the last record (all 4144 offsets, plus header-boundary edge cases) truncate the file there and run startup recovery: always recovers to the last whole record, never panics, index matches exactly the surviving whole records, file truncated to the good boundary. CI-correctness AC - gates M1. Lives in crates/snapstore-tests/tests/m1_torn_tail.rs (own compile target - no snapstore-tests src/ or Cargo.toml edits). Reserves: crates/snapstore-tests/tests/m1_torn_tail.rs.' \
   -p 0 -l m1 --silent)
 bd dep add "$M1_TEST_TORN" "$M1_WRITER"
 bd dep add "$M1_TEST_TORN" "$M1_REBUILD"
 
 M1_TEST_DEDUP=$(bd create "M1 AC test: dedup invariant + zero-page short-circuit" \
-  -d 'Ingest the same 100k synthetic pages twice: second pass reports pages_new==0 and pages_deduped==100k, physical pack bytes unchanged after pass two. Additionally assert the zero-page short-circuit: batches containing all-zero pages never write them to packs yet they report as present/deduped consistently. CI-correctness AC - gates M1.' \
+  -d 'Ingest the same 100k synthetic pages twice: second pass reports pages_new==0 and pages_deduped==100k, physical pack bytes unchanged after pass two. Additionally assert the zero-page short-circuit: batches containing all-zero pages never write them to packs yet they report as present/deduped consistently. CI-correctness AC - gates M1. Lives in crates/snapstore-tests/tests/m1_dedup.rs (own compile target). Reserves: crates/snapstore-tests/tests/m1_dedup.rs.' \
   -p 0 -l m1 --silent)
 bd dep add "$M1_TEST_DEDUP" "$M1_INGEST"
 
@@ -170,22 +178,22 @@ M2_CODEC=$(bd create "Manifest encode/decode/validate (pure, fuzzable)" \
 bd dep add "$M2_CODEC" "$M1_GATE"
 
 M2_FLATTEN=$(bd create "flatten(chain): shadowing merge + gap detection" \
-  -d 'pub fn flatten over a child-first manifest chain per API.md section 2: child entries shadow parent entries with equal page_index; pure in-memory merge over sorted entry arrays; result must cover every index 0..guest_ram_bytes/4096 - a gap is a typed corruption error (P0 signal), never a panic. Accepts any chain depth; the server never rewrites manifests (implicit FULL conversion would change the content-derived ref). Reserves: crates/snapstore-manifest/**.' \
+  -d 'pub fn flatten over a child-first manifest chain per API.md section 2: child entries shadow parent entries with equal page_index; pure in-memory merge over sorted entry arrays; result must cover every index 0..guest_ram_bytes/4096 - a gap is a typed corruption error (P0 signal), never a panic. Accepts any chain depth; the server never rewrites manifests (implicit FULL conversion would change the content-derived ref). Reserves: crates/snapstore-manifest/src/flatten* plus its single mod line in src/lib.rs (the codec bead upstream owns the rest of the crate).' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_FLATTEN" "$M2_CODEC"
 
 M2_TEST_ROUNDTRIP=$(bd create "M2 AC proptest: round-trip + canonicality" \
-  -d 'proptest strategies generating arbitrary valid manifests (FULL and DELTA, varied entry counts, device blobs incl. DEV_ZSTD): decode(encode(m)) == m and snapshot_ref stable across re-encode; canonicality: entries supplied in shuffled order encode to byte-identical output (sort enforced). Also one half of the Phase 1 exit gate (snapshot-store portion). CI-correctness AC - gates M2.' \
+  -d 'proptest strategies generating arbitrary valid manifests (FULL and DELTA, varied entry counts, device blobs incl. DEV_ZSTD): decode(encode(m)) == m and snapshot_ref stable across re-encode; canonicality: entries supplied in shuffled order encode to byte-identical output (sort enforced). Also one half of the Phase 1 exit gate (snapshot-store portion). CI-correctness AC - gates M2. Reserves: crates/snapstore-manifest/tests/roundtrip_prop.rs (own compile target, no src/ edits).' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_TEST_ROUNDTRIP" "$M2_CODEC"
 
 M2_TEST_FLATTEN=$(bd create "M2 AC proptest: flatten vs naive reference" \
-  -d 'proptest: flatten correctness against a naive reference implementation (rebuild full page map by walking the chain root-ward) for random chains of depth <= 64 with 2k-entry deltas; plus negative cases asserting gap detection errors. CI-correctness AC - gates M2.' \
+  -d 'proptest: flatten correctness against a naive reference implementation (rebuild full page map by walking the chain root-ward) for random chains of depth <= 64 with 2k-entry deltas; plus negative cases asserting gap detection errors. CI-correctness AC - gates M2. Reserves: crates/snapstore-manifest/tests/flatten_ref_prop.rs (own compile target, no src/ edits).' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_TEST_FLATTEN" "$M2_FLATTEN"
 
 M2_FUZZ_TARGET=$(bd create "cargo-fuzz target on Manifest::decode" \
-  -d 'cargo-fuzz target feeding arbitrary bytes to Manifest::decode (plus snapshot_ref on the valid corpus); seed corpus generated from the proptest strategies. Must never panic, OOM, or hit UB - every failure is a typed error. Reserves: fuzz/** (or crates/snapstore-manifest/fuzz/**).' \
+  -d 'cargo-fuzz target feeding arbitrary bytes to Manifest::decode (plus snapshot_ref on the valid corpus); seed corpus generated from the proptest strategies. Must never panic, OOM, or hit UB - every failure is a typed error. Reserves: fuzz/** at the repo root only (its own cargo-fuzz crate, excluded from workspace members) - deliberately NOT under crates/snapstore-manifest/ so it never overlaps reservations held by parallel manifest beads.' \
   -p 1 -l m2 --silent)
 bd dep add "$M2_FUZZ_TARGET" "$M2_CODEC"
 
@@ -201,18 +209,18 @@ M2_SPM_IO=$(bd create "Loose .spm write discipline + manifests dir I/O" \
 bd dep add "$M2_SPM_IO" "$M2_CODEC"
 
 M2_COMMIT=$(bd create "Snapshot commit: PutSnapshot library path" \
-  -d 'Library API in snapstore-pagestore (server wiring is M4): validate the container via snapstore-manifest (InvalidArgument on malformed/bad footer/unknown version); verify parent_manifest_hash resolves to a stored manifest with identical guest_ram_bytes (FailedPrecondition if missing); verify EVERY referenced page_hash is present AND durable in the page index (synced bit; issue a commit barrier to the pack writer if needed); missing pages -> FailedPrecondition with MissingPages detail listing exactly the gap hashes; then atomic .spm write; return SnapshotRef. Enforces the pages -> manifest fsync ordering invariant (ARCHITECTURE.md section 3 steps 7-9): returns only after rename + dir fsync. Idempotent re-commit of a stored manifest succeeds. Reserves: crates/snapstore-pagestore/src/commit*.' \
+  -d 'Library API in snapstore-pagestore (server wiring is M4): validate the container via snapstore-manifest (InvalidArgument on malformed/bad footer/unknown version); verify parent_manifest_hash resolves to a stored manifest with identical guest_ram_bytes (FailedPrecondition if missing); verify EVERY referenced page_hash is present AND durable in the page index (synced bit; issue a commit barrier to the pack writer if needed); missing pages -> FailedPrecondition with MissingPages detail listing exactly the gap hashes; then atomic .spm write; return SnapshotRef. Enforces the pages -> manifest fsync ordering invariant (ARCHITECTURE.md section 3 steps 7-9): returns only after rename + dir fsync. Idempotent re-commit of a stored manifest succeeds. Export the snapstore_commit_seconds histogram to the shared prometheus registry (ARCHITECTURE.md section 7.3 day-one metric). Reserves: crates/snapstore-pagestore/src/commit*.' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_COMMIT" "$M2_SPM_IO"
 
 M2_RESOLVE=$(bd create "GetSnapshot/ResolvePages library path + flatten LRU" \
-  -d 'Library API: GetSnapshot returns the stored container byte-identical; ResolvePages Mode A (full flatten of the chain) and Mode B (delta-only vs baseline_ref, which must be a chain ancestor - typed error otherwise) with hashes_only option, results ascending by page_index in bounded batches; flatten LRU cache (flatten_cache_entries default 1024) keyed by SnapshotRef - sibling restores hit it constantly; page payload reads = index probe + pread at PackLoc with an LRU of File handles per pack (cap 256). Unit tests: both modes, cache hit behavior, baseline-not-ancestor, snapstore_flatten_depth histogram exported. CI-correctness unit tests gate M2 via this bead. Reserves: crates/snapstore-pagestore/src/resolve*.' \
+  -d 'Library API: GetSnapshot returns the stored container byte-identical; ResolvePages Mode A (full flatten of the chain) and Mode B (delta-only vs baseline_ref, which must be a chain ancestor - typed error otherwise) with hashes_only option, results ascending by page_index in bounded batches; flatten LRU cache (flatten_cache_entries default 1024) keyed by SnapshotRef - sibling restores hit it constantly; page payload reads = index probe + pread at PackLoc with an LRU of File handles per pack (cap 256). Unit tests: both modes, cache hit behavior, baseline-not-ancestor, snapstore_flatten_depth and snapstore_resolve_seconds histograms exported (ARCHITECTURE.md section 7.3 day-one metrics). CI-correctness unit tests gate M2 via this bead. Reserves: crates/snapstore-pagestore/src/resolve*.' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_RESOLVE" "$M2_SPM_IO"
 bd dep add "$M2_RESOLVE" "$M2_FLATTEN"
 
 M2_TEST_MISSING=$(bd create "M2 AC test: commit-with-missing-pages lists exact gaps" \
-  -d 'In crates/snapstore-tests with synthgen: build a manifest referencing pages partially absent from the store; commit -> library FailedPrecondition error whose MissingPages detail lists EXACTLY the gap hashes (no more, no fewer); ingest the gaps, retry -> success with the same SnapshotRef. Asserts snapstore-types error variants (gRPC statuses do not exist until M4). CI-correctness AC - gates M2.' \
+  -d 'In crates/snapstore-tests with synthgen: build a manifest referencing pages partially absent from the store; commit -> library FailedPrecondition error whose MissingPages detail lists EXACTLY the gap hashes (no more, no fewer); ingest the gaps, retry -> success with the same SnapshotRef. Asserts snapstore-types error variants (gRPC statuses do not exist until M4). CI-correctness AC - gates M2. Lives in crates/snapstore-tests/tests/m2_missing_pages.rs (own compile target). Reserves: crates/snapstore-tests/tests/m2_missing_pages.rs.' \
   -p 0 -l m2 --silent)
 bd dep add "$M2_TEST_MISSING" "$M2_COMMIT"
 
@@ -252,7 +260,7 @@ M3_ACTOR=$(bd create "Meta actor (single writer) + read pool" \
 bd dep add "$M3_ACTOR" "$M3_SCHEMA"
 
 M3_COUNTER=$(bd create "Logical counter + wire real created_epoch into M1 seam" \
-  -d 'Logical counter per ARCHITECTURE.md section 5.3: monotonic, assigned inside the writer actor, flushed to the meta table on every writer txn; startup value = max(persisted, max(nodes.created_at), max(nodes.updated_at)) + 1. Ordering guarantees come from this counter, never from node-id values. ALSO: provide the production implementation of the created_epoch dependency injected in M1 pack headers, replacing the M1 stub constant at the integration wiring point (the M1 seam is a trait or fn parameter; this bead supplies the real source and an integration test proving new packs carry real epochs). Reserves: crates/snapstore-meta/src/counter*, the pagestore wiring point in crates/snapstore-tests.' \
+  -d 'Logical counter per ARCHITECTURE.md section 5.3: monotonic, assigned inside the writer actor, flushed to the meta table on every writer txn; startup value = max(persisted, max(nodes.created_at), max(nodes.updated_at)) + 1. Ordering guarantees come from this counter, never from node-id values. ALSO: provide the production implementation of the created_epoch dependency injected in M1 pack headers, replacing the M1 stub constant at the integration wiring point (the M1 seam is a trait or fn parameter; this bead supplies the real source and an integration test proving new packs carry real epochs). Reserves: crates/snapstore-meta/src/counter*, crates/snapstore-tests/tests/m3_created_epoch_wiring.rs (the wiring integration test - own compile target).' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_COUNTER" "$M3_ACTOR"
 
@@ -268,7 +276,7 @@ bd dep add "$M3_NODES" "$M3_COUNTER"
 bd dep add "$M3_NODES" "$M3_LOGS"
 
 M3_QUERIES=$(bd create "Canonical read queries: children, path, scan, stats" \
-  -d 'Implement ARCHITECTURE.md section 5.4 canonical SQL on the read pool: get children; recursive-CTE path-to-root returned root-first (GetPath semantics, optional inline input-log containers parallel to nodes[1..]); QueryNodes filtered scan - statuses, min/max progress, min novelty, depth bounds, created_after / updated_after exclusive logical-counter cursors, the three OrderBy modes (created ascending is the stable sync cursor), limit with streamed pages; Stats per-experiment and store-wide (counts by status, max_depth, best_progress_score, logical_counter, experiments_total). QueryNodes is the ONLY scan primitive - no ListNodes. Reserves: crates/snapstore-meta/src/queries*.' \
+  -d 'Implement ARCHITECTURE.md section 5.4 canonical SQL on the read pool: GetNode (single-row lookup by composite key - asserted by the isolation AC test); get children; recursive-CTE path-to-root returned root-first (GetPath semantics, optional inline input-log containers parallel to nodes[1..]); QueryNodes filtered scan - statuses, min/max progress, min novelty, depth bounds, created_after / updated_after exclusive logical-counter cursors, the three OrderBy modes (created ascending is the stable sync cursor), limit with streamed pages; Stats per-experiment and store-wide (counts by status, max_depth, best_progress_score, logical_counter, experiments_total). QueryNodes is the ONLY scan primitive - no ListNodes. Reserves: crates/snapstore-meta/src/queries*.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_QUERIES" "$M3_ACTOR"
 
@@ -283,39 +291,39 @@ M3_KV=$(bd create "Metadata KV with generation CAS" \
 bd dep add "$M3_KV" "$M3_COUNTER"
 
 M3_PINS_TOMB=$(bd create "Pins, tombstones, PruneSubtree transaction" \
-  -d 'Pin/Unpin rows (snapshot_ref PK, reason, created_at) - pins are GC roots, period (rule R5). PruneSubtree per ARCHITECTURE.md section 4.4 phase one, in ONE txn: verify the node exists and is not the experiment root (node_id 0) unless allow_root=true (safety interlock); recursive-CTE subtree collect; set status=PRUNED on all collected rows AND insert one tombstones row for the subtree root (node_count recorded); DELETE IS DEFERRED to GC reaping (M7, out of scope) - two-phase so prune is observable and crash-resumable. Returns nodes_pruned. CI unit tests: CTE correctness on branched trees, allow_root interlock, idempotent re-prune, tombstone row contents. Reserves: crates/snapstore-meta/src/prune*.' \
+  -d 'Pin/Unpin rows (snapshot_ref PK, reason, created_at) - pins are GC roots, period (rule R5). PruneSubtree per ARCHITECTURE.md section 4.4 phase one, in ONE txn: verify the node exists and is not the experiment root (node_id 0) unless allow_root=true (safety interlock); recursive-CTE subtree collect; set status=PRUNED on all collected rows AND insert one tombstones row for the subtree root (node_count recorded); DELETE IS DEFERRED to GC reaping (M7, out of scope) - two-phase so prune is observable and crash-resumable. Returns nodes_pruned. CI unit tests: CTE correctness on branched trees, allow_root interlock, tombstone row contents, and re-prune of an already-tombstoned root - the normative docs do NOT specify this case: decide the behavior (recommended: idempotent no-op), document the decision in rustdoc, and pin it with a test. Reserves: crates/snapstore-meta/src/prune*.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_PINS_TOMB" "$M3_NODES"
 
 M3_TEST_CURSOR=$(bd create "M3 AC test: 1M-node tree, GetPath + cursor interleaving" \
-  -d 'In crates/snapstore-tests with synthgen-driven drivers: build a 1M-node synthetic tree (branching ~8, with a depth-5k spine); assert GetPath(depth 5k) correctness (root-first order, exact rows); QueryNodes frontier scan with created_after cursor streams with NO gaps and NO dupes under concurrent writes - interleaving test with a writer task creating nodes while a reader pages via the cursor. The <40 ms p99 latency number is an Intel-box benchmark, NOT asserted here. CI-correctness AC - gates M3.' \
+  -d 'In crates/snapstore-tests with synthgen-driven drivers: build a 1M-node synthetic tree (branching ~8, with a depth-5k spine); assert GetPath(depth 5k) correctness (root-first order, exact rows); QueryNodes frontier scan with created_after cursor streams with NO gaps and NO dupes under concurrent writes - interleaving test with a writer task creating nodes while a reader pages via the cursor. The <40 ms p99 latency number is an Intel-box benchmark, NOT asserted here. CI-correctness AC - gates M3. Lives in crates/snapstore-tests/tests/m3_tree_cursor.rs (own compile target). Reserves: crates/snapstore-tests/tests/m3_tree_cursor.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_CURSOR" "$M3_QUERIES"
 bd dep add "$M3_TEST_CURSOR" "$M3_NODES"
 
 M3_TEST_IDEMP=$(bd create "M3 AC test: CreateNode idempotency replay" \
-  -d 'Generate a synthetic experiment CreateNode stream; replay ANY prefix with duplicates included in arbitrary interleavings -> byte-identical tree (full table compare against the reference run); key reuse with DIFFERENT immutable content -> AlreadyExists and zero rows changed (verified by before/after table compare). CI-correctness AC - gates M3.' \
+  -d 'Generate a synthetic experiment CreateNode stream; replay ANY prefix with duplicates included in arbitrary interleavings -> byte-identical tree (full table compare against the reference run); key reuse with DIFFERENT immutable content -> AlreadyExists and zero rows changed (verified by before/after table compare). CI-correctness AC - gates M3. Lives in crates/snapstore-tests/tests/m3_create_idempotency.rs (own compile target). Reserves: crates/snapstore-tests/tests/m3_create_idempotency.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_IDEMP" "$M3_NODES"
 
 M3_TEST_ISOLATION=$(bd create "M3 AC test: multi-experiment isolation + Stats" \
-  -d 'Two interleaved synthetic experiments sharing page content: neither ever observes the other via any tree query (GetNode, GetChildren, GetPath, QueryNodes, per-experiment Stats); per-experiment Stats match each driver own bookkeeping exactly (node counts by status, max depth, best score). Page/manifest storage is global by design - only tree rows carry the experiment dimension. CI-correctness AC - gates M3.' \
+  -d 'Two interleaved synthetic experiments sharing page content: neither ever observes the other via any tree query (GetNode, GetChildren, GetPath, QueryNodes, per-experiment Stats); per-experiment Stats match each driver own bookkeeping exactly (node counts by status, max depth, best score). Page/manifest storage is global by design - only tree rows carry the experiment dimension. CI-correctness AC - gates M3. Lives in crates/snapstore-tests/tests/m3_isolation.rs (own compile target). Reserves: crates/snapstore-tests/tests/m3_isolation.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_ISOLATION" "$M3_NODES"
 bd dep add "$M3_TEST_ISOLATION" "$M3_QUERIES"
 
 M3_TEST_CAS=$(bd create "M3 AC test: KV CAS contention, caps, delete-CAS" \
-  -d 'Concurrent writers hammering one key: exactly one winner per generation, losers receive FailedPrecondition with CurrentGeneration detail; create-only path (expected_generation=0) covered; delete-CAS covered; 16 MiB value-cap rejection covered (InvalidArgument). Asserts library error enum variants (gRPC statuses arrive in M4). CI-correctness AC - gates M3.' \
+  -d 'Concurrent writers hammering one key: exactly one winner per generation, losers receive FailedPrecondition with CurrentGeneration detail; create-only path (expected_generation=0) covered; delete-CAS covered; 16 MiB value-cap rejection covered (InvalidArgument). Asserts library error enum variants (gRPC statuses arrive in M4). CI-correctness AC - gates M3. Lives in crates/snapstore-tests/tests/m3_kv_cas.rs (own compile target). Reserves: crates/snapstore-tests/tests/m3_kv_cas.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_CAS" "$M3_KV"
 
 M3_TEST_ATOMIC=$(bd create "M3 AC test: UpdateNodes atomicity" \
-  -d 'UpdateNodes batch where exactly one id is unknown -> zero rows changed (full-table before/after compare), error is NotFound with MissingNodes detail listing precisely the bad ids; a valid retry then applies fully. CI-correctness AC - gates M3.' \
+  -d 'UpdateNodes batch where exactly one id is unknown -> zero rows changed (full-table before/after compare), error is NotFound with MissingNodes detail listing precisely the bad ids; a valid retry then applies fully. CI-correctness AC - gates M3. Lives in crates/snapstore-tests/tests/m3_update_atomicity.rs (own compile target). Reserves: crates/snapstore-tests/tests/m3_update_atomicity.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_ATOMIC" "$M3_UPDATES"
 
 M3_TEST_KILL=$(bd create "M3 AC test: kill -9 loop x200 on 256-update batches" \
-  -d 'Minimal kill-loop (SCOPE NOTE: the source plan runs this in the M6 crash-injection harness, out of scope here; the M6 harness absorbs this test later - NO failpoints now): child process runs 256-update batch workloads against tree.db; parent SIGKILLs the child at randomized SEEDED points (reproducible); restart + invariant check: each batch is wholly present or wholly absent, never partial; loop x200. Linux-only, runs in hosted CI (ubuntu-latest). Lives in crates/snapstore-tests. CI-correctness AC - gates M3.' \
+  -d 'Minimal kill-loop (SCOPE NOTE: the source plan runs this in the M6 crash-injection harness, out of scope here; the M6 harness absorbs this test later - NO failpoints now): child process runs 256-update batch workloads against tree.db; parent SIGKILLs the child at randomized SEEDED points (reproducible); restart + invariant check: each batch is wholly present or wholly absent, never partial; loop x200. Linux-only, runs in hosted CI (ubuntu-latest). Lives in crates/snapstore-tests/tests/m3_kill_loop.rs with the child workload binary at crates/snapstore-tests/src/bin/kill_workload.rs. CI-correctness AC - gates M3. Reserves: crates/snapstore-tests/tests/m3_kill_loop.rs, crates/snapstore-tests/src/bin/kill_workload.rs.' \
   -p 0 -l m3 --silent)
 bd dep add "$M3_TEST_KILL" "$M3_UPDATES"
 
@@ -377,6 +385,6 @@ echo "  M3: schema, actor, counter, logs, nodes, queries, updates, KV, prune, AC
 echo "  Cross: bench comparison harness, Phase 1 exit record, rustdoc pass"
 echo ""
 echo "Inspect with:"
-echo "  bd ready          # unblocked tasks (expect: skeleton crates, dep pinning, clippy gate)"
+echo "  bd ready          # unblocked tasks (expect: dep pinning, clippy gate)"
 echo "  bd dep tree       # full dependency tree"
 echo "  bd dep cycles     # must report none"
