@@ -1,0 +1,8 @@
+[package]
+name = "snapstore-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapstore-types = { path = "../snapstore-types" }
