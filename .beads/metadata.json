@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "snapshot_store",
+  "project_id": "c654dabe-1852-4501-9a36-25f1fa183719"
+}
