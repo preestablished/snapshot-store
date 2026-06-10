@@ -354,6 +354,7 @@ name = "snapstore-manifest"
 version = "0.1.0"
 dependencies = [
  "snapstore-types",
+ "thiserror",
 ]
 
 [[package]]
