@@ -16,3 +16,10 @@ test-strategies = ["dep:proptest"]
 
 [dev-dependencies]
 proptest = "1"
+
+[dev-dependencies.criterion]
+version = "0.5"
+
+[[bench]]
+name = "flatten"
+harness = false
