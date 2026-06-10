@@ -6,7 +6,12 @@ license.workspace = true
 
 [dependencies]
 snapstore-types = { path = "../snapstore-types" }
+blake3 = "1"
 thiserror = "2"
+proptest = { version = "1", optional = true }
+
+[features]
+test-strategies = ["dep:proptest"]
 
 [dev-dependencies]
-# proptest will be added in M2-WI2 (codec phase)
+proptest = "1"
