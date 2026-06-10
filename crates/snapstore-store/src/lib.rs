@@ -242,13 +242,17 @@ impl SnapshotStore {
 
         m.memory.regions.iter().flat_map(move |region| {
             let base_gpa = region.gpa;
-            region.pages.iter().enumerate().map(move |(page_idx, hash)| {
-                let gpa = base_gpa + (page_idx as u64 * page_size);
-                match self.pages.get(hash)? {
-                    Some(data) => Ok((gpa, data)),
-                    None => Err(StoreError::MissingPage(*hash)),
-                }
-            })
+            region
+                .pages
+                .iter()
+                .enumerate()
+                .map(move |(page_idx, hash)| {
+                    let gpa = base_gpa + (page_idx as u64 * page_size);
+                    match self.pages.get(hash)? {
+                        Some(data) => Ok((gpa, data)),
+                        None => Err(StoreError::MissingPage(*hash)),
+                    }
+                })
         })
     }
 }
@@ -359,10 +363,7 @@ mod tests {
         let mut guest = SyntheticGuest::new(99, profile);
 
         // Capture epoch-0 page data before mutation.
-        let epoch0_data: Vec<[u8; PAGE_SIZE]> = guest
-            .pages()
-            .map(|(_, p)| *p)
-            .collect();
+        let epoch0_data: Vec<[u8; PAGE_SIZE]> = guest.pages().map(|(_, p)| *p).collect();
 
         // Commit epoch 0.
         let image0 = guest_image_from_synthetic(&guest, 0, 0, None);
@@ -549,7 +550,10 @@ mod tests {
         assert_eq!(snap_ref, snap_ref2, "same state must give same ref");
 
         // Second commit was idempotent (no error, same record still in DB)
-        let record2 = db.get(&snap_ref).unwrap().expect("should still be in MetaDb");
+        let record2 = db
+            .get(&snap_ref)
+            .unwrap()
+            .expect("should still be in MetaDb");
         assert_eq!(record.page_count, record2.page_count);
     }
 }

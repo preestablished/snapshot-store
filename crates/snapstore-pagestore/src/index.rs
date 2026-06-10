@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use parking_lot::RwLock;
-use snapstore_types::{PageHash, PackId, PageLoc};
+use snapstore_types::{PackId, PageHash, PageLoc};
 
 use crate::pack::PackReader;
 
@@ -50,9 +50,8 @@ impl ShardedIndex {
     /// Batch insert many entries.
     pub fn insert_batch(&self, entries: impl IntoIterator<Item = (PageHash, PageLoc)>) {
         // Group by shard to minimise lock acquisitions.
-        let mut buckets: Vec<Vec<(PageHash, PageLoc)>> = (0..SHARD_COUNT)
-            .map(|_| Vec::new())
-            .collect();
+        let mut buckets: Vec<Vec<(PageHash, PageLoc)>> =
+            (0..SHARD_COUNT).map(|_| Vec::new()).collect();
         for (hash, loc) in entries {
             buckets[shard_for(&hash)].push((hash, loc));
         }
@@ -102,15 +101,16 @@ impl ShardedIndex {
         for i in 0..entry_count {
             let base = i * ENTRY_SIZE;
             let hash_bytes: [u8; 32] = entries_bytes[base..base + 32].try_into().unwrap();
-            let pack_id = u32::from_le_bytes(
-                entries_bytes[base + 32..base + 36].try_into().unwrap(),
-            );
-            let offset = u64::from_le_bytes(
-                entries_bytes[base + 36..base + 44].try_into().unwrap(),
-            );
+            let pack_id =
+                u32::from_le_bytes(entries_bytes[base + 32..base + 36].try_into().unwrap());
+            let offset =
+                u64::from_le_bytes(entries_bytes[base + 36..base + 44].try_into().unwrap());
             batch.push((
                 PageHash::from_bytes(hash_bytes),
-                PageLoc { pack: PackId(pack_id), offset },
+                PageLoc {
+                    pack: PackId(pack_id),
+                    offset,
+                },
             ));
         }
 
@@ -209,7 +209,15 @@ pub fn rebuild_from_pack(
 
     let entries = records
         .into_iter()
-        .map(|(offset, hash)| (hash, PageLoc { pack: pack_id, offset }))
+        .map(|(offset, hash)| {
+            (
+                hash,
+                PageLoc {
+                    pack: pack_id,
+                    offset,
+                },
+            )
+        })
         .collect();
 
     Ok(entries)
@@ -234,9 +242,9 @@ pub enum IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use snapstore_types::{PageHash, PackId, PageLoc, PAGE_SIZE};
     use crate::pack::PackWriter;
+    use snapstore_types::{PackId, PageHash, PageLoc, PAGE_SIZE};
+    use std::sync::Arc;
 
     fn make_hash(seed: u8) -> PageHash {
         let mut bytes = [0u8; 32];
@@ -247,7 +255,10 @@ mod tests {
     }
 
     fn make_loc(pack: u32, offset: u64) -> PageLoc {
-        PageLoc { pack: PackId(pack), offset }
+        PageLoc {
+            pack: PackId(pack),
+            offset,
+        }
     }
 
     fn make_page(seed: u8) -> [u8; PAGE_SIZE] {
@@ -320,12 +331,15 @@ mod tests {
             .collect();
 
         let mut handles = Vec::new();
-        for t in 0..num_threads {
+        for (t, thread_hashes) in all_hashes.iter().enumerate() {
             let idx_clone = Arc::clone(&idx);
-            let hashes = all_hashes[t].clone();
+            let hashes = thread_hashes.clone();
             let handle = std::thread::spawn(move || {
                 for (i, hash) in hashes.into_iter().enumerate() {
-                    let loc = PageLoc { pack: PackId(t as u32), offset: i as u64 * 4133 };
+                    let loc = PageLoc {
+                        pack: PackId(t as u32),
+                        offset: i as u64 * 4133,
+                    };
                     idx_clone.insert(hash, loc);
                 }
             });
@@ -336,8 +350,8 @@ mod tests {
         }
 
         // Verify all entries are findable.
-        for t in 0..num_threads {
-            for (i, hash) in all_hashes[t].iter().enumerate() {
+        for (t, thread_hashes) in all_hashes.iter().enumerate() {
+            for (i, hash) in thread_hashes.iter().enumerate() {
                 let loc = idx.get(hash).expect("entry should be present");
                 assert_eq!(loc.pack, PackId(t as u32));
                 assert_eq!(loc.offset, i as u64 * 4133);
@@ -439,7 +453,9 @@ mod tests {
         let rebuilt: HashMap<PageHash, PageLoc> = entries.into_iter().collect();
 
         for (hash, expected_off) in &expected {
-            let loc = rebuilt.get(hash).expect("hash should be present after rebuild");
+            let loc = rebuilt
+                .get(hash)
+                .expect("hash should be present after rebuild");
             assert_eq!(loc.pack, pack_id);
             assert_eq!(loc.offset, *expected_off);
         }

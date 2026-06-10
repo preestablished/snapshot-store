@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use bytes::Bytes;
-use snapstore_types::{PageHash, PackId, PAGE_SIZE};
+use snapstore_types::{PackId, PageHash, PAGE_SIZE};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -207,11 +207,13 @@ impl PackWriter {
         let record_start_in_buf = self.write_buf.len();
         self.write_buf.extend_from_slice(hash.as_bytes());
         self.write_buf.push(0x01); // flags: raw page
-        self.write_buf.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        self.write_buf
+            .extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
         self.write_buf.extend_from_slice(payload);
 
         // Update body hasher with the entire encoded record.
-        self.body_hasher.update(&self.write_buf[record_start_in_buf..]);
+        self.body_hasher
+            .update(&self.write_buf[record_start_in_buf..]);
 
         self.write_offset += RECORD_HEADER_SIZE + PAGE_SIZE as u64;
         self.record_count += 1;
@@ -393,7 +395,11 @@ impl PackReader {
             let len = u32::from_le_bytes(rec_header[33..37].try_into().unwrap());
 
             // For M1 we only write raw pages (flags & 1 == 1, len == PAGE_SIZE).
-            let expected_len = if flags & 0x01 != 0 { PAGE_SIZE as u32 } else { len };
+            let expected_len = if flags & 0x01 != 0 {
+                PAGE_SIZE as u32
+            } else {
+                len
+            };
             if len != expected_len || len as usize > PAGE_SIZE * 2 {
                 // Implausible length — treat as truncation.
                 truncate_at = Some(offset);
@@ -510,10 +516,7 @@ impl PackReader {
 
 /// Count how many complete records exist between PACK_HEADER_SIZE and body_end,
 /// without verifying hashes.
-fn count_records_in_file(
-    file: &mut std::fs::File,
-    body_end: u64,
-) -> Result<u64, PackError> {
+fn count_records_in_file(file: &mut std::fs::File, body_end: u64) -> Result<u64, PackError> {
     file.seek(SeekFrom::Start(PACK_HEADER_SIZE))?;
 
     let mut offset = PACK_HEADER_SIZE;
@@ -644,10 +647,7 @@ mod tests {
 
         // Re-open file and truncate mid-way through last record.
         {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             // last record starts at offsets[4]; cut halfway through payload
             let trunc_at = offsets[4] + RECORD_HEADER_SIZE + (PAGE_SIZE as u64 / 2);
             file.set_len(trunc_at).unwrap();

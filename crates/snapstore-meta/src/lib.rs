@@ -75,10 +75,7 @@ impl MetaDb {
             }
         } else {
             // First open — run the initial migration in a transaction.
-            conn.execute_batch(&format!(
-                "BEGIN;\n{}\nCOMMIT;",
-                MIGRATION_001
-            ))?;
+            conn.execute_batch(&format!("BEGIN;\n{}\nCOMMIT;", MIGRATION_001))?;
         }
 
         Ok(Self { conn })
@@ -438,8 +435,10 @@ mod tests {
         let child = make_ref(0x11);
         let grandchild = make_ref(0x12);
         db.register(&simple_rec(root.clone(), None)).unwrap();
-        db.register(&simple_rec(child.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(grandchild.clone(), Some(child.clone()))).unwrap();
+        db.register(&simple_rec(child.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(grandchild.clone(), Some(child.clone())))
+            .unwrap();
 
         let ancs = db.ancestors(&grandchild).unwrap();
         assert_eq!(ancs.len(), 2);
@@ -456,9 +455,12 @@ mod tests {
         let c2 = make_ref(0x22);
         let gc = make_ref(0x23);
         db.register(&simple_rec(root.clone(), None)).unwrap();
-        db.register(&simple_rec(c1.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(c2.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(gc.clone(), Some(c1.clone()))).unwrap();
+        db.register(&simple_rec(c1.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(c2.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(gc.clone(), Some(c1.clone())))
+            .unwrap();
 
         let desc = db.descendants(&root).unwrap();
         assert_eq!(desc.len(), 3);
@@ -476,8 +478,10 @@ mod tests {
         let c1 = make_ref(0x31);
         let gc = make_ref(0x32);
         db.register(&simple_rec(root.clone(), None)).unwrap();
-        db.register(&simple_rec(c1.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(gc.clone(), Some(c1.clone()))).unwrap();
+        db.register(&simple_rec(c1.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(gc.clone(), Some(c1.clone())))
+            .unwrap();
 
         let ch = db.children(&root).unwrap();
         assert_eq!(ch.len(), 1);
@@ -491,8 +495,10 @@ mod tests {
         let c1 = make_ref(0x41);
         let c2 = make_ref(0x42);
         db.register(&simple_rec(root.clone(), None)).unwrap();
-        db.register(&simple_rec(c1.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(c2.clone(), Some(root.clone()))).unwrap();
+        db.register(&simple_rec(c1.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(c2.clone(), Some(root.clone())))
+            .unwrap();
 
         let heads = db.heads().unwrap();
         assert_eq!(heads.len(), 2);
@@ -585,8 +591,16 @@ mod tests {
             ancs.len()
         );
         // Root-first: ancs[0] should be snapshot 0, ancs[99] should be snapshot 99
-        assert_eq!(ancs[0].r, SnapshotRef([0u8; 32]), "first ancestor should be root");
-        assert_eq!(ancs[99].r, SnapshotRef([99u8; 32]), "last ancestor should be tip's parent");
+        assert_eq!(
+            ancs[0].r,
+            SnapshotRef([0u8; 32]),
+            "first ancestor should be root"
+        );
+        assert_eq!(
+            ancs[99].r,
+            SnapshotRef([99u8; 32]),
+            "last ancestor should be tip's parent"
+        );
 
         // heads() returns just the tip (snapshot 100)
         let heads = db.heads().unwrap();
@@ -610,8 +624,10 @@ mod tests {
         let child_b = SnapshotRef([0xA2u8; 32]);
 
         db.register(&simple_rec(root.clone(), None)).unwrap();
-        db.register(&simple_rec(child_a.clone(), Some(root.clone()))).unwrap();
-        db.register(&simple_rec(child_b.clone(), Some(root.clone()))).unwrap();
+        db.register(&simple_rec(child_a.clone(), Some(root.clone())))
+            .unwrap();
+        db.register(&simple_rec(child_b.clone(), Some(root.clone())))
+            .unwrap();
 
         let desc = db.descendants(&root).unwrap();
         assert_eq!(desc.len(), 2, "descendants should be 2, got {}", desc.len());
@@ -623,7 +639,12 @@ mod tests {
         assert!(child_refs.contains(&child_b));
 
         let heads = db.heads().unwrap();
-        assert_eq!(heads.len(), 2, "heads should be 2 (both children), got {}", heads.len());
+        assert_eq!(
+            heads.len(),
+            2,
+            "heads should be 2 (both children), got {}",
+            heads.len()
+        );
         let head_refs: Vec<_> = heads.iter().map(|r| r.r.clone()).collect();
         assert!(head_refs.contains(&child_a));
         assert!(head_refs.contains(&child_b));
@@ -666,7 +687,9 @@ mod tests {
         let db = open_tmp();
         let r = SnapshotRef([0xB2u8; 32]);
         let missing_parent = SnapshotRef([0xFFu8; 32]);
-        let err = db.register(&simple_rec(r, Some(missing_parent))).unwrap_err();
+        let err = db
+            .register(&simple_rec(r, Some(missing_parent)))
+            .unwrap_err();
         assert!(
             matches!(err, MetaError::ParentNotFound),
             "expected ParentNotFound, got {:?}",
@@ -707,7 +730,8 @@ mod tests {
         parent_map.insert(ref_of(0), None); // root
 
         let db = open_tmp();
-        db.register(&simple_rec(SnapshotRef(ref_of(0)), None)).unwrap();
+        db.register(&simple_rec(SnapshotRef(ref_of(0)), None))
+            .unwrap();
 
         for i in 1..N {
             let parent_idx = lcg(i) % i;
@@ -727,14 +751,9 @@ mod tests {
         let ancestors_of = |start: usize| -> Vec<[u8; 32]> {
             let mut chain = Vec::new();
             let mut cur = ref_of(start);
-            loop {
-                match parent_map.get(&cur).copied() {
-                    Some(Some(p)) => {
-                        chain.push(p);
-                        cur = p;
-                    }
-                    _ => break,
-                }
+            while let Some(Some(p)) = parent_map.get(&cur).copied() {
+                chain.push(p);
+                cur = p;
             }
             chain.reverse(); // root-first
             chain
@@ -784,7 +803,9 @@ mod tests {
         // all nodes whose ancestor chain passes through node 1.
         // ----------------------------------------------------------------
         let mid_ref = SnapshotRef(ref_of(1));
-        let got_desc: Vec<_> = db.descendants(&mid_ref).unwrap()
+        let got_desc: Vec<_> = db
+            .descendants(&mid_ref)
+            .unwrap()
             .into_iter()
             .map(|rec| rec.r.0)
             .collect();
@@ -792,20 +813,17 @@ mod tests {
         // Compute expected descendants of node 1 from the map.
         let mut expected_desc: Vec<[u8; 32]> = Vec::new();
         for i in 0..N {
-            if i == 1 { continue; }
+            if i == 1 {
+                continue;
+            }
             // Walk the ancestor chain; if we hit node 1, it's a descendant.
             let mut cur = ref_of(i);
-            loop {
-                match parent_map.get(&cur).copied() {
-                    Some(Some(p)) => {
-                        if p == ref_of(1) || cur == ref_of(1) {
-                            expected_desc.push(ref_of(i));
-                            break;
-                        }
-                        cur = p;
-                    }
-                    _ => break,
+            while let Some(Some(p)) = parent_map.get(&cur).copied() {
+                if p == ref_of(1) || cur == ref_of(1) {
+                    expected_desc.push(ref_of(i));
+                    break;
                 }
+                cur = p;
             }
         }
 
@@ -821,19 +839,14 @@ mod tests {
         // Verify: heads() returns exactly the leaf nodes.
         // ----------------------------------------------------------------
         // A leaf is a node that appears as no other node's parent.
-        let has_children: std::collections::HashSet<[u8; 32]> = parent_map
-            .values()
-            .filter_map(|p| *p)
-            .collect();
+        let has_children: std::collections::HashSet<[u8; 32]> =
+            parent_map.values().filter_map(|p| *p).collect();
         let expected_heads: Vec<[u8; 32]> = (0..N)
             .map(ref_of)
             .filter(|r| !has_children.contains(r))
             .collect();
 
-        let got_heads: Vec<_> = db.heads().unwrap()
-            .into_iter()
-            .map(|rec| rec.r.0)
-            .collect();
+        let got_heads: Vec<_> = db.heads().unwrap().into_iter().map(|rec| rec.r.0).collect();
 
         assert_eq!(
             got_heads.len(),

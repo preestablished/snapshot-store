@@ -16,8 +16,15 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/control-plane
           path: control-plane
+          # Pinned: building against default-branch HEAD couples our CI to
+          # unreviewed upstream changes (phase-2 plan, risk 2).
+          ref: ca9ee9048d7fca8eec5fe512011b011128e2b0c3
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - run: cargo fmt --all -- --check
+        working-directory: repo
+      - run: cargo clippy --workspace --all-targets -- -D warnings
         working-directory: repo
       - run: cargo build --workspace
         working-directory: repo

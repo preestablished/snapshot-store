@@ -40,7 +40,10 @@ fn bench_ingest_fastpath_cold(c: &mut Criterion) {
     const BATCH_SIZE: usize = 4096; // pages per ingest call
 
     // Pre-generate the page data once outside any loop.
-    let profile = GuestProfile { total_pages: TOTAL_PAGES, ..GuestProfile::all_unique() };
+    let profile = GuestProfile {
+        total_pages: TOTAL_PAGES,
+        ..GuestProfile::all_unique()
+    };
     let guest = SyntheticGuest::new(42, profile);
 
     // Collect all pages as owned data so they can be passed to iter_batched.
@@ -208,7 +211,10 @@ fn bench_ingest_plus_sync(c: &mut Criterion) {
     const TOTAL_PAGES: usize = 262_144; // 1 GiB (smaller than cold to keep it feasible)
     const BATCH_SIZE: usize = 4096;
 
-    let profile = GuestProfile { total_pages: TOTAL_PAGES, ..GuestProfile::all_unique() };
+    let profile = GuestProfile {
+        total_pages: TOTAL_PAGES,
+        ..GuestProfile::all_unique()
+    };
     let guest = SyntheticGuest::new(42, profile);
     let all_pages: Vec<Box<[u8; PAGE_SIZE]>> = guest
         .pages()

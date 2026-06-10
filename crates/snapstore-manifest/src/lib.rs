@@ -290,7 +290,10 @@ impl Manifest {
         // Restore the original version (new() always stamps SNAPSHOT_MANIFEST_VERSION;
         // we want to preserve whatever version was in the wire bytes so decode is
         // the inverse of encode even for future version numbers).
-        Ok(Manifest { version, ..validated })
+        Ok(Manifest {
+            version,
+            ..validated
+        })
     }
 
     /// Compute the BLAKE3 hash of the canonical encoding. This is the [`SnapshotRef`].
@@ -319,10 +322,8 @@ pub mod strategies {
     }
 
     fn arb_region_at(gpa: u64) -> impl Strategy<Value = MemoryRegion> {
-        proptest::collection::vec(arb_page_hash(), 0..=4).prop_map(move |pages| MemoryRegion {
-            gpa,
-            pages,
-        })
+        proptest::collection::vec(arb_page_hash(), 0..=4)
+            .prop_map(move |pages| MemoryRegion { gpa, pages })
     }
 
     fn arb_memory_map() -> impl Strategy<Value = MemoryMap> {
@@ -395,9 +396,9 @@ pub mod strategies {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snapstore_types::PageHash;
     #[allow(unused_imports)]
     use proptest::{prop_assert, prop_assert_eq, prop_assert_ne};
+    use snapstore_types::PageHash;
 
     fn make_region(gpa: u64, num_pages: usize) -> MemoryRegion {
         MemoryRegion {
@@ -492,8 +493,7 @@ mod tests {
             page_size: 4096,
             regions: vec![],
         };
-        let m =
-            Manifest::new(None, 0, 0, memory, vec![]).expect("minimal manifest should succeed");
+        let m = Manifest::new(None, 0, 0, memory, vec![]).expect("minimal manifest should succeed");
         assert_eq!(m.version, SNAPSHOT_MANIFEST_VERSION);
         assert!(m.parent.is_none());
         assert!(m.memory.regions.is_empty());
@@ -601,7 +601,10 @@ mod tests {
         let m = Manifest::new(None, 0, 0, memory, vec![]).unwrap();
         let mut encoded = m.encode();
         encoded.push(0xff);
-        assert!(matches!(Manifest::decode(&encoded), Err(DecodeError::TrailingBytes)));
+        assert!(matches!(
+            Manifest::decode(&encoded),
+            Err(DecodeError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -614,7 +617,10 @@ mod tests {
         let encoded = m.encode();
         assert!(encoded.len() > 1, "encoded must be non-trivial");
         let truncated = &encoded[..encoded.len() - 1];
-        assert!(matches!(Manifest::decode(truncated), Err(DecodeError::UnexpectedEof)));
+        assert!(matches!(
+            Manifest::decode(truncated),
+            Err(DecodeError::UnexpectedEof)
+        ));
     }
 
     #[test]
@@ -622,7 +628,10 @@ mod tests {
         // version (4 bytes) then a bad parent tag
         let mut buf = vec![0x01, 0x00, 0x00, 0x00]; // version=1
         buf.push(0x02); // invalid Option tag
-        assert!(matches!(Manifest::decode(&buf), Err(DecodeError::InvalidTag(2))));
+        assert!(matches!(
+            Manifest::decode(&buf),
+            Err(DecodeError::InvalidTag(2))
+        ));
     }
 
     // -----------------------------------------------------------------------

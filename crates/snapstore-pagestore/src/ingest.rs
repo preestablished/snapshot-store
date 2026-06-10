@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use snapstore_types::{PageHash, PackId, PageLoc, PAGE_SIZE};
+use snapstore_types::{PackId, PageHash, PageLoc, PAGE_SIZE};
 
 use crate::index::{rebuild_from_pack, IndexError, ShardedIndex};
-use crate::pack::{PackError, PackReader, PackWriter, PACK_FOOTER_SIZE, PACK_HEADER_SIZE, RECORD_HEADER_SIZE};
+use crate::pack::{
+    PackError, PackReader, PackWriter, PACK_FOOTER_SIZE, PACK_HEADER_SIZE, RECORD_HEADER_SIZE,
+};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -118,11 +120,15 @@ impl PageStore {
                 if i < last_idx {
                     // Seal this old unseal pack and populate the index.
                     let entries = seal_existing_pack(&path, pack_id)?;
-                    index.insert_batch(
-                        entries
-                            .into_iter()
-                            .map(|(h, o)| (h, PageLoc { pack: pack_id, offset: o })),
-                    );
+                    index.insert_batch(entries.into_iter().map(|(h, o)| {
+                        (
+                            h,
+                            PageLoc {
+                                pack: pack_id,
+                                offset: o,
+                            },
+                        )
+                    }));
                     let sidecar = sidecar_path(dir, pack_id);
                     index.write_sidecar(&sidecar, pack_id)?;
                     sealed_packs.push(pack_id);
@@ -141,7 +147,7 @@ impl PageStore {
             if loaded.is_err() {
                 // Missing or corrupt sidecar: rebuild from the pack.
                 let entries = rebuild_from_pack(&p, pack_id, true)?;
-                index.insert_batch(entries.into_iter());
+                index.insert_batch(entries);
                 index.write_sidecar(&sidecar, pack_id)?;
             }
         }
@@ -154,9 +160,13 @@ impl PageStore {
             (writer, existing_id, false)
         } else {
             // No active pack; create a new one.
-            let new_id = pack_ids.last().map(|id| PackId(id.0 + 1)).unwrap_or(PackId(0));
+            let new_id = pack_ids
+                .last()
+                .map(|id| PackId(id.0 + 1))
+                .unwrap_or(PackId(0));
             let path = pack_path(dir, new_id);
-            let writer = PackWriter::create_with_max_bytes(&path, new_id, unix_now(), max_pack_bytes)?;
+            let writer =
+                PackWriter::create_with_max_bytes(&path, new_id, unix_now(), max_pack_bytes)?;
             pack_ids.push(new_id); // keep sorted list consistent (not used further)
             (writer, new_id, true)
         };
@@ -385,21 +395,20 @@ fn discover_packs(dir: &Path) -> Result<Vec<PackId>, StoreError> {
 
 /// Return true if the pack at `path` has a valid footer (is sealed).
 fn is_pack_sealed(path: &Path) -> bool {
-    PackReader::open(path, PackId(0)).is_ok()
-        || {
-            // Quick size check: if the file is too small it cannot be sealed.
-            match std::fs::metadata(path) {
-                Ok(m) => {
-                    if m.len() < PACK_HEADER_SIZE + PACK_FOOTER_SIZE {
-                        return false;
-                    }
-                    // Re-try with a dummy pack_id; open() validates footer magic so
-                    // any PackId works for the sealed check.
-                    false
+    PackReader::open(path, PackId(0)).is_ok() || {
+        // Quick size check: if the file is too small it cannot be sealed.
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                if m.len() < PACK_HEADER_SIZE + PACK_FOOTER_SIZE {
+                    return false;
                 }
-                Err(_) => false,
+                // Re-try with a dummy pack_id; open() validates footer magic so
+                // any PackId works for the sealed check.
+                false
             }
+            Err(_) => false,
         }
+    }
 }
 
 /// Seal an existing unsealed pack file.
@@ -408,12 +417,9 @@ fn is_pack_sealed(path: &Path) -> bool {
 /// 2. Scans all valid records to rebuild the body hash.
 /// 3. Writes the 44-byte footer and calls fdatasync.
 /// 4. Returns `(hash, offset)` pairs for index population.
-fn seal_existing_pack(
-    path: &Path,
-    pack_id: PackId,
-) -> Result<Vec<(PageHash, u64)>, StoreError> {
-    use std::io::Write;
+fn seal_existing_pack(path: &Path, pack_id: PackId) -> Result<Vec<(PageHash, u64)>, StoreError> {
     use crate::pack::FOOTER_MAGIC;
+    use std::io::Write;
 
     // open_unsealed truncates corrupt tail; returns a reader over valid records.
     let (reader, _) = PackReader::open_unsealed(path, pack_id)?;
@@ -444,9 +450,7 @@ fn seal_existing_pack(
     let body_hash = body_hasher.finalize();
 
     // Open file for appending and write the footer.
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)?;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
 
     let mut footer = [0u8; PACK_FOOTER_SIZE as usize];
     footer[0..4].copy_from_slice(FOOTER_MAGIC);
@@ -472,11 +476,15 @@ fn reopen_pack_for_append(
     let records = reader.scan()?;
 
     // Populate the index with all existing records.
-    index.insert_batch(
-        records
-            .into_iter()
-            .map(|(offset, hash)| (hash, PageLoc { pack: pack_id, offset })),
-    );
+    index.insert_batch(records.into_iter().map(|(offset, hash)| {
+        (
+            hash,
+            PageLoc {
+                pack: pack_id,
+                offset,
+            },
+        )
+    }));
 
     // Use PackWriter::reopen to reconstruct writer state from the (now clean) file.
     let writer = PackWriter::reopen(path, pack_id)?;
@@ -575,7 +583,10 @@ mod tests {
         );
 
         // get() returns the correct bytes.
-        let got = store.get(&outcomes[2].hash).unwrap().expect("must be in store");
+        let got = store
+            .get(&outcomes[2].hash)
+            .unwrap()
+            .expect("must be in store");
         assert_eq!(got.as_ref(), pages[2].as_ref());
     }
 
@@ -598,10 +609,7 @@ mod tests {
         // Second batch: all dedup hits.
         let outcomes_b = store.ingest(&page_refs).unwrap();
         for (i, o) in outcomes_b.iter().enumerate() {
-            assert!(
-                !o.newly_written,
-                "batch B page {i} should be a dedup hit"
-            );
+            assert!(!o.newly_written, "batch B page {i} should be a dedup hit");
             assert_eq!(
                 outcomes_a[i].loc, outcomes_b[i].loc,
                 "location must match across batches"
@@ -625,7 +633,10 @@ mod tests {
         // Pages are still readable after sync.
         for p in &pages {
             let hash = PageHash::from_bytes(*blake3::hash(p.as_ref()).as_bytes());
-            let got = store.get(&hash).unwrap().expect("page must still be readable after sync");
+            let got = store
+                .get(&hash)
+                .unwrap()
+                .expect("page must still be readable after sync");
             assert_eq!(got.as_ref(), p.as_ref());
         }
     }
@@ -657,12 +668,11 @@ mod tests {
             .collect();
 
         let mut handles = Vec::new();
-        for t in 0..THREADS {
+        for thread_pages in all_pages.iter().take(THREADS) {
             let store_clone = Arc::clone(&store);
-            let pages = all_pages[t].clone();
+            let pages = thread_pages.clone();
             let handle = std::thread::spawn(move || {
-                let page_refs: Vec<&[u8; PAGE_SIZE]> =
-                    pages.iter().map(|p| p.as_ref()).collect();
+                let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
                 store_clone.ingest(&page_refs).unwrap();
             });
             handles.push(handle);
@@ -791,7 +801,7 @@ mod tests {
         // Each record = RECORD_HEADER_SIZE (37) + PAGE_SIZE (4096) = 4133 bytes.
         // Pack header = 20 bytes. Set cap so exactly 5 pages fit (20 + 5*4133 = 20685 bytes).
         // 6th page would exceed cap.
-        use crate::pack::{RECORD_HEADER_SIZE, PACK_HEADER_SIZE};
+        use crate::pack::{PACK_HEADER_SIZE, RECORD_HEADER_SIZE};
         let record_size = RECORD_HEADER_SIZE + PAGE_SIZE as u64;
         let pages_per_pack: u64 = 5;
         let max_pack_bytes = PACK_HEADER_SIZE + pages_per_pack * record_size;
