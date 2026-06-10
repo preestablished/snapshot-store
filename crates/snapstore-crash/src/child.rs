@@ -92,7 +92,7 @@ pub fn run_child(scratch: &Path, seed: u64, ops: u64, scenario: Scenario) {
 
     match scenario {
         Scenario::Default => run_default(&store, &meta, &mut rng, &mut journal, ops),
-        Scenario::SqliteBatch => run_sqlite_batch(&meta, &mut rng, &mut journal, ops),
+        Scenario::SqliteBatch => run_sqlite_batch(&store, &meta, &mut rng, &mut journal, ops),
     }
 }
 
@@ -312,9 +312,50 @@ fn run_default(
 
 // ── SQLite batch scenario ─────────────────────────────────────────────────────
 
-fn run_sqlite_batch(meta: &MetaDb, rng: &mut StdRng, journal: &mut Journal, ops: u64) {
+fn run_sqlite_batch(
+    store: &SnapshotStore,
+    meta: &MetaDb,
+    rng: &mut StdRng,
+    journal: &mut Journal,
+    ops: u64,
+) {
     let exp = ExperimentId::new("batch-exp").unwrap();
-    let dummy_ref = SnapshotRef::from_bytes([0u8; 32]);
+
+    // Anchor every node to one real stored manifest: deep fsck verifies that
+    // node snapshot_refs resolve, so an all-zero placeholder ref would be
+    // (correctly) reported as MissingManifest after every recovery.
+    let pages: Vec<[u8; PAGE_SIZE]> = (0..PAGES)
+        .map(|i| {
+            let mut p = [0u8; PAGE_SIZE];
+            p[0] = i as u8;
+            p[1] = 0xb5; // batch-scenario marker
+            p
+        })
+        .collect();
+    let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().collect();
+    store
+        .pages()
+        .ingest(&page_refs)
+        .expect("child: ingest anchor pages");
+    let indexed: Vec<(u64, &[u8; PAGE_SIZE])> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as u64, p))
+        .collect();
+    let container = snapstore_store::build::build_full_container(
+        GUEST_RAM_BYTES,
+        &indexed,
+        DeviceBlob {
+            format: 0,
+            zstd: false,
+            bytes: vec![],
+            raw_len: 0,
+        },
+    );
+    let anchor_ref = store
+        .put_snapshot(&container)
+        .expect("child: anchor snapshot");
+    let dummy_ref = anchor_ref;
 
     // Create root.
     let root = CreateNodeParams {
