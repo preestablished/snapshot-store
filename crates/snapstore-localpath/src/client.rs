@@ -99,9 +99,11 @@ impl PageChannelClient {
         );
         assert!(!pages.is_empty(), "put_batch: empty batch");
 
-        // Compute per-page hashes for the cross-check.
+        // Compute per-page hashes for the cross-check (rayon: serial blake3
+        // alone caps the batch below the 1.5 GB/s transport gate).
+        use rayon::prelude::*;
         let hashes: Vec<PageHash> = pages
-            .iter()
+            .par_iter()
             .map(|p| PageHash::from_bytes(*blake3::hash(*p).as_bytes()))
             .collect();
         let local_cross_check = batch_cross_check(&hashes);
@@ -228,13 +230,19 @@ impl PageChannelClient {
                             "GET_BATCH_DATA fd size {fd_len} != expected {expected_len}"
                         )));
                     }
+                    // Bulk-read the whole reply memfd (per-page 4 KiB reads
+                    // would cap GET_BATCH well below the 2.5 GB/s gate).
                     let file = std::fs::File::from(fd);
-                    let mut pages_for_this_reply = Vec::with_capacity(echoed.len());
-                    for (i, req) in echoed.iter().enumerate() {
-                        let mut page = vec![0u8; PAGE_SIZE];
-                        file.read_exact_at(&mut page, (i * PAGE_SIZE) as u64)?;
-                        pages_for_this_reply.push((req.dst_slot, page));
+                    let mut all = vec![0u8; expected_len as usize];
+                    const READ_CHUNK: usize = 4 * 1024 * 1024;
+                    for (chunk_idx, chunk) in all.chunks_mut(READ_CHUNK).enumerate() {
+                        file.read_exact_at(chunk, (chunk_idx * READ_CHUNK) as u64)?;
                     }
+                    let pages_for_this_reply: Vec<(u64, Vec<u8>)> = echoed
+                        .iter()
+                        .zip(all.chunks_exact(PAGE_SIZE))
+                        .map(|(req, page)| (req.dst_slot, page.to_vec()))
+                        .collect();
                     reply_pages.insert(hdr.seq, pages_for_this_reply);
                 }
                 MsgKind::Error => {

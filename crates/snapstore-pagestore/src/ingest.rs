@@ -421,9 +421,56 @@ impl PageStore {
         //    new pack), and retry once before erroring.
         //    M7 GC relies on this probe: it repoints index entries then unlinks the
         //    old pack; one retry is sufficient to follow the repoint.
-        for (input_idx, hash, loc) in &sealed_lookups {
-            let data = self.read_sealed_with_retry(*input_idx, hash, *loc)?;
-            results[*input_idx] = data;
+        // The sealed path is the GET_BATCH hot loop. Two things matter for
+        // the 2.5 GB/s warm gate: fetch the pack handle ONCE per pack run
+        // (per-page cache lookups serialize on the LRU mutex), and spread the
+        // pread + per-record blake3 verification across rayon (a serial loop
+        // is capped by single-core hashing). Lookups are (pack, offset)-
+        // sorted, so per-pack groups are contiguous and rayon's splits keep
+        // reads mostly sequential.
+        let mut group_start = 0;
+        while group_start < sealed_lookups.len() {
+            let pack = sealed_lookups[group_start].2.pack;
+            let group_end = sealed_lookups[group_start..]
+                .iter()
+                .position(|(_, _, loc)| loc.pack != pack)
+                .map(|p| group_start + p)
+                .unwrap_or(sealed_lookups.len());
+            let group = &sealed_lookups[group_start..group_end];
+
+            match self.read_cache.get_or_open(pack) {
+                Ok(handle) => {
+                    let reads: Vec<(usize, Option<bytes::Bytes>)> = group
+                        .par_iter()
+                        .map(|(input_idx, hash, loc)| {
+                            match PackReader::read_at_from_file(&handle, loc.offset, hash) {
+                                Ok(data) => Ok((*input_idx, Some(data))),
+                                Err(PackError::Io(ref e))
+                                    if e.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    // Fall back to the slow per-page retry path
+                                    // (M7 GC repoint-then-unlink).
+                                    self.read_sealed_with_retry(*input_idx, hash, *loc)
+                                        .map(|d| (*input_idx, d))
+                                }
+                                Err(e) => Err(StoreError::Pack(e)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>, StoreError>>()?;
+                    for (input_idx, data) in reads {
+                        results[input_idx] = data;
+                    }
+                }
+                Err(_) => {
+                    // Pack missing/unopenable: per-page retry path handles the
+                    // GC-repoint case and surfaces genuine errors.
+                    for (input_idx, hash, loc) in group {
+                        results[*input_idx] =
+                            self.read_sealed_with_retry(*input_idx, hash, *loc)?;
+                    }
+                }
+            }
+            group_start = group_end;
         }
 
         // 5. Process active-pack reads under the active lock.

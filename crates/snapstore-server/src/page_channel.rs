@@ -370,26 +370,36 @@ fn handle_put_batch(
         return false;
     }
 
-    // Read pages from the memfd (pread, no unsafe mmap needed).
+    // Map the memfd read-only and borrow pages straight out of the mapping —
+    // zero copies on the receive path (a 32 MiB read-copy caps PUT_BATCH
+    // below the 1.5 GB/s transport gate). SAFETY of the mapping lifetime:
+    // we verified F_SEAL_WRITE | F_SEAL_SHRINK above, so no other process can
+    // mutate or truncate the memfd while we read it — exactly the TOCTOU
+    // guarantee the seal requirement exists to provide (no SIGBUS window).
     let file = std::fs::File::from(fd);
-    let mut pages: Vec<Box<[u8; PAGE_SIZE]>> = Vec::with_capacity(count as usize);
-    for i in 0..count as usize {
-        let mut page = Box::new([0u8; PAGE_SIZE]);
-        if let Err(e) = file.read_exact_at(page.as_mut(), (i * PAGE_SIZE) as u64) {
+    #[allow(unsafe_code)]
+    let mapped = match unsafe {
+        // populate(): fault the whole mapping in one go — 8192 on-demand
+        // minor faults per batch otherwise dominate the receive path.
+        memmap2::MmapOptions::new().populate().map(&file)
+    } {
+        Ok(m) => m,
+        Err(e) => {
             in_flight.fetch_sub(count as i64, Ordering::SeqCst);
             let _ = send_datagram(
                 conn,
-                &encode_error(hdr.seq, ErrorCode::Invalid, &format!("read page {i}: {e}")),
+                &encode_error(hdr.seq, ErrorCode::Invalid, &format!("mmap pages: {e}")),
                 None,
             );
             return true;
         }
-        pages.push(page);
-    }
-    // fd (file) drops here — RAII close.
+    };
+    let buf: &[u8] = &mapped;
 
-    // Convert to refs for ingest.
-    let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+    let page_refs: Vec<&[u8; PAGE_SIZE]> = buf
+        .chunks_exact(PAGE_SIZE)
+        .map(|c| <&[u8; PAGE_SIZE]>::try_from(c).unwrap())
+        .collect();
 
     // Ingest via PageStore (hashes internally with rayon).
     let outcomes = match page_store.ingest(&page_refs) {
@@ -520,16 +530,30 @@ fn handle_get_batch(
         }
     };
 
-    for (i, maybe) in results.iter().enumerate() {
-        let page_bytes = maybe.as_ref().unwrap();
-        if let Err(e) = file.write_all_at(page_bytes, (i * PAGE_SIZE) as u64) {
-            let _ = send_datagram(
-                conn,
-                &encode_error(hdr.seq, ErrorCode::Invalid, &format!("write page: {e}")),
-                None,
-            );
-            return true;
+    // Stage pages into 1 MiB writes (per-page 4 KiB syscalls cap GET_BATCH
+    // far below the 2.5 GB/s gate).
+    const STAGE_PAGES: usize = 256;
+    let mut stage = Vec::with_capacity(STAGE_PAGES * PAGE_SIZE);
+    let mut offset = 0u64;
+    let mut write_err = None;
+    for chunk in results.chunks(STAGE_PAGES) {
+        stage.clear();
+        for maybe in chunk {
+            stage.extend_from_slice(maybe.as_ref().unwrap());
         }
+        if let Err(e) = file.write_all_at(&stage, offset) {
+            write_err = Some(e);
+            break;
+        }
+        offset += stage.len() as u64;
+    }
+    if let Some(e) = write_err {
+        let _ = send_datagram(
+            conn,
+            &encode_error(hdr.seq, ErrorCode::Invalid, &format!("write pages: {e}")),
+            None,
+        );
+        return true;
     }
 
     let sealed_fd = match seal_get_memfd(file) {

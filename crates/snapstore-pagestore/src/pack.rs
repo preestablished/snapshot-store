@@ -402,23 +402,22 @@ impl PackReader {
     ) -> Result<bytes::Bytes, PackError> {
         use std::os::unix::fs::FileExt;
 
-        // Read record header via pread (lock-free, no seek state).
-        let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
-        file.read_exact_at(&mut rec_header, offset)
+        // One pread covers header + payload (two syscalls per page would
+        // halve GET_BATCH throughput).
+        let mut record = vec![0u8; RECORD_HEADER_SIZE as usize + PAGE_SIZE];
+        file.read_exact_at(&mut record, offset)
             .map_err(|_| PackError::TruncatedRecord { offset })?;
 
-        let stored_hash_bytes: [u8; 32] = rec_header[0..32].try_into().unwrap();
-        let len = u32::from_le_bytes(rec_header[33..37].try_into().unwrap());
+        let stored_hash_bytes: [u8; 32] = record[0..32].try_into().unwrap();
+        let len = u32::from_le_bytes(record[33..37].try_into().unwrap());
 
         // Sanity-check length: must be exactly PAGE_SIZE for raw page records.
         if len as usize != PAGE_SIZE {
             return Err(PackError::TruncatedRecord { offset });
         }
 
-        // Read payload via pread.
-        let mut payload = vec![0u8; len as usize];
-        file.read_exact_at(&mut payload, offset + RECORD_HEADER_SIZE)
-            .map_err(|_| PackError::TruncatedRecord { offset })?;
+        // Zero-copy payload view over the single read buffer.
+        let payload = bytes::Bytes::from(record).slice(RECORD_HEADER_SIZE as usize..);
 
         // Verify stored hash matches requested hash (detects corruption and
         // wrong-offset reads).
@@ -432,7 +431,7 @@ impl PackReader {
             return Err(PackError::HashMismatch { offset });
         }
 
-        Ok(bytes::Bytes::from(payload))
+        Ok(payload)
     }
 
     /// Open an unsealed (active or crashed) pack.  Scans records forward,

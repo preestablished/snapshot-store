@@ -6,7 +6,6 @@
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::FileExt;
 
 use nix::fcntl::{fcntl, FcntlArg, SealFlag};
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
@@ -134,8 +133,21 @@ pub fn create_sealed_put_memfd(pages: &[&[u8; PAGE_SIZE]]) -> Result<OwnedFd, Ch
     )
     .map_err(io_err)?;
     let file = std::fs::File::from(fd);
-    for (i, page) in pages.iter().enumerate() {
-        file.write_all_at(*page, (i * PAGE_SIZE) as u64)?;
+    // Vectored writes straight from the caller's pages — zero staging copy
+    // (a stage+write pair of memcpys caps PUT_BATCH below the 1.5 GB/s
+    // transport gate). IOV_MAX is 1024 on Linux; chunk accordingly.
+    const IOV_CHUNK: usize = 1024;
+    let mut offset = 0u64;
+    for chunk in pages.chunks(IOV_CHUNK) {
+        let iov: Vec<IoSlice<'_>> = chunk.iter().map(|p| IoSlice::new(*p)).collect();
+        let expected: usize = chunk.len() * PAGE_SIZE;
+        let written = nix::sys::uio::pwritev(&file, &iov, offset as i64).map_err(io_err)?;
+        if written != expected {
+            return Err(ChannelError::Protocol(format!(
+                "short memfd pwritev: {written} of {expected} bytes"
+            )));
+        }
+        offset += expected as u64;
     }
     let fd = OwnedFd::from(file);
     fcntl(
@@ -203,6 +215,7 @@ mod tests {
     use crate::proto::*;
     use snapstore_types::PageHash;
     use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
 
     fn page(fill: u8) -> Box<[u8; PAGE_SIZE]> {
         Box::new([fill; PAGE_SIZE])
