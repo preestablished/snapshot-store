@@ -718,6 +718,7 @@ dependencies = [
  "crc32fast",
  "parking_lot",
  "rayon",
+ "snapstore-testgen",
  "snapstore-types",
  "tempfile",
  "thiserror",

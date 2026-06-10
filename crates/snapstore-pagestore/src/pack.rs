@@ -85,6 +85,87 @@ impl PackWriter {
         })
     }
 
+    /// Reopen an existing unsealed pack file for continued appending.
+    ///
+    /// The file must already exist and must NOT have a valid footer (unsealed).
+    /// Scans existing records to reconstruct `write_offset`, `record_count`, and
+    /// `body_hasher`.  Returns a `PackWriter` ready to append more records.
+    pub fn reopen(path: &Path, pack_id: PackId) -> Result<Self, PackError> {
+        use std::os::unix::fs::FileExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        // Validate header magic.
+        let mut magic = [0u8; 4];
+        file.read_exact_at(&mut magic, 0)?;
+        if &magic != PACK_MAGIC {
+            return Err(PackError::BadMagic);
+        }
+
+        // Determine file length.
+        let file_len = file.seek(SeekFrom::End(0))?;
+
+        // Scan forward through records to reconstruct hasher and counts.
+        let mut offset = PACK_HEADER_SIZE;
+        let mut record_count: u64 = 0;
+        let mut body_hasher = blake3::Hasher::new();
+
+        while offset < file_len {
+            let remaining = file_len - offset;
+            if remaining < RECORD_HEADER_SIZE {
+                break;
+            }
+
+            // Read record header.
+            let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
+            file.read_exact_at(&mut rec_header, offset)?;
+            let len = u32::from_le_bytes(rec_header[33..37].try_into().unwrap());
+
+            // Sanity-check length.
+            if len as usize > PAGE_SIZE * 2 {
+                break;
+            }
+
+            // Check that the payload is present.
+            if offset + RECORD_HEADER_SIZE + len as u64 > file_len {
+                break;
+            }
+
+            // Read payload.
+            let mut payload = vec![0u8; len as usize];
+            file.read_exact_at(&mut payload, offset + RECORD_HEADER_SIZE)?;
+
+            // Feed the complete record (header + payload) into the body hasher.
+            body_hasher.update(&rec_header);
+            body_hasher.update(&payload);
+
+            record_count += 1;
+            offset += RECORD_HEADER_SIZE + len as u64;
+        }
+
+        // Re-open and seek to the write position so subsequent flush_buf calls
+        // land at the right offset.
+        drop(file);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+
+        Ok(Self {
+            file,
+            pack_id,
+            body_hasher,
+            write_buf: Vec::with_capacity(WRITE_BUF_FLUSH_THRESHOLD + PAGE_SIZE + 37),
+            write_offset: offset,
+            record_count,
+            sealed: false,
+        })
+    }
+
     /// True if appending one more record would exceed the 1 GiB cap.
     pub fn would_exceed_cap(&self) -> bool {
         self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > PACK_MAX_BYTES
