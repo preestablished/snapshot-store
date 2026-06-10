@@ -10,3 +10,4 @@ proto = ["dep:determinism-proto"]
 
 [dependencies]
 determinism-proto = { workspace = true, features = ["snapstore"], optional = true }
+thiserror = "2"
