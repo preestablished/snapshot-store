@@ -10,11 +10,13 @@
 
 mod child;
 mod fsck;
+mod fullstack;
 mod harness;
 
 // Re-export for integration tests.
 pub use child::Scenario;
 pub use fsck::{FsckReport, Violation};
+pub use fullstack::find_server_binary;
 pub use harness::{run_cycles, RunOptions, Summary};
 
 use snapstore_types::PAGE_SIZE;

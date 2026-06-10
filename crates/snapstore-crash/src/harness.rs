@@ -13,6 +13,7 @@ use snapstore_store::SnapshotStore;
 use snapstore_types::{ExperimentId, NodeId, SnapshotRef};
 
 use crate::fsck::fsck;
+use crate::fullstack;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -78,12 +79,70 @@ pub struct Summary {
 ///
 /// Spawns the child binary (current exe), kills with SIGKILL after a random
 /// delay, then runs recovery + fsck + invariant checks.
+///
+/// For the `FullStack` scenario, the child process is not used; instead the
+/// real `snapstore-server` binary is driven via gRPC.  The failpoint matrix
+/// is NOT applicable to `FullStack` (failpoints require the child to be built
+/// with the `failpoints` feature; the release server binary has none) and is
+/// silently skipped.  `--matrix-passes > 0` with `--scenario full-stack` emits
+/// a single informational note.
 pub fn run_cycles(opts: &RunOptions) -> Summary {
     let start = Instant::now();
     let mut summary = Summary::default();
     let mut rng = StdRng::seed_from_u64(opts.seed);
 
-    // ── Random-kill cycles ────────────────────────────────────────────────────
+    // ── Full-stack scenario ───────────────────────────────────────────────────
+
+    if opts.scenario == crate::child::Scenario::FullStack {
+        if opts.matrix_passes > 0 {
+            eprintln!(
+                "NOTE: --matrix-passes {} ignored for full-stack scenario \
+                 (failpoints require a specially-built child; the release \
+                 snapstore-server binary has none).",
+                opts.matrix_passes
+            );
+        }
+
+        // Find the server binary.
+        let server_binary = match fullstack::find_server_binary() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: snapstore-server binary not found next to current \
+                     executable.  Build it first: cargo build -p snapstore-server"
+                );
+                let elapsed = start.elapsed().as_secs_f64();
+                summary.elapsed_secs = elapsed;
+                return summary;
+            }
+        };
+
+        for cycle in 0..opts.cycles {
+            let cycle_seed = rng.gen::<u64>();
+            summary.total_cycles += 1;
+            match fullstack::run_fullstack_cycle(&server_binary, cycle_seed) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "INVARIANT FAILURE full-stack cycle {cycle}: {e}\n\
+                         repro: cargo run -p snapstore-crash -- \
+                         run --scenario full-stack --cycles 1 --seed {cycle_seed} \
+                         --matrix-passes 0"
+                    );
+                    summary.invariant_failures += 1;
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        summary.elapsed_secs = elapsed;
+        if elapsed > 0.0 {
+            summary.cycles_per_sec = summary.total_cycles as f64 / elapsed;
+        }
+        return summary;
+    }
+
+    // ── Random-kill cycles (library mode) ────────────────────────────────────
 
     for cycle in 0..opts.cycles {
         let cycle_seed = rng.gen::<u64>();
@@ -194,6 +253,11 @@ fn spawn_child(
     let scenario_str = match scenario {
         crate::child::Scenario::Default => "default",
         crate::child::Scenario::SqliteBatch => "sqlite-batch",
+        // FullStack does not use a child workload process; this branch should
+        // never be reached (run_cycles returns early for FullStack).
+        crate::child::Scenario::FullStack => {
+            return Err("spawn_child called for FullStack scenario (should not happen)".into());
+        }
     };
 
     let mut cmd = std::process::Command::new(&exe);

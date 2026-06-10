@@ -29,6 +29,11 @@ use snapstore_types::{ExperimentId, LogId, NodeId, NodeStatus, SnapshotRef, PAGE
 pub enum Scenario {
     Default,
     SqliteBatch,
+    /// Full-stack mode: the real `snapstore-server` binary is the kill target.
+    /// The child process is NOT used for the workload in this scenario; the
+    /// parent drives the server via gRPC.  This variant is accepted by the CLI
+    /// so `--scenario full-stack` routes correctly through `run_cycles`.
+    FullStack,
 }
 
 impl std::str::FromStr for Scenario {
@@ -37,6 +42,7 @@ impl std::str::FromStr for Scenario {
         match s {
             "default" => Ok(Scenario::Default),
             "sqlite-batch" => Ok(Scenario::SqliteBatch),
+            "full-stack" => Ok(Scenario::FullStack),
             _ => Err(format!("unknown scenario: {s}")),
         }
     }
@@ -93,6 +99,14 @@ pub fn run_child(scratch: &Path, seed: u64, ops: u64, scenario: Scenario) {
     match scenario {
         Scenario::Default => run_default(&store, &meta, &mut rng, &mut journal, ops),
         Scenario::SqliteBatch => run_sqlite_batch(&store, &meta, &mut rng, &mut journal, ops),
+        Scenario::FullStack => {
+            // The full-stack scenario does not use a child process for the
+            // workload; the parent drives the server directly via gRPC.
+            // If somehow invoked as a child subcommand, just exit immediately.
+            eprintln!(
+                "snapstore-crash child: full-stack scenario does not use a child workload process"
+            );
+        }
     }
 }
 

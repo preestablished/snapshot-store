@@ -25,6 +25,8 @@ snapstore-pagestore = { path = "../snapstore-pagestore" }
 snapstore-meta     = { path = "../snapstore-meta" }
 snapstore-manifest = { path = "../snapstore-manifest" }
 snapstore-types    = { path = "../snapstore-types" }
+# Full-stack scenario: blocking client drives the server-under-test via gRPC.
+snapstore-client   = { path = "../snapstore-client" }
 
 # SQLite direct access for fsck (read-only, bypasses snapstore-meta API).
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -45,6 +47,9 @@ thiserror = "2"
 tempfile  = "3"
 
 clap = { version = "4", features = ["derive"] }
+
+# Tokio runtime required by the blocking client (thin current_thread wrapper).
+tokio = { workspace = true }
 
 # Optional failpoint runtime (arming via FAILPOINTS env var in the child).
 fail = { version = "0.5", optional = true }
