@@ -202,6 +202,7 @@ mod tests {
     use super::*;
     use crate::proto::*;
     use snapstore_types::PageHash;
+    use std::os::fd::AsFd;
 
     fn page(fill: u8) -> Box<[u8; PAGE_SIZE]> {
         Box::new([fill; PAGE_SIZE])
