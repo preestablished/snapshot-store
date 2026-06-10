@@ -366,6 +366,7 @@ fn randomized_kill_cycles_5() {
         matrix_passes: 0,
         ops_per_cycle: 32,
         scenario: Scenario::Default,
+        failpoint: None,
     };
     let summary = run_cycles(&opts);
     assert_eq!(
@@ -389,6 +390,7 @@ fn failpoint_matrix_one_pass() {
         matrix_passes: 1,
         ops_per_cycle: 16,
         scenario: Scenario::Default,
+        failpoint: None,
     };
     let summary = run_cycles(&opts);
     assert_eq!(summary.matrix_failures, 0, "matrix failures: {summary:?}");
@@ -404,6 +406,7 @@ fn sqlite_batch_10_cycles() {
         matrix_passes: 0,
         ops_per_cycle: 30,
         scenario: Scenario::SqliteBatch,
+        failpoint: None,
     };
     let summary = run_cycles(&opts);
     assert_eq!(

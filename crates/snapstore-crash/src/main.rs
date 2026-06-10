@@ -65,6 +65,10 @@ enum Cmd {
         /// Workload scenario.
         #[arg(long, default_value = "default")]
         scenario: String,
+        /// Arm one named failpoint for every randomized cycle (matrix-failure
+        /// repro; requires --features failpoints).
+        #[arg(long)]
+        failpoint: Option<String>,
     },
     /// Offline integrity check — prints a JSON report and exits nonzero on violations.
     Fsck {
@@ -107,6 +111,7 @@ fn main() {
             matrix_passes,
             ops_per_cycle,
             scenario,
+            failpoint,
         } => {
             let sc: child::Scenario = scenario.parse().unwrap_or_else(|e| {
                 eprintln!("bad scenario: {e}");
@@ -119,6 +124,7 @@ fn main() {
                 matrix_passes,
                 ops_per_cycle,
                 scenario: sc,
+                failpoint,
             };
 
             println!(

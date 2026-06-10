@@ -41,6 +41,9 @@ pub struct RunOptions {
     pub matrix_passes: u64,
     pub ops_per_cycle: u64,
     pub scenario: crate::child::Scenario,
+    /// Arm one named failpoint for every randomized cycle (repro path for
+    /// matrix failures). Requires the `failpoints` feature.
+    pub failpoint: Option<String>,
 }
 
 impl Default for RunOptions {
@@ -51,6 +54,7 @@ impl Default for RunOptions {
             matrix_passes: 1,
             ops_per_cycle: 64,
             scenario: crate::child::Scenario::Default,
+            failpoint: None,
         }
     }
 }
@@ -83,7 +87,12 @@ pub fn run_cycles(opts: &RunOptions) -> Summary {
 
     for cycle in 0..opts.cycles {
         let cycle_seed = rng.gen::<u64>();
-        let result = run_one_cycle(cycle_seed, opts.ops_per_cycle, opts.scenario, None);
+        let result = run_one_cycle(
+            cycle_seed,
+            opts.ops_per_cycle,
+            opts.scenario,
+            opts.failpoint.as_deref(),
+        );
         summary.total_cycles += 1;
 
         match result {
@@ -115,7 +124,8 @@ pub fn run_cycles(opts: &RunOptions) -> Summary {
                         eprintln!(
                             "MATRIX FAILURE fp={fp_name}: {e}\n\
                              repro: cargo run -p snapstore-crash --features failpoints -- \
-                             run --cycles 1 --seed {cycle_seed} --matrix-passes 0"
+                             run --cycles 1 --seed {cycle_seed} --matrix-passes 0 \
+                             --failpoint {fp_name}"
                         );
                         summary.matrix_failures += 1;
                     }

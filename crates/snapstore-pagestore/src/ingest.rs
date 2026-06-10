@@ -123,6 +123,22 @@ impl PageStore {
         // 1. Find all pack files, sorted ascending by PackId.
         let mut pack_ids = discover_packs(dir)?;
 
+        // 1b. Remove runt packs: a file shorter than the 20-byte header is a
+        // crash between pack creation and the header write (the M6 harness
+        // hits this window via the rotation failpoints). It cannot contain a
+        // committed record and nothing references it — deleting is the
+        // repair; recovery would otherwise die on a short header read.
+        pack_ids.retain(|&pack_id| {
+            let path = pack_path(dir, pack_id);
+            match std::fs::metadata(&path) {
+                Ok(m) if m.len() < PACK_HEADER_SIZE => {
+                    let _ = std::fs::remove_file(&path);
+                    false
+                }
+                _ => true,
+            }
+        });
+
         let index = Arc::new(ShardedIndex::new());
 
         // Separate sealed from unsealed packs.
