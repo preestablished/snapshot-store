@@ -17,6 +17,10 @@ thiserror = "2"
 tempfile = "3"
 snapstore-testgen = { path = "../snapstore-testgen" }
 
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["html_reports"]
+
 [[bench]]
 name = "ingest"
 harness = false
