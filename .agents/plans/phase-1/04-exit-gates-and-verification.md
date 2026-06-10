@@ -8,9 +8,12 @@ snapshot-store owns two of the four Phase 1 exit-gate items:
 ## G1 — fast-path ingest ≥ 1.5 GB/s
 
 **Definition.** Throughput of `PageStore::ingest` on the cold path (all-new
-pages: hash + index probe + buffered append, no fsync per batch), measured
-over ≥ 4 GiB of synthetic data from `snapstore-testgen`
-(`busy_workload` profile, fixed seed), on the reference Intel box.
+pages: hash + batch dedup + index probe + buffered append, no fsync per
+batch), measured over 4 GiB per iteration of synthetic data from
+`snapstore-testgen` (**`all_unique` profile**, fixed seed — pairwise-distinct
+pages so zero dedup hits; profiles with a zero-page fraction would inflate
+the number by skipping the append path), on the reference Intel box.
+Throughput accounting: input bytes presented to `ingest`.
 
 **How measured.**
 
@@ -19,12 +22,18 @@ cargo bench -p snapstore-pagestore -- ingest_fastpath_cold
 ```
 
 Criterion reports `Throughput::Bytes`; the gate number is the reported
-mean GB/s. Also recorded (informational, not gated): `ingest_fastpath_warm`
-(dedup-dominated) and `ingest_plus_sync`.
+**median** GB/s. Full methodology (input pre-generated outside the timed
+region, fresh store dir per iteration, sample count, burst-vs-sustained
+position on dirty-page throttling) is pinned in `01-m1-page-store-core.md`
+WI5 — the bench must follow it or the number isn't the gate number. Also
+recorded (informational, not gated): `ingest_fastpath_realistic`
+(`busy_workload`), `ingest_fastpath_warm` (dedup-dominated), and
+`ingest_plus_sync`.
 
 **Rules.**
 - Sign-off happens on the reference machine only; record machine identity,
-  kernel, and rustc version alongside the number in the sign-off note.
+  kernel, rustc version, and `vm.dirty_ratio`/`vm.dirty_bytes` alongside the
+  number in the sign-off note.
 - CI runs the bench as a smoke test and flags >10% regressions; CI absolute
   numbers are not the gate.
 - Fixed seed, fixed profile, store on a local NVMe path (not tmpfs — tmpfs
@@ -45,8 +54,8 @@ turning knobs.
 **How measured.**
 
 ```bash
-cargo test -p snapstore-manifest            # proptest round-trip / ref-stability / strictness + golden vector
-cargo test -p snapstore-store               # commit→resolve byte-identity, multi-epoch, reopen
+cargo test -p snapstore-manifest            # proptest round-trip / canonical-bytes / ref-stability / strictness + golden vector
+cargo test -p snapstore-store               # commit→resolve byte-identity, multi-epoch, reopen, manifest-corruption rejection
 PROPTEST_CASES=4096 cargo test -p snapstore-manifest   # sign-off run, deeper case count
 ```
 
@@ -59,20 +68,26 @@ PROPTEST_CASES=4096 cargo test -p snapstore-manifest   # sign-off run, deeper ca
 ## Full verification checklist (phase sign-off)
 
 ```
-[ ] cargo build --workspace --all-targets        # requires determinism-proto request fulfilled;
-                                                 # until then: -p each Phase 1 crate
+[ ] cargo build --workspace --all-targets        # works from M1 WI0 onward via the
+                                                 # vendored determinism-proto stub
 [ ] cargo test  -p snapstore-types -p snapstore-testgen -p snapstore-pagestore
 [ ] cargo test  -p snapstore-manifest -p snapstore-store -p snapstore-meta
 [ ] cargo clippy --workspace -- -D warnings
-[ ] cargo bench -p snapstore-pagestore           # on reference machine
-[ ] G1 number ≥ 1.5 GB/s recorded with machine identity
-[ ] PROPTEST_CASES=4096 deep run green
-[ ] torn-write recovery + index rebuild tests green (M1 WI2/WI3)
-[ ] multi-epoch dedup integration test green (M2 WI3)
+[ ] cargo bench -p snapstore-pagestore           # on reference machine, per WI5 methodology
+[ ] G1 median ≥ 1.5 GB/s recorded with machine identity + vm.dirty_* settings
+[ ] PROPTEST_CASES=4096 deep run green (incl. canonical-bytes property)
+[ ] torn-write recovery (truncation + payload corruption) + index rebuild +
+    crash-during-rotation tests green (M1 WI2/WI3)
+[ ] sync()-spans-rotation durability test green (M1 WI4)
+[ ] multi-epoch dedup + manifest-corruption-rejection tests green (M2 WI3)
 [ ] lineage property test green (M3 WI3)
+[ ] M2↔M3 commit→register integration test green (M3 WI4)
 [ ] all beads issues for M1–M3 closed; follow-ups filed
 [x] control-plane request `publish-determinism-proto` filed 2026-06-10
     (~/.agents/projects/control-plane/requests/publish-determinism-proto/)
+[ ] if the request was fulfilled during the phase: stub retired (path flipped
+    to ../control-plane), acceptance checks in the request dir pass;
+    otherwise: stub still in place and noted in hand-off
 [ ] git push + bd dolt push clean
 ```
 

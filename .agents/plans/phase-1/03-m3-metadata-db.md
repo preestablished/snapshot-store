@@ -1,7 +1,9 @@
 # M3 — Metadata DB (`snapstore-meta`)
 
 **Crates:** `snapstore-meta` (new)
-**Depends on:** M1 (types only — `SnapshotRef`); no dependency on M2 code
+**Depends on:** nothing — `SnapshotRef` already exists in Phase 0
+`snapstore-types`, so M3 can technically start any time (after M1 WI0's
+workspace fix); the upstream "after M1" sequencing is a staffing choice
 **Parallel with:** M2
 
 ## Scope
@@ -42,8 +44,10 @@ CREATE UNIQUE INDEX idx_snapshots_label ON snapshots(label) WHERE label IS NOT N
 
 Notes:
 - `parent_id` is a tree in Phase 1 (single timeline ⇒ chains; the schema
-  already supports forking in Phase 2 — multiple children per parent — with
-  no migration).
+  supports *tree-shaped* forking in Phase 2 — multiple children per parent —
+  with no migration). If Phase 2 lineage turns out to need true multi-parent
+  DAG edges (merges), that's a `snapshot_parents` join table and a migration;
+  the migration machinery in WI1 is the hedge, not the single column.
 - `created_at` is caller-supplied, not `now()`: keeps the crate clock-free
   and tests deterministic.
 - Migrations: embedded numbered SQL scripts run inside one transaction at
@@ -84,6 +88,11 @@ impl MetaDb {
 }
 ```
 
+Implementation note for `heads()`: do **not** write
+`WHERE id NOT IN (SELECT parent_id FROM snapshots)` — the subquery contains
+NULL `parent_id`s (every root row), and SQL's `NOT IN` with NULL returns an
+empty set. Use `NOT EXISTS` or filter `parent_id IS NOT NULL`.
+
 Semantics:
 - `register` is idempotent for an identical record (commit retries must not
   fail); a *conflicting* re-register of the same ref is an error.
@@ -106,13 +115,20 @@ Semantics:
 - Property test (reuses no M2 code): generate random trees, mirror them in a
   `HashMap` model, check `ancestors`/`descendants`/`heads` against the model.
 
-## Integration point (end of phase, after M2 lands)
+## Work item 4 — M2↔M3 integration (depends on M2 WI3 *and* M3 WI1–3)
 
-One thin follow-up once both tracks are done: `SnapshotStore::commit` (M2)
-optionally takes a `&MetaDb` and registers the snapshot after the manifest is
-durable — DB write strictly last, so the DB never references an unresolvable
-ref; a crash between manifest-write and DB-register leaves an orphan manifest
-(harmless, re-registerable), never a dangling DB row. Covered by one
-integration test in `snapstore-store`. This is the only M2↔M3 touchpoint and
-lands after both; neither milestone waits on the other for its own
-acceptance.
+An explicit work item with its own beads issue and a line in the 04 sign-off
+checklist — end-of-phase glue with no owner is how integrations silently
+slip. `SnapshotStore::commit` (M2) optionally takes a `&MetaDb` and registers
+the snapshot after the manifest is durable — DB write strictly last, so the
+DB never references an unresolvable ref; a crash between manifest-write and
+DB-register leaves an orphan manifest (harmless, re-registerable), never a
+dangling DB row. The `new_pages` value comes from the commit's
+`IngestOutcome.newly_written` counts.
+
+Acceptance: one integration test in `snapstore-store` — commit with a MetaDb,
+verify the record (ref, parent, icount, page counts) matches the manifest;
+re-commit of identical state re-registers idempotently.
+
+This is the only M2↔M3 touchpoint and lands after both; neither milestone
+waits on the other for its own acceptance.

@@ -75,12 +75,20 @@ Rules:
 
 Property tests (proptest, this is gate G2):
 - **Round-trip identity**: ∀ valid manifest `m`, `decode(encode(m)) == m`.
+- **Canonical bytes**: ∀ bytes `b` accepted by `decode`,
+  `encode(decode(b)) == b`. This is the property that makes the encoding a
+  safe hash input — no two distinct byte strings may decode to equal
+  manifests. Easy to violate silently (e.g. an `Option` tag accepting any
+  nonzero byte as `Some`), so test it directly: generate `b` as
+  `encode(arbitrary manifest)` plus mutation attempts.
 - **Ref stability**: `encode` is a pure function — equal manifests ⇒ equal
   bytes ⇒ equal refs; any single-field mutation ⇒ different ref.
 - **Strictness**: ∀ `m`, appending a byte to `encode(m)` fails decode;
   truncating fails decode.
 - A `proptest` `Strategy` for `Manifest` lives in the crate behind a
-  `test-strategies` feature so M3 and integration tests reuse it.
+  `test-strategies` feature for integration tests. (M3 deliberately does
+  *not* consume it — its property tests are model-based and M2-independent,
+  preserving M2/M3 parallelism.)
 
 Plus one **golden vector test**: a fixed manifest checked against a
 hex-encoded expected byte string committed to the repo. This is what actually
@@ -114,17 +122,31 @@ icount/virtual_ns) so the hypervisor can later hand over guest memory without
 copying; M1's testgen grows a `as_guest_image()` adapter.
 
 Commit sequence (ordering is the correctness story):
-1. `pages.ingest()` every region's pages (batched).
-2. `pages.sync()` — durability barrier (see M1 durability contract).
+1. `pages.ingest()` every region's pages (batched). The returned
+   `IngestOutcome`s carry the page hashes — commit never re-hashes the image
+   — and the `newly_written` counts feed M3's `new_pages` statistic.
+2. `pages.sync()` — durability barrier (see M1 durability contract; it
+   covers rotation and directory creation).
 3. Build `Manifest` from returned hashes + metadata; `encode`; compute ref.
-4. Store the encoded manifest, keyed by ref.
+4. Store the encoded manifest durably: write temp file → **fsync the temp
+   file** → rename into place → **fsync the `manifests/` directory**.
+   Rename without those fsyncs is atomic but not durable — a crash could
+   leave a returned (and M3-registered) ref with no manifest behind it,
+   which is precisely the invariant violation that matters for lineage
+   anchors.
 5. Return ref. A ref is never observable before steps 1–4 complete, so a
-   resolvable ref always resolves to fully-durable pages.
+   resolvable ref always resolves to fully-durable pages — and an observed
+   ref always has a durable manifest.
+
+`resolve` must verify `blake3(file bytes) == ref` **before** decoding — a
+corrupt or tampered manifest file must fail loudly, never be silently
+returned under a ref it doesn't match. (Test: flip one byte in a stored
+`.smf`, assert resolve errors.)
 
 Manifest storage for Phase 1: a `manifests/` subdirectory, one file per ref
-(`manifests/{hex}.smf`), written via temp-file + rename for atomicity.
-Manifests are small (a 4 GiB guest ≈ 32 MiB of hashes; typical regions far
-less); pack-storing manifests is a later optimization and must not block G2.
+(`manifests/{hex}.smf`). Manifests are small (a 4 GiB guest ≈ 32 MiB of
+hashes; typical regions far less); pack-storing manifests is a later
+optimization and must not block G2.
 
 Idempotency: committing identical state twice yields the identical ref and is
 a near-no-op (all pages dedup, manifest file already exists).
