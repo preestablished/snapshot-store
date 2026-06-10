@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[package.metadata]
+cargo-fuzz = true
+
 # Detach from the workspace — cargo-fuzz requires nightly and its own
 # workspace root; the main workspace must not include this package.
 [workspace]
