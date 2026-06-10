@@ -233,7 +233,37 @@ impl PackWriter {
         Ok(())
     }
 
+    /// Flush buffered records and write footer without fdatasync.
+    ///
+    /// Use during pack rotation so the hot ingest path never blocks on disk I/O.
+    /// The caller is responsible for ensuring `sync_data()` is eventually called
+    /// (e.g. via `PageStore::sync()`).  The pack is correctly treated as sealed
+    /// by `PackReader::open()` once the footer reaches the filesystem.
+    pub fn seal_no_sync(&mut self) -> Result<(), PackError> {
+        if self.sealed {
+            return Err(PackError::Sealed);
+        }
+
+        // Flush buffered records to OS (page cache only, no fdatasync).
+        self.flush_buf()?;
+
+        // Finalise body hash and write footer.
+        let body_hash = self.body_hasher.finalize();
+        let mut footer = [0u8; PACK_FOOTER_SIZE as usize];
+        footer[0..4].copy_from_slice(FOOTER_MAGIC);
+        footer[4..12].copy_from_slice(&self.record_count.to_le_bytes());
+        footer[12..44].copy_from_slice(body_hash.as_bytes());
+        self.file.write_all(&footer)?;
+
+        self.sealed = true;
+        Ok(())
+    }
+
     /// Flush, fdatasync record data, write footer, fdatasync again.
+    ///
+    /// Use this for explicit, durable sealing (e.g. in tests or when called
+    /// directly outside the hot ingest path).  The ingest rotation path should
+    /// use `seal_no_sync()` instead to avoid blocking on disk I/O.
     pub fn seal(&mut self) -> Result<(), PackError> {
         if self.sealed {
             return Err(PackError::Sealed);

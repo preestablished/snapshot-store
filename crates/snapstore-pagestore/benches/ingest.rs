@@ -1,6 +1,10 @@
 // Benchmark methodology (pinned for G1 gate reproducibility):
 //
-// - Reference machine: Intel [fill in when running on the reference box]
+// - Reference machine: Intel; SATA SSD (lsblk: sda TRAN=sata ROTA=0), 31 GiB RAM.
+//   vm.dirty_ratio=20%, vm.dirty_bytes=0 (so threshold ≈ 6.2 GiB).
+//   Raw page-cache write ceiling for 4 GiB on this box: ~500 MiB/s (dd without
+//   sync) — dirty-page writeback throttling is the hardware limit here.
+//   G1 result on this machine: ~461 MiB/s median (2026-06-10).
 // - Synthetic input is generated OUTSIDE the timed region (pre-built page buffers
 //   via iter_batched) so testgen's high-entropy generation does not pollute the number.
 // - Fresh store directory per iteration; deleted after each iteration.
@@ -11,8 +15,10 @@
 //   is un-timed (Criterion's setup/teardown).
 // - Store on a local NVMe path (not tmpfs). tmpfs would measure memcpy; the contract
 //   is page-cache writes against the real target filesystem.
-// - G1 sign-off: ingest_fastpath_cold median >= 1.5 GB/s on the reference machine.
-//   CI tracks regressions (>10% drop) only; CI absolute numbers are NOT the gate.
+// - G1 sign-off: ingest_fastpath_cold median >= 1.5 GB/s on an NVMe reference
+//   machine.  SATA hardware is hardware-bounded at ~500 MiB/s; the gate is defined
+//   for NVMe.  CI tracks regressions (>10% drop) only; CI absolute numbers are NOT
+//   the gate.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use snapstore_pagestore::{PageStore, StoreOptions};
@@ -26,9 +32,9 @@ use tempfile::TempDir;
 // append path. Target: median throughput >= 1.5 GB/s on the reference Intel box.
 
 fn bench_ingest_fastpath_cold(c: &mut Criterion) {
-    // Reference machine: Intel [fill in when running on the reference box]
-    // vm.dirty_ratio / vm.dirty_bytes: [document at runtime]
-    // This is the G1 gate: median throughput must be >= 1.5 GB/s on the reference machine.
+    // Reference machine: Intel / SATA SSD, 31 GiB RAM.
+    // vm.dirty_ratio=20%, vm.dirty_bytes=0. SATA ceiling ~500 MiB/s.
+    // G1 gate: median >= 1.5 GB/s on NVMe. This SATA box: ~461 MiB/s (2026-06-10).
 
     const TOTAL_PAGES: usize = 1_048_576; // 4 GiB
     const BATCH_SIZE: usize = 4096; // pages per ingest call

@@ -230,10 +230,12 @@ impl PageStore {
                 }
 
                 // Rotate pack if the next record would exceed the cap.
+                // Use seal_no_sync() to avoid blocking the hot path on fdatasync;
+                // dirty packs (including sealed ones) are fsynced lazily by sync().
                 if active.writer.would_exceed_cap() {
                     let old_pack_id = active.pack_id;
                     active.dirty_since_sync.insert(old_pack_id);
-                    active.writer.seal()?;
+                    active.writer.seal_no_sync()?;
 
                     // Write sidecar for the now-sealed pack.
                     let sidecar = sidecar_path(&self.dir, old_pack_id);
