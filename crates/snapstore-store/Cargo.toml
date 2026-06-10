@@ -1,0 +1,18 @@
+[package]
+name = "snapstore-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapstore-types = { path = "../snapstore-types" }
+snapstore-manifest = { path = "../snapstore-manifest" }
+snapstore-pagestore = { path = "../snapstore-pagestore" }
+snapstore-meta = { path = "../snapstore-meta" }
+blake3 = "1"
+bytes = "1"
+thiserror = "2"
+
+[dev-dependencies]
+snapstore-testgen = { path = "../snapstore-testgen" }
+tempfile = "3"

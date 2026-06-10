@@ -1023,6 +1023,7 @@ dependencies = [
  "blake3",
  "bytes",
  "snapstore-manifest",
+ "snapstore-meta",
  "snapstore-pagestore",
  "snapstore-testgen",
  "snapstore-types",
