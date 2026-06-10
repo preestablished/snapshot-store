@@ -1,0 +1,11 @@
+[package]
+name = "snapstore-testgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapstore-types = { path = "../snapstore-types" }
+rand = "0.8"
+rand_chacha = "0.3"
+blake3 = "1"
