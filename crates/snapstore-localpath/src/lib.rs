@@ -37,4 +37,11 @@ pub enum ChannelError {
     },
     #[error("protocol violation: {0}")]
     Protocol(String),
+    /// The server's `batch_blake3` did not match the client's locally-computed
+    /// cross-check hash.  This is a P0 determinism bug: NEVER retried silently.
+    #[error("batch_blake3 cross-check mismatch: expected {expected} got {actual}")]
+    CrossCheckMismatch { expected: String, actual: String },
 }
+
+#[cfg(target_os = "linux")]
+pub mod client;

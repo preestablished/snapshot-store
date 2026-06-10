@@ -9,6 +9,29 @@ use std::path::PathBuf;
 
 // ── Sub-sections ────────────────────────────────────────────────────────────
 
+/// Configuration for the SEQPACKET page channel (M5 / WI2-WI3).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PageChannelConfig {
+    /// Maximum number of pages that can be in-flight through the ingest
+    /// backpressure gate at any one time.  When the gate is full an incoming
+    /// PUT_BATCH is rejected with `ERROR OVERLOAD`; the client backs off and
+    /// retries (the operation is content-idempotent).
+    ///
+    /// Default: 65536 (= 256 MiB of 4 KiB pages).
+    pub ingest_queue_pages: Option<u32>,
+
+    /// Test-only: when set to `true`, the server deliberately flips one byte
+    /// of the `batch_blake3` it returns in `PUT_BATCH_OK` responses.  This is
+    /// used by the client cross-check test to verify that
+    /// `ChannelError::CrossCheckMismatch` is surfaced and never retried.
+    ///
+    /// **MUST NOT be set in production.**  Documented here so the field does
+    /// not trigger `deny_unknown_fields` in tests.
+    #[doc(hidden)]
+    pub corrupt_cross_check_for_test: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PagestoreConfig {
@@ -67,6 +90,11 @@ pub struct ServerConfig {
     /// Meta tuning.
     #[serde(default)]
     pub meta: MetaConfig,
+
+    /// Page channel tuning (optional; ignored when `page_channel_path` is
+    /// absent).
+    #[serde(default)]
+    pub page_channel: PageChannelConfig,
 }
 
 fn default_grpc_tcp_addr() -> SocketAddr {

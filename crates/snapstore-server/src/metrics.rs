@@ -2,8 +2,9 @@
 
 use prometheus::{
     register_counter_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_with_registry, register_int_gauge_vec_with_registry, CounterVec,
-    Histogram, IntCounter, IntGaugeVec, Registry,
+    register_int_counter_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry, CounterVec, Histogram, IntCounter, IntGauge, IntGaugeVec,
+    Registry,
 };
 
 /// All server-level Prometheus metrics collected in one struct.
@@ -24,6 +25,22 @@ pub struct Metrics {
     /// `snapstore_integrity_errors_total` — counter incremented on startup
     /// reconciliation failures and bad-footer manifest removals.
     pub integrity_errors: IntCounter,
+
+    // ── page channel ─────────────────────────────────────────────────────────
+    /// `snapstore_page_channel_bytes_total{dir="in"|"out"}` — bytes transferred
+    /// on the SEQPACKET page channel (page payload bytes, not wire overhead).
+    pub page_channel_bytes: CounterVec,
+    /// `snapstore_page_channel_batches_total{op="put"|"get"}` — completed
+    /// batches by operation type.
+    pub page_channel_batches: CounterVec,
+    /// `snapstore_page_channel_clients` — current number of connected page-channel
+    /// clients (gauge).
+    pub page_channel_clients: IntGauge,
+    /// `snapstore_page_channel_crosscheck_mismatch_total` — server-side hook
+    /// counter for the corrupt-cross-check test path (see
+    /// [`crate::config::PageChannelConfig::corrupt_cross_check_for_test`]).
+    /// Under normal operation this must never advance.
+    pub page_channel_crosscheck_mismatch: IntCounter,
 }
 
 impl Metrics {
@@ -87,12 +104,46 @@ impl Metrics {
         )
         .expect("metrics registration");
 
+        let page_channel_bytes = register_counter_vec_with_registry!(
+            "snapstore_page_channel_bytes_total",
+            "Page-channel payload bytes transferred, by direction",
+            &["dir"],
+            registry
+        )
+        .expect("metrics registration");
+
+        let page_channel_batches = register_counter_vec_with_registry!(
+            "snapstore_page_channel_batches_total",
+            "Page-channel completed batches, by operation",
+            &["op"],
+            registry
+        )
+        .expect("metrics registration");
+
+        let page_channel_clients = register_int_gauge_with_registry!(
+            "snapstore_page_channel_clients",
+            "Current number of connected page-channel clients",
+            registry
+        )
+        .expect("metrics registration");
+
+        let page_channel_crosscheck_mismatch = register_int_counter_with_registry!(
+            "snapstore_page_channel_crosscheck_mismatch_total",
+            "Server-side corrupt-cross-check hook counter (test-only path; must stay at 0 in production)",
+            registry
+        )
+        .expect("metrics registration");
+
         // Pre-initialise label combinations so they appear in /metrics even when 0.
         let _ = pages_ingested.with_label_values(&["new"]);
         let _ = pages_ingested.with_label_values(&["dup"]);
         for status in ["frontier", "expanded", "pruned", "goal"] {
             nodes.with_label_values(&[status]).set(0);
         }
+        let _ = page_channel_bytes.with_label_values(&["in"]);
+        let _ = page_channel_bytes.with_label_values(&["out"]);
+        let _ = page_channel_batches.with_label_values(&["put"]);
+        let _ = page_channel_batches.with_label_values(&["get"]);
 
         Self {
             pages_ingested,
@@ -102,6 +153,10 @@ impl Metrics {
             meta_txn_seconds,
             nodes,
             integrity_errors,
+            page_channel_bytes,
+            page_channel_batches,
+            page_channel_clients,
+            page_channel_crosscheck_mismatch,
         }
     }
 }

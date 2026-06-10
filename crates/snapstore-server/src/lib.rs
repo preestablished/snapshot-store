@@ -18,6 +18,9 @@ pub mod metrics;
 pub mod service;
 pub mod startup;
 
+#[cfg(target_os = "linux")]
+pub mod page_channel;
+
 #[cfg(test)]
 mod tests {
     use super::snapstore_proto;

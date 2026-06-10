@@ -81,6 +81,7 @@ async fn start_server() -> (ServerHandle, SnapshotStoreClient<Channel>, TempDir)
         http_addr,
         pagestore: Default::default(),
         meta: Default::default(),
+        page_channel: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests(config).await.expect("serve_for_tests");
@@ -831,6 +832,7 @@ async fn store_version_mismatch_refused() {
         http_addr: "127.0.0.1:0".parse().unwrap(),
         pagestore: Default::default(),
         meta: Default::default(),
+        page_channel: Default::default(),
     };
 
     let result = serve_for_tests(config).await;

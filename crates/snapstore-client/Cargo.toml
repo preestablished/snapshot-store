@@ -25,11 +25,17 @@ bytes = "1"
 snapstore-manifest = { path = "../snapstore-manifest" }
 snapstore-types = { path = "../snapstore-types" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+snapstore-localpath = { path = "../snapstore-localpath" }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+blake3 = "1"
+snapstore-server = { path = "../snapstore-server" }
+snapstore-types = { path = "../snapstore-types" }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }

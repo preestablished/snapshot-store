@@ -6,6 +6,11 @@
 //!
 //! Also runs an HTTP server on `config.http_addr` for `/healthz` + `/metrics`.
 //! Provides `serve_for_tests` for in-process integration tests.
+//!
+//! When `config.page_channel_path` is set (Linux only), the SEQPACKET page
+//! channel is also started (see [`crate::page_channel`]).  On non-Linux targets
+//! the option is accepted in config but a warning is emitted and the channel is
+//! not started.
 
 use std::convert::Infallible;
 use std::fs;
@@ -33,6 +38,13 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 /// A running in-process server that can be shut down.
 pub struct ServerHandle {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// Page-channel handle (Linux only). Kept alive so the listener thread
+    /// keeps running until this handle is dropped.
+    #[cfg(target_os = "linux")]
+    pub page_channel: Option<crate::page_channel::PageChannelHandle>,
+    /// Page-channel placeholder on non-Linux builds (always None).
+    #[cfg(not(target_os = "linux"))]
+    pub page_channel: Option<std::convert::Infallible>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -145,6 +157,41 @@ pub async fn run(
     let http_shutdown = shutdown_tx.subscribe();
     let http_handle = tokio::spawn(run_http(http_addr, registry, http_shutdown));
 
+    // ── Page channel (Linux only) ─────────────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ref pc_path) = config.page_channel_path {
+            let pc_store = Arc::clone(&store);
+            let pc_metrics = Arc::clone(&metrics);
+            let ingest_queue_pages = config.page_channel.ingest_queue_pages.unwrap_or(65536);
+            let corrupt = config
+                .page_channel
+                .corrupt_cross_check_for_test
+                .unwrap_or(false);
+            match crate::page_channel::start(
+                pc_path,
+                pc_store,
+                pc_metrics,
+                ingest_queue_pages,
+                corrupt,
+            ) {
+                Ok(h) => {
+                    tracing::info!(path = %pc_path.display(), "page-channel listening");
+                    drop(h); // for `run` the handle doesn't need to outlive this scope
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, path = %pc_path.display(), "page-channel bind failed");
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if config.page_channel_path.is_some() {
+        tracing::warn!(
+            "page_channel_path is set but this build is not Linux; page channel ignored"
+        );
+    }
+
     // Mark SERVING now that all transports are bound.
     health_reporter
         .set_service_status(
@@ -219,7 +266,7 @@ pub async fn serve_for_tests_with_metrics(
         .await;
 
     let svc_impl = SnapshotStoreServer {
-        store,
+        store: Arc::clone(&store),
         meta,
         metrics: Arc::clone(&metrics),
     };
@@ -264,6 +311,48 @@ pub async fn serve_for_tests_with_metrics(
         tracing::debug!(uds = %path_clone.display(), "test server UDS task exited");
     });
 
+    // ── Page channel (Linux only) ─────────────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    let pc_handle: Option<crate::page_channel::PageChannelHandle> = {
+        if let Some(ref pc_path) = config.page_channel_path {
+            let pc_store = Arc::clone(&store);
+            let pc_metrics = Arc::clone(&metrics);
+            let ingest_queue_pages = config.page_channel.ingest_queue_pages.unwrap_or(65536);
+            let corrupt = config
+                .page_channel
+                .corrupt_cross_check_for_test
+                .unwrap_or(false);
+            match crate::page_channel::start(
+                pc_path,
+                pc_store,
+                pc_metrics,
+                ingest_queue_pages,
+                corrupt,
+            ) {
+                Ok(h) => {
+                    tracing::debug!(path = %pc_path.display(), "page-channel listening (test)");
+                    Some(h)
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, path = %pc_path.display(), "page-channel bind failed (test)");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let pc_handle: Option<std::convert::Infallible> = {
+        if config.page_channel_path.is_some() {
+            tracing::warn!(
+                "page_channel_path is set but this build is not Linux; page channel ignored"
+            );
+        }
+        None
+    };
+
     // Mark SERVING.
     health_reporter
         .set_service_status(
@@ -272,7 +361,13 @@ pub async fn serve_for_tests_with_metrics(
         )
         .await;
 
-    Ok((ServerHandle { shutdown_tx }, uds_path))
+    Ok((
+        ServerHandle {
+            shutdown_tx,
+            page_channel: pc_handle,
+        },
+        uds_path,
+    ))
 }
 
 // ── HTTP service (hyper) ──────────────────────────────────────────────────────

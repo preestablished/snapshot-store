@@ -27,17 +27,38 @@ use crate::{
 /// automatically retried with exponential backoff (see `retry` module).
 ///
 /// Clone is cheap: the underlying `Channel` is reference-counted.
+///
+/// # Page-channel fast path (Linux only)
+///
+/// When the `Transport::Auto` configuration includes a `page_channel_path` that
+/// exists and connects, `put_pages` sends page bytes over the SEQPACKET channel
+/// instead of gRPC.  Every operation keeps its pure-gRPC equivalent; any
+/// `ChannelError` that is not `CrossCheckMismatch` causes a silent fallback to
+/// gRPC (logged at WARN level).
+///
+/// `CrossCheckMismatch` is a P0 determinism signal — it surfaces as
+/// `ClientError::BatchBlake3Mismatch` and is never retried or fallen back.
 #[derive(Clone)]
 pub struct SnapstoreClient {
     inner: RawClient<Channel>,
+    /// Page-channel client, present when the `page_channel_path` exists and
+    /// connects at construction time (Linux only).
+    #[cfg(target_os = "linux")]
+    page_channel: Option<std::sync::Arc<snapstore_localpath::client::PageChannelClient>>,
 }
 
 impl SnapstoreClient {
     /// Connect using the given `Transport` configuration.
     pub async fn connect(transport: Transport) -> ClientResult<Self> {
+        #[cfg(target_os = "linux")]
+        let page_channel = try_connect_page_channel(&transport);
+
         let channel = transport.connect().await?;
+
         Ok(Self {
             inner: RawClient::new(channel),
+            #[cfg(target_os = "linux")]
+            page_channel,
         })
     }
 
@@ -45,6 +66,8 @@ impl SnapstoreClient {
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             inner: RawClient::new(channel),
+            #[cfg(target_os = "linux")]
+            page_channel: None,
         }
     }
 
@@ -60,6 +83,15 @@ impl SnapstoreClient {
     ///
     /// The entire upload is retried on transient errors because the operation
     /// is content-idempotent (server deduplicates by hash).
+    ///
+    /// # Page-channel fast path
+    ///
+    /// On Linux, when the client was constructed via `Transport::Auto` with a
+    /// `page_channel_path` that connected, page bytes are sent over the
+    /// SEQPACKET channel.  Any channel error that is not
+    /// `CrossCheckMismatch` causes a transparent fallback to gRPC (WARN log).
+    /// `CrossCheckMismatch` surfaces immediately as
+    /// `ClientError::BatchBlake3Mismatch`.
     pub async fn put_pages(&self, pages: Vec<(u64, Vec<u8>)>) -> ClientResult<(u64, u64)> {
         // Validate page sizes up-front.
         for (idx, data) in &pages {
@@ -68,6 +100,27 @@ impl SnapstoreClient {
                     "page at index {idx} must be exactly 4096 bytes, got {}",
                     data.len()
                 )));
+            }
+        }
+
+        // ── Page-channel fast path (Linux only) ───────────────────────────────
+        #[cfg(target_os = "linux")]
+        if let Some(ref pc) = self.page_channel {
+            match put_pages_via_channel(pc.as_ref(), &pages) {
+                Ok(result) => return Ok(result),
+                Err(snapstore_localpath::ChannelError::CrossCheckMismatch { expected, actual }) => {
+                    // P0 — never fall back silently.
+                    tracing::warn!(
+                        expected = %expected,
+                        actual = %actual,
+                        "page-channel: batch_blake3 cross-check mismatch (P0)"
+                    );
+                    return Err(ClientError::BatchBlake3Mismatch { expected, actual });
+                }
+                Err(e) => {
+                    // Non-fatal channel error — fall back to gRPC.
+                    tracing::warn!(err = %e, "page-channel: error, falling back to gRPC");
+                }
             }
         }
 
@@ -718,6 +771,71 @@ impl SnapstoreClient {
 
         self.put_snapshot(container).await
     }
+}
+
+// ── page-channel helpers (Linux only) ────────────────────────────────────────
+
+/// Try to connect a [`PageChannelClient`] from the `page_channel_path` in a
+/// `Transport::Auto` config.  Returns `None` if the path is absent or
+/// the connect fails (the caller falls back to gRPC).
+#[cfg(target_os = "linux")]
+fn try_connect_page_channel(
+    transport: &Transport,
+) -> Option<std::sync::Arc<snapstore_localpath::client::PageChannelClient>> {
+    use crate::transport::Transport;
+    let path = match transport {
+        Transport::Auto {
+            page_channel_path: Some(p),
+            ..
+        } => p,
+        _ => return None,
+    };
+    if !path.exists() {
+        return None;
+    }
+    match snapstore_localpath::client::PageChannelClient::connect(path) {
+        Ok(c) => {
+            tracing::debug!(path = %path.display(), "page-channel connected");
+            Some(std::sync::Arc::new(c))
+        }
+        Err(e) => {
+            tracing::debug!(path = %path.display(), err = %e, "page-channel connect failed; will use gRPC");
+            None
+        }
+    }
+}
+
+/// Upload `pages` via the page channel, chunking into PUT_BATCH_MAX_PAGES
+/// batches.  Returns the cumulative `(pages_new, pages_deduped)`.
+///
+/// Called synchronously from an async context: this is a blocking call.
+/// For the scale targeted here (co-located clients) this is acceptable;
+/// a future version can move this to `spawn_blocking`.
+#[cfg(target_os = "linux")]
+fn put_pages_via_channel(
+    pc: &snapstore_localpath::client::PageChannelClient,
+    pages: &[(u64, Vec<u8>)],
+) -> Result<(u64, u64), snapstore_localpath::ChannelError> {
+    use snapstore_localpath::proto::PUT_BATCH_MAX_PAGES;
+
+    let mut total_new: u64 = 0;
+    let mut total_deduped: u64 = 0;
+
+    for chunk in pages.chunks(PUT_BATCH_MAX_PAGES as usize) {
+        // Build &[&[u8; 4096]] from the chunk.
+        let page_refs: Vec<&[u8; 4096]> = chunk
+            .iter()
+            .map(|(_, data)| {
+                let arr: &[u8; 4096] = data.as_slice().try_into().expect("already validated 4096");
+                arr
+            })
+            .collect();
+        let outcome = pc.put_batch(&page_refs)?;
+        total_new += outcome.pages_new as u64;
+        total_deduped += outcome.pages_deduped as u64;
+    }
+
+    Ok((total_new, total_deduped))
 }
 
 // ── footer verification helpers ───────────────────────────────────────────────
