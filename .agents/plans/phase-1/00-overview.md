@@ -45,9 +45,6 @@ crates/
   snapstore-meta        # NEW (M3): SQLite metadata DB, lineage queries
   snapstore-server      # unchanged this phase (wire-up is a later phase)
   snapstore-client      # unchanged this phase
-vendor/
-  determinism-proto     # NEW (M1 WI0): temporary stub; retired when the
-                        # control-plane request is fulfilled (see risk 1)
 ```
 
 Rationale for new crates rather than growing `snapstore-server`: the page store
@@ -86,25 +83,19 @@ M1 (pagestore + testgen + bench) ──► M2 (manifest/commit/resolve)
 
 ## Risks / open issues
 
-1. **`determinism-proto` does not exist yet, and a dangling path dep poisons
-   the whole workspace.** At implementation time this repo is checked out at
-   `/home/infra-admin/git/preestablished/snapshot-store`, so the workspace
-   path `../control-plane/crates/determinism-proto` resolves to the sibling
-   control-plane checkout — but control-plane is currently an empty scaffold
-   (README only) and does not yet contain the crate. Verified: Cargo loads
-   every workspace member's manifest (including all path deps) before *any*
-   build, so even `cargo test -p snapstore-pagestore` and
-   `cargo bench -p snapstore-pagestore` fail while the dep dangles — making
-   an optional/feature-gated dep no help and both exit gates unrunnable.
-   Mitigation (M1 WI0): **vendor a minimal stub crate** at
-   `vendor/determinism-proto` inside this repo (the `snapstore` feature, the
-   two message types, nothing else) and point the workspace path dep at it.
-   On request fulfillment, flip the path back to
-   `../control-plane/crates/determinism-proto` — a one-line change. New
-   Phase 1 crates additionally take **zero proto dependency** (today only
-   `snapstore-client` and `snapstore-types` use it; `snapstore-types` makes
-   it optional behind a `proto` feature in WI0) so the stub's surface stays
-   frozen at the Phase 0 floor.
+1. **`determinism-proto` dependency — RESOLVED 2026-06-10.** control-plane
+   commit `ca9ee90` published `crates/determinism-proto` with the `snapstore`
+   feature and both required message types; the cross-repo request (see
+   below) is fulfilled, all acceptance checks pass, and the snapshot-store
+   workspace builds and tests green against the real crate in the sibling
+   layout. The previously planned vendored stub is **not needed**. What
+   survives of the mitigation as permanent hygiene: new Phase 1 crates take
+   **zero proto dependency**, and WI0 still makes `snapstore-types`' proto
+   dep optional behind a `proto` feature (default off) so the page-store
+   stack never inherits it. Residual risk is ordinary now: upstream changes
+   to determinism-proto can break our build like any shared dep; the crate
+   is versioned (`PROTO_VERSION "proto-v0.1.0"`) and our consumed surface is
+   tiny.
 2. **Benchmark variance**: 1.5 GB/s is hardware-sensitive. Pin the benchmark
    to the Intel box profile, document the reference machine, and treat CI
    numbers as smoke (regression %) rather than absolute gate. The absolute
@@ -123,15 +114,13 @@ Anything we need from control-plane is requested as markdown files in
 `~/.agents/projects/control-plane/requests/<request-name>/`. Phase 1 needs one
 request, **filed 2026-06-10**:
 
-- **`publish-determinism-proto`**
+- **`publish-determinism-proto`** — **FULFILLED 2026-06-10** by control-plane
+  commit `ca9ee90`; all acceptance checks pass (see the request dir's
+  `03-fulfillment.md`). Kept here for the record:
   (`~/.agents/projects/control-plane/requests/publish-determinism-proto/`) —
   ship `crates/determinism-proto` with a `snapstore` cargo feature providing
   the `snapstore::v1` module (`PutSnapshotRequest { manifest: Vec<u8> }`,
-  `NodeMeta`) that `snapstore-client`/`snapstore-types` already import. With
-  the vendored stub in place (risk 1) this is not gate-blocking; fulfillment
-  retires the stub via the one-line path flip. See the request's
-  `01-crate-spec.md` for the exact contract and `02-acceptance.md` for how
-  fulfillment is verified.
+  `NodeMeta`) that `snapstore-client`/`snapstore-types` already import.
 
 ## Task tracking
 

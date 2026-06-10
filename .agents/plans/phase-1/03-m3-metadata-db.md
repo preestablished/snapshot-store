@@ -2,8 +2,8 @@
 
 **Crates:** `snapstore-meta` (new)
 **Depends on:** nothing — `SnapshotRef` already exists in Phase 0
-`snapstore-types`, so M3 can technically start any time (after M1 WI0's
-workspace fix); the upstream "after M1" sequencing is a staffing choice
+`snapstore-types`, so M3 can technically start any time; the upstream
+"after M1" sequencing is a staffing choice
 **Parallel with:** M2
 
 ## Scope

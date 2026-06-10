@@ -16,20 +16,18 @@ Out of scope for M1: manifests, snapshot refs, commit/resolve (M2), any
 network/proto surface, compression of the fast path (see "Fast path vs cold
 path"), garbage collection.
 
-## Work item 0 — unbreak the workspace + shared types (`snapstore-types`)
+## Work item 0 — shared types (`snapstore-types`)
 
-**First: vendor the proto stub.** A dangling workspace path dep breaks *all*
-cargo invocations, including `-p` builds of unrelated crates (verified — see
-00-overview, risk 1). Create `vendor/determinism-proto`: a minimal crate with
-a `snapstore` feature exposing `snapstore::v1::{PutSnapshotRequest, NodeMeta}`
-matching the request spec, and point the workspace dep at it. Retired by a
-one-line path flip when control-plane fulfills the request. Acceptance:
-`cargo build --workspace --all-targets` green from a clean checkout.
+(The vendored proto stub originally planned here is no longer needed —
+control-plane published `determinism-proto` on 2026-06-10 and the workspace
+builds against the real crate in the sibling layout; see 00-overview risk 1.
+First step is now just a sanity check: `cargo build --workspace
+--all-targets` green from a clean sibling checkout.)
 
-Then extend `snapstore-types` with the core value types. **Make the
+Extend `snapstore-types` with the core value types. **Make the
 `determinism-proto` dependency optional behind a `proto` feature (default
-off)** — the `NodeMeta` re-export moves behind that feature — so new crates
-don't inherit the proto dep and the stub's surface stays frozen.
+off)** — the `NodeMeta` re-export moves behind that feature — so the new
+page-store stack never inherits the proto dep.
 
 ```rust
 pub const PAGE_SIZE: usize = 4096;
@@ -282,9 +280,6 @@ the server's problem in a later phase.
 ## Suggested execution order
 
 ```
-WI0 (stub + types) ──► WI2 (pack) ──► WI3 (index) ──► WI4 (ingest) ──► WI5 (bench)
+WI0 (types) ──► WI2 (pack) ──► WI3 (index) ──► WI4 (ingest) ──► WI5 (bench)
 WI1 (testgen)  [parallel with WI2/WI3; must land before WI4's tests]
 ```
-
-The vendored stub is the very first commit of the milestone — nothing builds
-reliably until the workspace loads.

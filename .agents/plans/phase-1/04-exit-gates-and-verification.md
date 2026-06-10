@@ -68,8 +68,8 @@ PROPTEST_CASES=4096 cargo test -p snapstore-manifest   # sign-off run, deeper ca
 ## Full verification checklist (phase sign-off)
 
 ```
-[ ] cargo build --workspace --all-targets        # works from M1 WI0 onward via the
-                                                 # vendored determinism-proto stub
+[ ] cargo build --workspace --all-targets        # against sibling control-plane
+                                                 # determinism-proto (verified green 2026-06-10)
 [ ] cargo test  -p snapstore-types -p snapstore-testgen -p snapstore-pagestore
 [ ] cargo test  -p snapstore-manifest -p snapstore-store -p snapstore-meta
 [ ] cargo clippy --workspace -- -D warnings
@@ -83,11 +83,9 @@ PROPTEST_CASES=4096 cargo test -p snapstore-manifest   # sign-off run, deeper ca
 [ ] lineage property test green (M3 WI3)
 [ ] M2↔M3 commit→register integration test green (M3 WI4)
 [ ] all beads issues for M1–M3 closed; follow-ups filed
-[x] control-plane request `publish-determinism-proto` filed 2026-06-10
-    (~/.agents/projects/control-plane/requests/publish-determinism-proto/)
-[ ] if the request was fulfilled during the phase: stub retired (path flipped
-    to ../control-plane), acceptance checks in the request dir pass;
-    otherwise: stub still in place and noted in hand-off
+[x] control-plane request `publish-determinism-proto` filed AND fulfilled
+    2026-06-10 (control-plane ca9ee90; acceptance checks verified green —
+    see the request dir's 03-fulfillment.md). No stub needed.
 [ ] git push + bd dolt push clean
 ```
 
