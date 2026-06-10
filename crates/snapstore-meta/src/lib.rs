@@ -335,6 +335,7 @@ fn blob_to_ref_slice(b: &[u8]) -> SnapshotRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::NamedTempFile;
 
     fn open_tmp() -> MetaDb {
@@ -358,6 +359,10 @@ mod tests {
             new_pages: 5,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Existing tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn open_creates_schema() {
@@ -508,5 +513,340 @@ mod tests {
         }
         let err = MetaDb::open(f.path()).unwrap_err();
         assert!(matches!(err, MetaError::FutureVersion { found: 999, .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Migration tests
+    // -----------------------------------------------------------------------
+
+    /// Opening an existing v1 DB a second time is a no-op (no error).
+    #[test]
+    fn migration_reopen_v1_is_noop() {
+        let f = NamedTempFile::new().unwrap();
+        // First open creates schema.
+        MetaDb::open(f.path()).unwrap();
+        // Second open sees schema_version=1 and must succeed without error.
+        MetaDb::open(f.path()).unwrap();
+    }
+
+    /// Manually inserting schema_version=9999 causes FutureVersion on open.
+    #[test]
+    fn migration_future_version_9999() {
+        let f = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(f.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL); \
+                 INSERT INTO schema_version VALUES (9999);",
+            )
+            .unwrap();
+        }
+        let err = MetaDb::open(f.path()).unwrap_err();
+        assert!(
+            matches!(err, MetaError::FutureVersion { found: 9999, .. }),
+            "expected FutureVersion{{found: 9999}}, got {:?}",
+            err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Chain test: 100-deep chain
+    // -----------------------------------------------------------------------
+
+    /// Register a 100-deep chain (snapshot 0 = root, snapshot 100 = tip).
+    /// - `ancestors(tip)` returns 100 records (indices 0..99), root-first.
+    ///   (ancestors does NOT include the tip itself)
+    /// - `heads()` returns just the tip.
+    #[test]
+    fn chain_100_deep() {
+        let db = open_tmp();
+
+        // snapshot i uses SnapshotRef([i as u8; 32]), i in 0..=100
+        // snapshot 0 is root (no parent), snapshot i has parent i-1.
+        for i in 0u8..=100 {
+            let r = SnapshotRef([i; 32]);
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(SnapshotRef([(i - 1); 32]))
+            };
+            db.register(&simple_rec(r, parent)).unwrap();
+        }
+
+        let tip = SnapshotRef([100u8; 32]);
+
+        // ancestors(tip) returns 100 records: snapshots 0..=99 (not tip itself)
+        let ancs = db.ancestors(&tip).unwrap();
+        assert_eq!(
+            ancs.len(),
+            100,
+            "expected 100 ancestors, got {}",
+            ancs.len()
+        );
+        // Root-first: ancs[0] should be snapshot 0, ancs[99] should be snapshot 99
+        assert_eq!(ancs[0].r, SnapshotRef([0u8; 32]), "first ancestor should be root");
+        assert_eq!(ancs[99].r, SnapshotRef([99u8; 32]), "last ancestor should be tip's parent");
+
+        // heads() returns just the tip (snapshot 100)
+        let heads = db.heads().unwrap();
+        assert_eq!(heads.len(), 1, "expected 1 head, got {}", heads.len());
+        assert_eq!(heads[0].r, tip, "head should be the tip");
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Fork test
+    // -----------------------------------------------------------------------
+
+    /// Register root + 2 children.
+    /// - `descendants(root)` returns 2
+    /// - `children(root)` returns 2 direct children
+    /// - `heads()` returns both children
+    #[test]
+    fn fork_two_children() {
+        let db = open_tmp();
+        let root = SnapshotRef([0xA0u8; 32]);
+        let child_a = SnapshotRef([0xA1u8; 32]);
+        let child_b = SnapshotRef([0xA2u8; 32]);
+
+        db.register(&simple_rec(root.clone(), None)).unwrap();
+        db.register(&simple_rec(child_a.clone(), Some(root.clone()))).unwrap();
+        db.register(&simple_rec(child_b.clone(), Some(root.clone()))).unwrap();
+
+        let desc = db.descendants(&root).unwrap();
+        assert_eq!(desc.len(), 2, "descendants should be 2, got {}", desc.len());
+
+        let ch = db.children(&root).unwrap();
+        assert_eq!(ch.len(), 2, "direct children should be 2, got {}", ch.len());
+        let child_refs: Vec<_> = ch.iter().map(|r| r.r.clone()).collect();
+        assert!(child_refs.contains(&child_a));
+        assert!(child_refs.contains(&child_b));
+
+        let heads = db.heads().unwrap();
+        assert_eq!(heads.len(), 2, "heads should be 2 (both children), got {}", heads.len());
+        let head_refs: Vec<_> = heads.iter().map(|r| r.r.clone()).collect();
+        assert!(head_refs.contains(&child_a));
+        assert!(head_refs.contains(&child_b));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Idempotency / error tests
+    // -----------------------------------------------------------------------
+
+    /// Re-registering an identical record returns Ok.
+    #[test]
+    fn idempotency_identical_reregister() {
+        let db = open_tmp();
+        let r = SnapshotRef([0xB0u8; 32]);
+        let rec = simple_rec(r.clone(), None);
+        db.register(&rec).unwrap();
+        // Exact same data → Ok
+        db.register(&simple_rec(r, None)).unwrap();
+    }
+
+    /// Conflicting re-register (same ref, different data) returns ConflictingRegister.
+    #[test]
+    fn idempotency_conflicting_reregister() {
+        let db = open_tmp();
+        let r = SnapshotRef([0xB1u8; 32]);
+        db.register(&simple_rec(r.clone(), None)).unwrap();
+        let mut conflict = simple_rec(r, None);
+        conflict.icount = 42; // different from the default 1
+        let err = db.register(&conflict).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ConflictingRegister),
+            "expected ConflictingRegister, got {:?}",
+            err
+        );
+    }
+
+    /// Registering with a parent ref not in DB returns ParentNotFound.
+    #[test]
+    fn idempotency_parent_not_found() {
+        let db = open_tmp();
+        let r = SnapshotRef([0xB2u8; 32]);
+        let missing_parent = SnapshotRef([0xFFu8; 32]);
+        let err = db.register(&simple_rec(r, Some(missing_parent))).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ParentNotFound),
+            "expected ParentNotFound, got {:?}",
+            err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Property test: deterministic random tree of 50 snapshots
+    // -----------------------------------------------------------------------
+
+    /// Build a deterministic pseudo-random tree of 50 snapshots.
+    /// The tree is mirrored in a HashMap<[u8;32], Option<[u8;32]>>.
+    /// Verifies:
+    ///   - For each snapshot, `ancestors(r)` matches the chain computed from the map.
+    ///   - For a mid-chain ref, `descendants(r)` includes all expected descendants.
+    ///   - `heads()` returns exactly the leaf nodes (no children in the map).
+    #[test]
+    fn property_random_tree_50() {
+        // ----------------------------------------------------------------
+        // Build the tree deterministically.
+        // Node i gets byte pattern [i as u8; 32].  The parent of node i (i>0)
+        // is chosen as node (lcg(i) % i) where lcg is a simple LCG step,
+        // giving a varied but reproducible parent selection.
+        // ----------------------------------------------------------------
+        const N: usize = 50;
+
+        // Simple LCG: next = (a * x + c) % m  with Knuth's constants.
+        fn lcg(x: usize) -> usize {
+            x.wrapping_mul(1664525).wrapping_add(1013904223)
+        }
+
+        // ref_of(i) → [i as u8; 32]
+        let ref_of = |i: usize| -> [u8; 32] { [i as u8; 32] };
+
+        // Build parent map: ref → Option<parent_ref>
+        let mut parent_map: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
+        parent_map.insert(ref_of(0), None); // root
+
+        let db = open_tmp();
+        db.register(&simple_rec(SnapshotRef(ref_of(0)), None)).unwrap();
+
+        for i in 1..N {
+            let parent_idx = lcg(i) % i;
+            let parent_ref = ref_of(parent_idx);
+            parent_map.insert(ref_of(i), Some(parent_ref));
+            db.register(&simple_rec(
+                SnapshotRef(ref_of(i)),
+                Some(SnapshotRef(parent_ref)),
+            ))
+            .unwrap();
+        }
+
+        // ----------------------------------------------------------------
+        // Helper: compute expected ancestors for node i from the map.
+        // Returns refs in root-first order (not including i itself).
+        // ----------------------------------------------------------------
+        let ancestors_of = |start: usize| -> Vec<[u8; 32]> {
+            let mut chain = Vec::new();
+            let mut cur = ref_of(start);
+            loop {
+                match parent_map.get(&cur).copied() {
+                    Some(Some(p)) => {
+                        chain.push(p);
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            chain.reverse(); // root-first
+            chain
+        };
+
+        // ----------------------------------------------------------------
+        // Verify: ancestors for every node.
+        // ----------------------------------------------------------------
+        for i in 0..N {
+            let r = SnapshotRef(ref_of(i));
+            let got_ancs = db.ancestors(&r).unwrap();
+            let expected = ancestors_of(i);
+            assert_eq!(
+                got_ancs.len(),
+                expected.len(),
+                "ancestors({}) length mismatch: got {}, expected {}",
+                i,
+                got_ancs.len(),
+                expected.len()
+            );
+            for (j, (got, exp)) in got_ancs.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    got.r,
+                    SnapshotRef(*exp),
+                    "ancestors({}) index {} mismatch",
+                    i,
+                    j
+                );
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Verify: descendants for node 0 (root) includes all other nodes.
+        // ----------------------------------------------------------------
+        let root = SnapshotRef(ref_of(0));
+        let desc = db.descendants(&root).unwrap();
+        assert_eq!(
+            desc.len(),
+            N - 1,
+            "descendants(root) should have {} entries, got {}",
+            N - 1,
+            desc.len()
+        );
+
+        // ----------------------------------------------------------------
+        // Verify: descendants for a mid-chain node (node 1) includes
+        // all nodes whose ancestor chain passes through node 1.
+        // ----------------------------------------------------------------
+        let mid_ref = SnapshotRef(ref_of(1));
+        let got_desc: Vec<_> = db.descendants(&mid_ref).unwrap()
+            .into_iter()
+            .map(|rec| rec.r.0)
+            .collect();
+
+        // Compute expected descendants of node 1 from the map.
+        let mut expected_desc: Vec<[u8; 32]> = Vec::new();
+        for i in 0..N {
+            if i == 1 { continue; }
+            // Walk the ancestor chain; if we hit node 1, it's a descendant.
+            let mut cur = ref_of(i);
+            loop {
+                match parent_map.get(&cur).copied() {
+                    Some(Some(p)) => {
+                        if p == ref_of(1) || cur == ref_of(1) {
+                            expected_desc.push(ref_of(i));
+                            break;
+                        }
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        for exp in &expected_desc {
+            assert!(
+                got_desc.contains(exp),
+                "descendants(1) missing {:?}",
+                exp[0]
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Verify: heads() returns exactly the leaf nodes.
+        // ----------------------------------------------------------------
+        // A leaf is a node that appears as no other node's parent.
+        let has_children: std::collections::HashSet<[u8; 32]> = parent_map
+            .values()
+            .filter_map(|p| *p)
+            .collect();
+        let expected_heads: Vec<[u8; 32]> = (0..N)
+            .map(ref_of)
+            .filter(|r| !has_children.contains(r))
+            .collect();
+
+        let got_heads: Vec<_> = db.heads().unwrap()
+            .into_iter()
+            .map(|rec| rec.r.0)
+            .collect();
+
+        assert_eq!(
+            got_heads.len(),
+            expected_heads.len(),
+            "heads() count mismatch: got {}, expected {}",
+            got_heads.len(),
+            expected_heads.len()
+        );
+        for exp in &expected_heads {
+            assert!(
+                got_heads.contains(exp),
+                "heads() missing ref with byte {:?}",
+                exp[0]
+            );
+        }
     }
 }
