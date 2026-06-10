@@ -100,14 +100,17 @@ M1 (pagestore + testgen + bench) ──► M2 (manifest/commit/resolve)
 
 Anything we need from control-plane is requested as markdown files in
 `~/.agents/projects/control-plane/requests/<request-name>/`. Phase 1 needs one
-request up front:
+request, **filed 2026-06-10**:
 
-- **`publish-determinism-proto`** — ship `crates/determinism-proto` with a
-  `snapstore` cargo feature providing the `snapstore::v1` module
-  (`PutSnapshotRequest { manifest: Vec<u8> }`, `NodeMeta`) that
-  `snapstore-client`/`snapstore-types` already import. Not on the Phase 1
-  critical path (no gate depends on it), but it unblocks `cargo build
-  --workspace` and should be filed on day 1.
+- **`publish-determinism-proto`**
+  (`~/.agents/projects/control-plane/requests/publish-determinism-proto/`) —
+  ship `crates/determinism-proto` with a `snapstore` cargo feature providing
+  the `snapstore::v1` module (`PutSnapshotRequest { manifest: Vec<u8> }`,
+  `NodeMeta`) that `snapstore-client`/`snapstore-types` already import. Not
+  on the Phase 1 critical path (no gate depends on it), but it restores the
+  Phase 0 "all skeletons build" condition (`cargo build --workspace`). See
+  the request's `01-crate-spec.md` for the exact contract and
+  `02-acceptance.md` for how fulfillment is verified.
 2. **Benchmark variance**: 1.5 GB/s is hardware-sensitive. Pin the benchmark
    to the Intel box profile, document the reference machine, and treat CI
    numbers as smoke (regression %) rather than absolute gate. The absolute

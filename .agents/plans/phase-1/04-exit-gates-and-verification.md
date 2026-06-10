@@ -71,7 +71,7 @@ PROPTEST_CASES=4096 cargo test -p snapstore-manifest   # sign-off run, deeper ca
 [ ] multi-epoch dedup integration test green (M2 WI3)
 [ ] lineage property test green (M3 WI3)
 [ ] all beads issues for M1–M3 closed; follow-ups filed
-[ ] control-plane request `publish-determinism-proto` filed
+[x] control-plane request `publish-determinism-proto` filed 2026-06-10
     (~/.agents/projects/control-plane/requests/publish-determinism-proto/)
 [ ] git push + bd dolt push clean
 ```
