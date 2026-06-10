@@ -8,4 +8,25 @@ version = "0.1.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+# Inert until the adopt-snapstore-proto-v1 request lands and the vendored
+# proto swaps back to the published crate (phase-2 plan, risk 2).
 determinism-proto = { path = "../control-plane/crates/determinism-proto", default-features = false }
+
+# Async runtime + gRPC stack (phase-2 02 WI1). Versions pinned as a coherent
+# set: tonic 0.12-era APIs are required for UDS connectors + rich status
+# details (00-overview risk 5).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+tonic-build = "0.12"
+tonic-health = "0.12"
+tonic-types = "0.12"
+prost = "0.13"
+protoc-bin-vendored = "3"
+tower = "0.5"
+hyper-util = "0.1"
+prometheus = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

@@ -1,8 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "proto")]
-pub use determinism_proto::snapstore::v1::NodeMeta;
-
 /// Fixed page size used throughout the snapshot store.
 pub const PAGE_SIZE: usize = 4096;
 
