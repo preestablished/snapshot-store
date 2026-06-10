@@ -62,6 +62,7 @@ pub struct PageStore {
     dir: PathBuf,
     index: Arc<ShardedIndex>,
     active: Mutex<ActiveState>,
+    #[allow(dead_code)]
     opts: StoreOptions,
 }
 
@@ -433,7 +434,6 @@ fn seal_existing_pack(
 
     // Open file for appending and write the footer.
     let mut file = std::fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .open(path)?;
 

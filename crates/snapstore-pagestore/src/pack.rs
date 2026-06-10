@@ -166,6 +166,10 @@ impl PackWriter {
         })
     }
 
+    pub fn pack_id(&self) -> PackId {
+        self.pack_id
+    }
+
     /// True if appending one more record would exceed the 1 GiB cap.
     pub fn would_exceed_cap(&self) -> bool {
         self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > PACK_MAX_BYTES

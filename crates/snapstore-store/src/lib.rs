@@ -118,7 +118,7 @@ impl SnapshotStore {
         let memory_regions: Vec<MemoryRegion> = guest
             .regions
             .iter()
-            .zip(region_hashes.into_iter())
+            .zip(region_hashes)
             .map(|(region, hashes)| MemoryRegion {
                 gpa: region.gpa,
                 pages: hashes,

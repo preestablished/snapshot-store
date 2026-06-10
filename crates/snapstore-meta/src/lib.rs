@@ -107,7 +107,8 @@ impl MetaDb {
         };
 
         // Check whether this ref is already registered.
-        let existing: Option<(i64, Option<i64>, i64, i64, i64, Option<String>, i64, i64)> = self
+        type ExistingRow = (i64, Option<i64>, i64, i64, i64, Option<String>, i64, i64);
+        let existing: Option<ExistingRow> = self
             .conn
             .query_row(
                 "SELECT id, parent_id, icount, virtual_ns, created_at, label, \
