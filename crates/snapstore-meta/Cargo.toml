@@ -1,0 +1,13 @@
+[package]
+name = "snapstore-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapstore-types = { path = "../snapstore-types" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
