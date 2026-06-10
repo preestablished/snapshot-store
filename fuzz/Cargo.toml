@@ -1,0 +1,17 @@
+[package]
+name = "snapstore-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the workspace — cargo-fuzz requires nightly and its own
+# workspace root; the main workspace must not include this package.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snapstore-manifest = { path = "../crates/snapstore-manifest" }
+
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
