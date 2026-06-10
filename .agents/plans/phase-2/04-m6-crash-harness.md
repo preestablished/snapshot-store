@@ -24,7 +24,7 @@ compiled only in the harness profile. Named points at every ordering boundary:
 | 1 | `pack-append` | record bytes written, not yet synced |
 | 2 | `pack-fdatasync` | before/after batch fdatasync |
 | 3 | `pack-rotate-seal` | mid-rotation (seal old / open new) |
-| 4 | `sidecar-write` | `.sppx` bytes written |
+| 4 | `sidecar-write` | `.idx` sidecar bytes written |
 | 5 | `sidecar-fsync` | sidecar durable vs not |
 | 6 | `manifest-tmp-write` | `.spm` staged in `tmp/` |
 | 7 | `manifest-fsync` | staged file synced |
@@ -43,13 +43,24 @@ Library function in `snapstore-store` (or a small `fsck` module crate-local to
 the CLI if dependency direction is cleaner), exposed as
 `snapstorectl fsck [--deep]` (offline, direct store access):
 
-- **Shallow** (ARCHITECTURE.md §8 step 5 + sidecar footers): every node row's
-  `snapshot_ref` resolves to a manifest; every pinned ref resolves; every
-  manifest entry resolves to an indexed page; every `input_log_id` referenced
-  by a node exists; sidecar and manifest footers verify.
-- **Deep**: additionally re-read every pack record — `rec_magic`, crc32c of
-  payload, BLAKE3(payload) == `page_hash` in the record header; input-log
-  container footers re-hashed.
+All checks are written against the **as-built** pack/sidecar format
+(`pack.rs`: `SPK1` header, 37-byte record headers hash+flags+len, `SPKF`
+footer with record count + body BLAKE3; `index.rs`: `.idx` sidecars with
+CRC32 trailer) — NOT against ARCHITECTURE.md §2.1–2.2's `SPPACK01`/`CREC`/
+`.sppx` layout, which the code deliberately diverges from (00-overview
+risk 6). There is no per-record `rec_magic` or crc32c in the as-built format;
+per-record integrity comes from the stored BLAKE3 hash itself.
+
+- **Shallow** (ARCHITECTURE.md §8 step 5 + container checks): every node
+  row's `snapshot_ref` resolves to a manifest; every pinned ref resolves;
+  every manifest entry resolves to an indexed page; every `input_log_id`
+  referenced by a node exists; `.idx` sidecar CRC32s and `.spm` manifest
+  footers verify; sealed-pack `SPKF` footers present with matching record
+  counts.
+- **Deep**: additionally re-read every pack record and verify
+  BLAKE3(payload) == the record's stored `page_hash`; recompute each sealed
+  pack's body BLAKE3 against its `SPKF` footer; re-hash input-log container
+  footers.
 
 Output: machine-readable report (counts + first N violations), nonzero exit on
 any violation.
@@ -86,7 +97,9 @@ Parent/child architecture per the upstream plan:
   the repro command line.
 
 **AC:** harness runs N randomized cycles + the failpoint matrix from one
-command (`cargo run -p snapstore-crash -- --cycles N --seed S [--matrix]`).
+command (`cargo run -p snapstore-crash -- --cycles N --seed S
+--matrix-passes K`; `--matrix-passes 0` skips the matrix — same interface 05
+S5 invokes).
 
 ## Work item 4 — SQLite batch-atomicity kill loop
 
@@ -102,10 +115,24 @@ update batches; parent kills at random; invariant 3 checked each cycle).
   Verifies the same invariants through the public API (and that a client's
   blind-retry after the restart converges — ties to INTEGRATION.md §6's
   "clients simply retry in-flight ops").
-- **CI**: PR job = library-mode smoke (~25 randomized cycles + one pass of the
-  failpoint matrix ×1); nightly = **1,000 randomized cycles with zero
-  invariant violations** + failpoint matrix (9 boundaries × kill) **×50
-  each** (upstream M6 AC). Nightly runs on the Linux runner / reference box.
+- **CI infrastructure** (review finding: current CI is fmt+build+test only —
+  none of the plan's CI commitments have a home yet; this WI owns building
+  them, not just "wiring"):
+  - **Immediately** (first commit of phase 2, independent of the harness):
+    add `cargo clippy --workspace --all-targets -- -D warnings` to PR CI
+    (claimed in the phase-1 sign-off, never enforced), and pin the
+    control-plane checkout rev in `ci.yaml` (00 risk 2).
+  - PR job: library-mode smoke (~25 randomized cycles + failpoint matrix ×1),
+    required.
+  - Nightly job: **1,000 randomized cycles with zero invariant violations** +
+    failpoint matrix (9 boundaries × kill) **×50 each** (upstream M6 AC),
+    plus the 10-minute manifest fuzz run (01 WI1 — net-new: no `fuzz/` dir
+    exists; the phase-1 M2 fuzz AC was never delivered) and the perf-regression
+    smoke. **Decision needed before building**: GitHub-hosted runner vs
+    self-hosted on the reference box — budget the wall-clock of 1,000
+    cycles + deep fsck per cycle empirically (a 6-hour job is fine nightly,
+    a 20-hour one isn't) and pick accordingly; kill/fd semantics require
+    Linux either way.
 
 **AC (milestone):** nightly job green: 1,000 cycles, zero violations; matrix
 ×50 green; PR smoke wired and required.

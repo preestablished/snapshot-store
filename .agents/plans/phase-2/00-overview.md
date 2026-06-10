@@ -38,19 +38,23 @@ inventory:
 | Server / client crates | Phase 0 stubs (≈13 / ≈7 LOC) | tonic services on TCP `:7410` + UDS, config loader, `/healthz` `/metrics`, tracing; client lib with transport fallback, footer verification, retry policy |
 | CLI | none | `snapstorectl` (subset; see 02) |
 | Crash testing | in-process torn-tail/rotation tests in `snapstore-pagestore` | child-process kill -9 harness with failpoints at every fsync/rename boundary, deep fsck, invariant checks |
+| Pack/sidecar on-disk format | `SPK1` 20-byte header, 37-byte record headers (hash+flags+len, **no per-record crc32c**), `SPKF` footer with body BLAKE3, `.idx` CRC32 sidecars (`pack.rs`, `index.rs`) | ARCHITECTURE.md §2.1–2.2 specifies `SPPACK01` 64-byte header, `CREC` records with crc32c, `.sppx` BLAKE3-footer sidecars — **as-built format kept** (repo-internal, no cross-repo consumer reads packs; phase-1 durability tests green); deviation documented, upstream doc amendment filed (risk 6) |
+| Pagestore read path | `PageStore::get` opens the pack file **per page read**, and `PackReader::open` footer-validates by scanning the whole pack body (`ingest.rs:295`, `pack.rs:309`) | ResolvePages / GET_BATCH read gates (≥ 2.5 GB/s warm) need cached pack readers + batched pread — ARCHITECTURE.md §6's File-handle LRU (cap 256). New work item 01 WI6 |
 | Fast path | none | `snapstore-localpath` SEQPACKET + memfd channel (Linux-only) |
 | Async runtime | none (workspace has no tokio/tonic/prost) | tokio rt-multi-thread, tonic, prost, tonic-health, tonic-types, prometheus, nix |
 
-What carries forward unchanged: `snapstore-pagestore` (packs, sharded index,
-ingest, recovery — G1 met at ~461 MiB/s on the SATA reference box),
-`snapstore-testgen`, the pagestore torn-tail/rotation test suite.
+What carries forward: `snapstore-pagestore`'s write path (packs, sharded
+index, ingest, recovery — G1 met at ~461 MiB/s on the SATA reference box),
+`snapstore-testgen`, and the torn-tail/rotation test suite. The pagestore
+**read path** does not carry forward unchanged — see the table row above and
+01 WI6.
 
 ## Target crate layout after this plan
 
 ```
 crates/
   snapstore-types       # + LogId, NodeId, ExperimentId, NodeStatus
-  snapstore-pagestore   # + failpoints feature; durable-barrier hook for PutSnapshot
+  snapstore-pagestore   # + failpoints; read-path cache (WI6); commit barrier w/ group fsync
   snapstore-testgen     # + scripted multi-experiment exploration driver helpers
   snapstore-manifest    # REWRITTEN to .spm container spec (delta + flatten)   [01]
   snapstore-store       # commit/resolve over .spm; PutSnapshot validation     [01]
@@ -80,21 +84,24 @@ workspace root can't own integration tests, and the harness needs its own deps
 ## Ordering and parallelism
 
 ```
-[01] WI1 manifest v2 ──┐
-[01] WI2 meta v2 ──────┼──► [02] gRPC server + client + ctl + e2e ──► [03] M5 page channel
-proto request ─────────┘                                  │
-(control-plane)                                           │
-[01] WI3 failpoint hooks ──► [04] M6 harness (library mode) ──► [04] full-stack mode
+[01] WI1 manifest v2 ───┐
+[01] WI4 meta v2 ───────┼──► [02] gRPC server + client + ctl + e2e ──► [03] M5 page channel
+[01] WI6 read path ─────┤                                 │    (WI1 codec can start during [02])
+vendored proto (02 WI1) ┘                                 │
+[01] WI5 failpoint hooks ──► [04] M6 harness (library mode) ──► [04] full-stack mode
                                                           (parallel with [03])
 ```
 
-- **[01] is the long pole and starts first.** Manifest v2 and meta v2 are
-  independent of each other and parallelizable.
-- The cross-repo proto request (below) is filed on day 1; nothing in [01]
-  depends on it.
-- [02] needs all of [01] plus the proto. [03] needs [02] (client
-  auto-selection, server wiring). [04] library mode needs only [01] and runs
-  parallel with [02]/[03]; its full-stack mode needs [02].
+- **[01] is the long pole and starts first.** Manifest v2 (WI1+WI3) and meta
+  v2 (WI2+WI4) are independent of each other and parallelizable; the read-path
+  work (WI6) is a third independent stream.
+- The proto is vendored in-repo (02 WI1) so nothing blocks on control-plane;
+  the cross-repo request (below) is a publish/adopt follow-up, off the
+  critical path.
+- [02] needs all of [01]. [03] needs [02] (client auto-selection, server
+  wiring) — except 03 WI1 (the pure codec), which can run parallel with [02].
+  [04] library mode needs only [01] and runs parallel with [02]/[03]; its
+  full-stack mode needs [02].
 - M6 is the in-repo parallel track exactly as the phase doc orders it: it must
   be green for the phase exit gate but does not block hypervisor M4 — [02]
   does. **Ship [02] before polishing anything.**
@@ -109,12 +116,18 @@ proto request ─────────┘                                  �
    format change with an explanatory message; `snapstore-store`'s
    `commit(meta_db)` auto-register coupling is removed (workers never write
    node rows — INTEGRATION.md §2.1).
-2. **`determinism-proto` cross-repo dependency.** The full service + tonic
-   codegen lives in control-plane's crate. Mitigation: file the request
-   (below) immediately; fallback if not fulfilled before [01] completes:
-   vendor `proto/snapshot_store.proto` in this repo with local `tonic-build`,
-   per ARCHITECTURE.md §1's "canonical until control-plane exists" escape
-   hatch, and swap to the published crate when it lands.
+2. **Proto ownership.** Decision (review-driven inversion of the original
+   plan): the **vendored proto is primary** — `proto/snapshot_store.proto` at
+   this repo root with local `tonic-build`, per ARCHITECTURE.md §1's
+   "canonical until control-plane exists" rule. Rationale: `determinism-proto`
+   today is hand-written structs with **no protoc/prost/tonic infrastructure**
+   — landing codegen there is real work on another team's critical path, and
+   it was the only cross-repo item gating hypervisor M4. The control-plane
+   request (below) becomes a publish/adopt follow-up; type paths are kept
+   swappable via module re-export. Until the swap, **pin the control-plane
+   checkout to a rev in `ci.yaml`** (it currently tracks default-branch HEAD —
+   an unpinned cross-repo CI coupling that bites the moment `NodeMeta` is
+   replaced upstream).
 3. **Linux-only surfaces vs darwin dev machine.** `SOCK_SEQPACKET`, `memfd_create`,
    `/proc/self/fd` audits, and meaningful fsync/kill semantics are Linux-only.
    `snapstore-localpath` and the harness's fd/kill assertions are
@@ -133,22 +146,52 @@ proto request ─────────┘                                  �
 5. **tonic-over-UDS + rich error details** need `tonic` ≥ 0.12-era APIs and
    `tonic-types` for `google.rpc.Status` details; pin versions in the workspace
    `Cargo.toml` and verify UDS connector + details round-trip early in [02].
+6. **Pack on-disk format diverges from ARCHITECTURE.md §2.1–2.2** (see gap
+   table). Kept as-built: the format is repo-internal (nothing outside this
+   repo reads packs), phase-1 torn-tail durability tests are green against it,
+   and per-record BLAKE3 verification on tail-scan is stronger than the spec's
+   crc32c. Action: file an upstream doc issue
+   (`~/.agents/projects/determinism/reviews/`-style) to amend ARCHITECTURE §2
+   to as-built, or schedule convergence as an explicit later milestone — do
+   NOT let the deep fsck or GC work silently assume the spec layout (04 WI2 is
+   written against as-built).
+7. **fsync storm under concurrent commits.** `PageStore::sync()` fdatasyncs
+   every dirty pack under the active-pack lock; 16 workers committing
+   concurrently (S4: p99 < 40 ms) through a naive per-PutSnapshot sync would
+   serialize on it — phase 1 removed inline fsyncs from rotation for a 2.25×
+   gain (commit 0d8ef62) for exactly this reason. Mitigation: group-commit
+   barrier specified in 01 WI3 — the most likely non-hardware cause of an S4
+   miss.
+8. **sync↔async bridge is the seam every benchmark flows through.** The
+   workspace is fully synchronous; tonic is async. Channel types at the
+   boundary, `spawn_blocking` strategy, and whether `snapstore-client` offers
+   a blocking facade (KVM vCPU loops aren't tokio-native) are decided in a
+   short design note **before** 02 WI2 starts (02 WI2 lists the questions).
+9. **CI infrastructure debt.** Current CI is fmt+build+test only: no clippy
+   (despite phase-1 sign-off claiming it), no fuzz dir, no nightly jobs, and
+   the nightly crash/bench commitments imply a Linux runner decision
+   (GitHub-hosted vs self-hosted reference box). Owned explicitly by 04 WI5;
+   clippy lands in PR CI immediately.
 
 ## Cross-repo requests
 
-One request to control-plane, filed when this plan lands, as
-`~/.agents/projects/control-plane/requests/extend-snapstore-proto-v1/`:
+One request to control-plane — a **non-blocking follow-up** (the vendored
+proto is primary; see risk 2), filed as
+`~/.agents/projects/control-plane/requests/adopt-snapstore-proto-v1/`:
 
-- **`extend-snapstore-proto-v1`** — replace the placeholder
-  `proto/determinism/snapshot_store.proto` content with the full
-  `determinism.snapstore.v1` service from API.md §1 (all RPCs + messages +
-  `NodeMeta` in its 15-field shape + error-detail messages `MissingPages`,
-  `MissingNodes`, `CurrentGeneration`), and publish prost/tonic-generated code
-  (server + client) behind the existing `snapstore` feature (or a new
-  `snapstore-grpc` feature so the types-only consumers don't inherit tonic).
-  Acceptance: `snapstore-server` builds a `SnapshotStoreServer` and
-  `snapstore-client` a `SnapshotStoreClient` from the crate; the old
-  hand-written `NodeMeta`/`PutSnapshotRequest` are replaced by generated ones.
+- **`adopt-snapstore-proto-v1`** — adopt this repo's
+  `proto/snapshot_store.proto` (the full `determinism.snapstore.v1` service
+  from API.md §1: all RPCs + messages + `NodeMeta` in its 15-field shape +
+  error-detail messages `MissingPages`, `MissingNodes`, `CurrentGeneration`)
+  as the canonical copy, replacing the placeholder at
+  `proto/determinism/snapstore/v1/snapshot_store.proto`, and publish
+  prost/tonic-generated code (server + client) behind a `snapstore-grpc`
+  feature (so types-only consumers don't inherit tonic). Note this requires
+  control-plane to stand up protoc/prost build infrastructure it does not
+  have today. Acceptance: this repo swaps its `tonic-build` output for the
+  published crate with no type-path changes (module re-export contract) and
+  deletes the vendored copy; the old hand-written
+  `NodeMeta`/`PutSnapshotRequest` are replaced by generated ones.
 
 ## Task tracking
 

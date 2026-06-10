@@ -55,11 +55,12 @@ version bump.
 |---|---|---|
 | PutPages over UDS gRPC (256-page msgs, dedup-warm = transport+hash bound) | ≥ 600 MB/s | spec number as-is (no disk writes involved) |
 | PutPages cold (disk-bound) | — | informational; consistency-check against G1 (~450 MiB/s ceiling) |
-| QueryNodes page of 1,000 over UDS | p50 < 4 ms | as-is |
-| PutSnapshot already-paged (2k-entry delta) | p50 < 3 ms | as-is |
-| CreateNode + 16 KiB inline log | p50 < 1.5 ms | as-is |
-| UpdateNodes(256) | p50 < 3 ms | as-is |
-| flatten 64-deep × 2k-entry chain (warm) | < 2 ms | as-is |
+| QueryNodes page of 1,000 over UDS | p50 < 4 ms | as-is (CPU/read bound) |
+| PutSnapshot already-paged (2k-entry delta) | p50 < 3 ms | **fsync-bound** (file fsync + rename + dir fsync): record actual; gate at the fio-derived flush floor, spec value re-validated on NVMe at M8 |
+| CreateNode + 16 KiB inline log | p50 < 1.5 ms | **fsync-bound** (`synchronous=FULL`): same treatment — record actual, floor-gated, NVMe at M8 |
+| UpdateNodes(256) | p50 < 3 ms | same treatment (one durable txn) |
+| flatten 64-deep × 2k-entry chain (warm) | < 2 ms | as-is (pure CPU) |
+| library-layer warm read, 8 threads (01 WI6 pre-gate) | ≥ 2.5 GB/s | as-is (page-cache bound) |
 
 ## Gate S4 — M5 benchmarks (MAP.md principle 2 — misses are release blockers)
 
@@ -68,16 +69,20 @@ version bump.
 | PUT_BATCH dedup-warm (transport+hash bound) | ≥ 1.5 GB/s sustained | spec number as-is |
 | PUT_BATCH cold sustained (disk-bound) | (1.5 GB/s assumes NVMe) | record actual; gate = G1-consistent (≥ 400 MiB/s); NVMe re-validation required at M8 |
 | GET_BATCH warm (page cache) | ≥ 2.5 GB/s | as-is |
-| 16 clients × 8 MiB deltas: p99 commit incl. fsync | < 40 ms | **record actual; fsync-bound on SATA — formal gate decision at sign-off** (see hardware rule) |
+| 16 clients × 8 MiB deltas: p99 commit incl. fsync | < 40 ms | **fsync-bound**: gate at the fio-derived flush floor recorded in `docs/bench-baseline.md`; spec value re-validated on NVMe at M8 |
 | 16 clients aggregate ingest | ≥ 1.2 GB/s | dedup-warm as-is; cold recorded |
 
-**Hardware rule (G1 precedent).** Spec numbers assume the NVMe box
-(ARCHITECTURE.md §7.1). Transport-/CPU-bound measurements gate at spec values
-on any hardware. Disk-bound measurements gate at the fio/G1-derived ceiling of
-the reference machine, with the spec value re-validated on NVMe-class hardware
-**before M8 sign-off** (phase exit gate 2 — "delta commit 8 ms p50" — is
-signed there). Every recorded number carries machine identity, kernel, rustc,
-and `vm.dirty_*` settings, appended to `docs/bench-baseline.md`.
+**Hardware rule (G1 precedent — decided now, not relitigated at sign-off).**
+Spec numbers assume the NVMe box (ARCHITECTURE.md §7.1). Transport-/CPU-/page-
+cache-bound rows gate at spec values on any hardware and **block the
+milestone**. Disk- and fsync-bound rows gate at the fio/G1-derived floor of
+the reference machine (derived once, written into `docs/bench-baseline.md`
+when the bench lands), with the spec value re-validated on NVMe-class
+hardware **before M8 sign-off** (phase exit gate 2 — "delta commit 8 ms p50"
+— is signed there). A miss against the applicable gate is a release blocker
+for its milestone either way. Every recorded number carries machine identity,
+kernel, rustc, and `vm.dirty_*` settings, appended to
+`docs/bench-baseline.md`.
 
 ## Gate S5 — crash-injection suite green (phase exit gate 3)
 
@@ -104,13 +109,18 @@ clean after every recovery. Any violation is a P0.
 [ ] S4: M5 BM table recorded; disk-bound actuals + gate decisions noted;
         NVMe re-validation flagged as M8 entry item
 [ ] S5: nightly crash job green (1000 cycles + matrix ×50); PR smoke required
-[ ] cross-repo request extend-snapstore-proto-v1 fulfilled (or fallback
-        vendored proto in place with swap-back issue filed)
+[ ] vendored proto/snapshot_store.proto in place with tonic-build; cross-repo
+        request adopt-snapstore-proto-v1 filed (fulfillment NOT a phase gate);
+        control-plane checkout rev pinned in ci.yaml
+[ ] clippy -D warnings enforced in PR CI (landed at phase start, not at sign-off)
 [ ] stale NodeMeta re-export removed from snapstore-types
-[ ] docs drift check: API.md §1/§2/§3/§4 vs as-built (file doc issues upstream
-        if implementation forced any deviation)
+[ ] docs drift check: API.md §1/§2/§3/§4 AND ARCHITECTURE.md §2 (pack/sidecar
+        format) + §5.3 (per-command logical counter) vs as-built; upstream doc
+        issues filed for: pack-format deviation, counter granularity,
+        page-channel memfd sealing requirement (API.md §4), client→manifest
+        dependency (ARCHITECTURE.md §1)
 [ ] all beads issues for M4–M6 closed; follow-ups filed (M7 GC, M8 joint
-        milestone plan, M9 watermarks/backup)
+        milestone plan, M9 watermarks/backup, determinism-proto swap-back)
 [ ] git push + bd dolt push clean
 ```
 

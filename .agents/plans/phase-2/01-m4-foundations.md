@@ -66,6 +66,8 @@ before it. All integers LE.
 ### Validation in `decode` (each failure a distinct `ManifestError` variant)
 
 - magic / version / unknown flag bits / header_len ≠ 96 / reserved ≠ 0
+- `page_size != 4096` rejected (v1 readers reject ≠ 4096 — API.md §2);
+  `guest_ram_bytes` not a multiple of 4096 rejected
 - entries sorted strictly ascending by `page_index`, no duplicates
 - FULL (`!delta`): `entry_count == guest_ram_bytes/4096` and indices run
   `0..N-1` contiguously; `parent_manifest_hash` all-zero
@@ -107,10 +109,12 @@ P0 at call sites). Also: a delta-only merge variant for ResolvePages Mode B
 
 Small module (in `snapstore-manifest` or a `container` module in
 `snapstore-types` — implementer's choice, it's ~100 lines): the API.md §3
-wrapper (`SILG` magic, container_version=1, `inner_format_version` u32,
-`payload_len` u64, opaque payload, BLAKE3 footer = `log_id`). Validate
-magic/version/lengths/footer; expose `inner_version()` and `log_id()`. The
-store never parses the payload. Proptest round-trip + strictness tests.
+wrapper (`SILG` magic, container_version u16=1, `flags` u16=0 (reserved,
+reject nonzero), `inner_format_version` u32, `reserved` u32=0 (reject
+nonzero), `payload_len` u64, opaque payload, BLAKE3 footer = `log_id`).
+Validate magic/version/flags/reserved/lengths/footer; expose
+`inner_version()` and `log_id()`. The store never parses the payload.
+Proptest round-trip + strictness tests.
 
 ## Work item 3 — store façade rework (`snapstore-store`)
 
@@ -119,13 +123,24 @@ Rework `SnapshotStore` (currently `commit(&GuestImage, Option<&MetaDb>)` /
 
 - `put_snapshot(container: &[u8]) -> Result<SnapshotRef, PutError>` —
   full API.md §2 validation: codec decode (WI1); parent resolves to a stored
-  manifest **with identical `guest_ram_bytes`** (`PutError::UnknownParent` ⇒
-  FAILED_PRECONDITION); every `page_hash` present **and durable**
+  manifest (`PutError::UnknownParent` ⇒ FAILED_PRECONDITION) and has identical
+  `guest_ram_bytes` (`PutError::ParentRamMismatch` ⇒ INVALID_ARGUMENT — API.md
+  §2 notes only the *missing* case as FAILED_PRECONDITION; everything else
+  defaults to INVALID_ARGUMENT); every `page_hash` present **and durable**
   (`PutError::MissingPages(Vec<PageHash>)` listing exactly the gaps ⇒
-  FAILED_PRECONDITION detail). Durability barrier: call
-  `PageStore::sync()` before the presence check is treated as durable
-  (the per-entry `synced`-bit optimization from ARCHITECTURE.md §3 step 7 is
-  deferred; the store-level barrier gives the same contract — note it in code).
+  FAILED_PRECONDITION detail). **Durability barrier = group commit**, not a
+  naive per-call `PageStore::sync()`: concurrent `put_snapshot`s coalesce on a
+  sequence-numbered flush (a caller needing durability up to ingest-seq N
+  waits on the next barrier; one fdatasync pass serves every waiter at ≤ that
+  seq). Rationale: `sync()` takes the active-pack lock and fdatasyncs every
+  dirty pack — 16 concurrent committers (gate S4 p99 < 40 ms) through
+  per-call syncs would serialize into an fsync storm, re-creating the problem
+  phase 1 removed for a 2.25× gain (commit 0d8ef62). The per-entry
+  `synced`-bit from ARCHITECTURE.md §3 step 7 stays deferred; group commit
+  gives the same contract. Also: take a read lock on a **`gc_commit_gate`
+  `RwLock` stub** around the commit (no-op until M7's mark fence / M9's
+  backup consistency point take the write side — ARCHITECTURE.md §4.5 R3;
+  one line now vs hot-path surgery under M7 pressure).
   Then write the container byte-identical to
   `manifests/<first-byte-hex>/<hex>.spm` via `tmp/` + fsync + rename + dir
   fsync (keep the existing atomic-write discipline).
@@ -177,9 +192,19 @@ ordering.
 - **Writer actor**: one dedicated blocking thread owning the sole write
   connection; commands arrive on a bounded `crossbeam-channel` carrying oneshot
   reply senders; the actor drains up to `write_batch_max` (256) commands into
-  one `BEGIN IMMEDIATE … COMMIT`. The logical counter increments per txn and is
-  flushed in the same txn; startup re-derives
+  one `BEGIN IMMEDIATE … COMMIT`. Startup re-derives the counter as
   `max(persisted, max(created_at), max(updated_at)) + 1`.
+- **Logical-counter granularity (decision, made here deliberately):** the
+  counter advances **per command** within the batch txn (flushed once per
+  txn), not per txn. ARCHITECTURE.md §5.3's "per txn" wording would give up to
+  256 CreateNodes an identical `created_at`, and an exclusive
+  `QueryNodes(created_after=…, limit=N)` cursor **silently skips rows** when a
+  page boundary splits a same-counter group — breaking the orchestrator's
+  warm-start contract (INTEGRATION.md §2.3, "never misses or double-counts").
+  Per-command counters keep the cursor sound with no wire change; a whole
+  `UpdateNodes` batch is one command and still gets one `updated_at` (matches
+  API.md §1.4's response). File the upstream doc issue amending §5.3. The
+  cursor test below must cover a batch split across page boundaries.
 - **Read pool**: 4 connections, `PRAGMA query_only=ON`, used via
   `spawn_blocking` from the (future) server; expose a sync facade so [04]'s
   harness and tests can drive it without tokio.
@@ -194,7 +219,10 @@ ordering.
   inline container stored in the same txn), depth = parent.depth + 1.
   **Idempotency** per API.md §1.4: PK conflict ⇒ re-read, compare immutable
   fields (parent, snapshot_ref, input_log_id) ⇒ return stored row or
-  `AlreadyExists`.
+  `AlreadyExists`. Note: the API.md §1.4 rule that `snapshot_ref` "must
+  resolve to a stored manifest" (⇒ `NOT_FOUND`, a P0 commit-ordering signal
+  per INTEGRATION.md §6) **cannot live in this crate** — meta has no manifest
+  visibility. It is owned by the server layer (02 WI2); don't silently drop it.
 - `update_nodes` — bulk partial updates, one txn, all-or-nothing; any unknown
   id rolls back the whole batch and reports the missing ids; deltas add
   (`visit_count_delta`), `touch_visited` stamps the txn counter; returns the
@@ -252,13 +280,40 @@ semantics in 04.
 **AC:** `cargo build --workspace` unaffected without the feature; with the
 feature, a smoke test triggers one failpoint and observes the configured panic.
 
+## Work item 6 — pagestore read path (gates ResolvePages + GET_BATCH)
+
+Review finding, missing from the original plan: the as-built read path cannot
+meet any read gate. `PageStore::get`
+(`crates/snapstore-pagestore/src/ingest.rs:295`) opens the pack file **per
+page read**, and `PackReader::open` (`pack.rs:309`) validates by scanning the
+entire pack body (`count_records_in_file`) on every open — worst case a ~1 GiB
+scan per 4 KiB page. GET_BATCH at 2.5 GB/s warm is ~610k pages/s, and M4's
+`ResolvePages` Mode A streams payloads through the same call.
+
+- Cached pack readers: LRU of open `File` handles per ARCHITECTURE.md §6
+  (cap 256); sealed packs are immutable ⇒ no revalidation on open (their
+  sidecars were verified at startup) — validate-on-open survives only for the
+  unsealed-pack recovery path.
+- Batched reads: `pread`/`preadv` straight from the cached handle at `PageLoc`
+  offsets; no per-read seek-scan. Multi-page lookups (GET_BATCH, ResolvePages)
+  sort by `(pack, offset)` to keep reads sequential per pack.
+- Eviction hook left for M7: GC compaction must be able to invalidate a pack's
+  cached handle before unlink (R2's repoint-then-unlink makes one retry
+  sufficient — keep the retry-on-ENOENT probe in the read path now).
+
+**AC:** read correctness suite unchanged and green; criterion bench:
+single-thread warm random `get` ≥ 500k pages/s; 8-thread ≥ 2.5 GB/s warm from
+page cache (pre-gate for S4's GET_BATCH number — measured at the library
+layer, before channel overhead).
+
 ## Dependencies and ordering
 
 ```
 WI0 types ──► WI1 manifest v2 ──► WI3 store façade ──► (02)
          └──► WI2 log container ──► WI4 meta v2 ─────► (02)
+WI6 read path ───────────────────────────────────────► (02 ResolvePages, 03 GET_BATCH)
 WI5 failpoints rides with WI3 (same files)
 ```
 
-WI1+WI3 and WI2+WI4 are two parallel streams (different crates, different
-beads issues). Nothing here touches tokio/tonic.
+WI1+WI3, WI2+WI4, and WI6 are three parallel streams (different crates/
+modules, different beads issues). Nothing here touches tokio/tonic.

@@ -40,12 +40,20 @@ loopback socketpair test sending each message type with an fd (Linux).
 Wired into `snapstore-server` startup: listener on `page_channel_path`
 (`/run/snapstore/pages.sock`, mode 0660), one task per connection.
 
-- **PUT_BATCH**: receive fd → validate memfd size == count*4096 → mmap
-  readonly → rayon batch-hash (same pool as gRPC ingest) → dedup probe →
-  enqueue novel pages to the pack writer → reply `PUT_BATCH_OK` with
-  new/deduped counts + cross-check hash → close fd after the batch is
-  queued+indexed (never earlier; never leak on error paths — RAII fd guard).
-  Zero pages short-circuit as in the existing ingest path.
+- **PUT_BATCH**: receive fd → **verify the memfd carries
+  `F_SEAL_WRITE | F_SEAL_SHRINK` (`F_GET_SEALS`); reject unsealed fds with
+  `ERROR INVALID`** → validate memfd size == count*4096 → mmap readonly →
+  rayon batch-hash (same pool as gRPC ingest) → dedup probe → enqueue novel
+  pages to the pack writer → reply `PUT_BATCH_OK` with new/deduped counts +
+  cross-check hash → close fd after the batch is queued+indexed (never
+  earlier; never leak on error paths — RAII fd guard). Zero pages
+  short-circuit as in the existing ingest path.
+  The seal requirement closes a hash-then-copy TOCTOU (review finding): the
+  server hashes at receive time but the pack writer copies later — an
+  unsealed memfd mutated in between would store bytes whose BLAKE3 ≠ their
+  index key, silent content-address corruption. API.md §4 doesn't currently
+  require client-side sealing — file the upstream doc issue adding it to the
+  protocol rules.
 - **GET_BATCH**: collect datagrams, look up each hash (index probe + pack
   pread, or flatten-cache-backed resolve), create memfd sized count*4096,
   write pages at i*4096, seal size (`F_SEAL_GROW|F_SEAL_SHRINK`), send fd.
@@ -66,7 +74,8 @@ after, looped); OVERLOAD path exercised with a tiny queue.
 
 In `snapstore-localpath` (client struct) + `snapstore-client` (selection):
 
-- Client creates memfds, writes pages, sends `PUT_BATCH`; computes per-page
+- Client creates memfds, writes pages, **seals them
+  (`F_SEAL_WRITE | F_SEAL_SHRINK`)**, sends `PUT_BATCH`; computes per-page
   hashes itself (it builds the manifest anyway) and **cross-checks**
   `batch_blake3` — mismatch is a P0 determinism bug: typed fatal error +
   metric, never retried silently (API.md §4: "Mismatch = P0").
@@ -102,7 +111,16 @@ caveats in 05):
 (02 client)        ──────────────────► WI3 client half ──► WI4
 ```
 
-WI1 can start as soon as 02 WI2's server skeleton exists (it's mostly
-self-contained); WI2/WI3 parallelize across server/client once WI1's codec is
-stable. Hypervisor M4 does **not** wait for M5 (it integrates on gRPC and
-switches to the fast path when M5 lands — phase doc note).
+WI1 (the pure codec) has **no dependency on 02 at all** — it's byte-layout
+work and can run fully parallel with 02 if hands are free; only WI2/WI3 need
+02's server skeleton and client. WI2/WI3 parallelize across server/client once
+WI1's codec is stable. Hypervisor M4 does **not** wait for M5 (it integrates
+on gRPC and switches to the fast path when M5 lands — phase doc note).
+
+Gate clarity (review finding — 05 owns the authoritative table): the
+transport-/CPU-bound rows (PUT_BATCH dedup-warm, GET_BATCH warm) **block M5
+sign-off at spec values on any hardware**. The disk-/fsync-bound rows (cold
+sustained, 16-client p99 incl. fsync) gate at the SATA-derived floors recorded
+in `docs/bench-baseline.md`, with spec values re-validated on NVMe at M8 —
+"release blocker" means the applicable gate for the row, decided now, not
+relitigated at sign-off.
