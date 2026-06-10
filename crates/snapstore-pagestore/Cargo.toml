@@ -1,0 +1,21 @@
+[package]
+name = "snapstore-pagestore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapstore-types = { path = "../snapstore-types" }
+blake3 = { version = "1", features = ["rayon"] }
+rayon = "1"
+parking_lot = "0.12"
+crc32fast = "1"
+bytes = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "ingest"
+harness = false
