@@ -1465,6 +1465,7 @@ dependencies = [
 name = "snapstore-localpath"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "nix",
  "snapstore-types",
  "tempfile",
