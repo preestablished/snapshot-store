@@ -543,6 +543,21 @@ impl SnapshotStore {
         }
     }
 
+    // ── has_manifest ─────────────────────────────────────────────────────────
+
+    /// Fast path-existence check for a stored manifest file.
+    ///
+    /// Used by the server layer to validate `snapshot_ref` before calling
+    /// `MetaDb::create_node` (API.md §1.4 NOT_FOUND rule).  Manifests are
+    /// immutable-once-present (content-addressed write-once), so a `true`
+    /// return here is a permanent guarantee — no TOCTOU concern.
+    pub fn has_manifest(&self, r: &SnapshotRef) -> bool {
+        let hex = ref_to_hex(r);
+        let shard = &hex[..2];
+        let path = self.manifests_dir.join(shard).join(format!("{}.spm", hex));
+        path.exists()
+    }
+
     // ── has_pages ────────────────────────────────────────────────────────────
 
     /// Batch presence check for page hashes (index-only; no payload reads).

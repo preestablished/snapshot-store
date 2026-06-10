@@ -11,6 +11,13 @@ pub mod snapstore_proto {
     tonic::include_proto!("determinism.snapstore.v1");
 }
 
+pub mod build_server;
+pub mod config;
+pub mod errors;
+pub mod metrics;
+pub mod service;
+pub mod startup;
+
 #[cfg(test)]
 mod tests {
     use super::snapstore_proto;

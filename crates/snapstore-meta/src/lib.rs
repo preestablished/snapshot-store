@@ -408,4 +408,44 @@ impl MetaDb {
             .read_pool
             .with(|conn| pool::stats(conn, experiment_id))
     }
+
+    /// Run `PRAGMA integrity_check` on a read connection.
+    ///
+    /// Returns `Ok(())` if the database reports "ok", `Err(MetaError::Io(…))`
+    /// otherwise.  Called at startup to refuse serving a corrupt database.
+    pub fn integrity_check(&self) -> Result<(), MetaError> {
+        self.0.read_pool.with(|conn| {
+            let result: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(MetaError::Sqlite)?;
+            if result == "ok" {
+                Ok(())
+            } else {
+                Err(MetaError::Io(format!("integrity_check failed: {result}")))
+            }
+        })
+    }
+
+    /// List all distinct experiment ids present in the nodes table.
+    ///
+    /// Used by startup reconciliation to walk all experiments and verify
+    /// that every node's `snapshot_ref` resolves to a stored manifest.
+    pub fn list_experiments(&self) -> Result<Vec<ExperimentId>, MetaError> {
+        self.0.read_pool.with(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT experiment_id FROM nodes ORDER BY experiment_id")
+                .map_err(MetaError::Sqlite)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(MetaError::Sqlite)?;
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r.map_err(MetaError::Sqlite)?;
+                let eid = ExperimentId::new(s)
+                    .map_err(|e| MetaError::Io(format!("invalid experiment_id: {e}")))?;
+                out.push(eid);
+            }
+            Ok(out)
+        })
+    }
 }

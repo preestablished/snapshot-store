@@ -568,6 +568,16 @@ impl PageStore {
         Ok(hashes.iter().map(|h| self.index.get(h).is_some()).collect())
     }
 
+    /// Number of unique pages currently in the index.
+    ///
+    /// Returns the count of distinct `PageHash` entries across all sealed and
+    /// active packs.  Used by the server layer to populate `StoreStats` without
+    /// requiring a full pack scan.  The value is exact at the moment of the call
+    /// but not guaranteed stable across concurrent ingests.
+    pub fn unique_pages(&self) -> u64 {
+        self.index.len() as u64
+    }
+
     /// Evict a cached read handle for `pack`.
     ///
     /// Called by M7 GC before unlinking a pack file so the next reader opens a
