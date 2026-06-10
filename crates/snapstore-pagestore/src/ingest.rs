@@ -26,12 +26,16 @@ pub enum StoreError {
 pub struct StoreOptions {
     /// Flush write buffer when it reaches this size (bytes). Default: 4 MiB.
     pub write_buf_size: usize,
+    /// Rotation threshold for pack files. Default: PACK_MAX_BYTES (1 GiB).
+    /// Set smaller in tests to force rotation cheaply.
+    pub max_pack_bytes: u64,
 }
 
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             write_buf_size: 4 * 1024 * 1024,
+            max_pack_bytes: crate::pack::PACK_MAX_BYTES,
         }
     }
 }
@@ -62,7 +66,6 @@ pub struct PageStore {
     dir: PathBuf,
     index: Arc<ShardedIndex>,
     active: Mutex<ActiveState>,
-    #[allow(dead_code)]
     opts: StoreOptions,
 }
 
@@ -144,6 +147,7 @@ impl PageStore {
         }
 
         // Create or reopen the active pack.
+        let max_pack_bytes = opts.max_pack_bytes;
         let (writer, pack_id, new_file) = if let Some(existing_id) = active_pack_id {
             let path = pack_path(dir, existing_id);
             let writer = reopen_pack_for_append(&path, existing_id, &index)?;
@@ -152,7 +156,7 @@ impl PageStore {
             // No active pack; create a new one.
             let new_id = pack_ids.last().map(|id| PackId(id.0 + 1)).unwrap_or(PackId(0));
             let path = pack_path(dir, new_id);
-            let writer = PackWriter::create(&path, new_id, unix_now())?;
+            let writer = PackWriter::create_with_max_bytes(&path, new_id, unix_now(), max_pack_bytes)?;
             pack_ids.push(new_id); // keep sorted list consistent (not used further)
             (writer, new_id, true)
         };
@@ -225,7 +229,7 @@ impl PageStore {
                     continue;
                 }
 
-                // Rotate pack if the next record would exceed the 1 GiB cap.
+                // Rotate pack if the next record would exceed the cap.
                 if active.writer.would_exceed_cap() {
                     let old_pack_id = active.pack_id;
                     active.dirty_since_sync.insert(old_pack_id);
@@ -235,10 +239,15 @@ impl PageStore {
                     let sidecar = sidecar_path(&self.dir, old_pack_id);
                     self.index.write_sidecar(&sidecar, old_pack_id)?;
 
-                    // Create the next pack.
+                    // Create the next pack with the configured cap.
                     let new_id = PackId(old_pack_id.0 + 1);
                     let new_path = pack_path(&self.dir, new_id);
-                    active.writer = PackWriter::create(&new_path, new_id, unix_now())?;
+                    active.writer = PackWriter::create_with_max_bytes(
+                        &new_path,
+                        new_id,
+                        unix_now(),
+                        self.opts.max_pack_bytes,
+                    )?;
                     active.pack_id = new_id;
                     active.new_files_since_sync = true;
                 }
@@ -710,6 +719,118 @@ mod tests {
             assert!(
                 !o.newly_written,
                 "page {i} should be a dedup hit after reopen"
+            );
+        }
+    }
+
+    // ── Test 7: crash_during_rotation_sealed_no_sidecar (M1 WI3 exit gate) ───
+
+    #[test]
+    fn crash_during_rotation_sealed_no_sidecar() {
+        use crate::pack::PackWriter;
+
+        let dir = TempDir::new().unwrap();
+
+        // Phase 1: ingest 20 pages, drop store (pack 0 remains UNSEALED, no sidecar)
+        let pages = make_unique_pages(20);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        let hashes: Vec<PageHash> = pages
+            .iter()
+            .map(|p| PageHash::from_bytes(*blake3::hash(p.as_ref()).as_bytes()))
+            .collect();
+
+        {
+            let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+            store.ingest(&page_refs).unwrap();
+            // Flush write buffer to OS so records are on disk, then drop without sealing.
+            // pack 0 is unsealed on disk (no footer), and no sidecar has been written.
+            store.sync().unwrap();
+        }
+
+        // Phase 2: simulate "rotation completed but crash before sidecar":
+        //   - seal pack 0 manually (write footer) — this is what rotation does
+        //   - ensure no .idx sidecar exists for pack 0
+        let pack0_path = dir.path().join("pack-00000000.spk");
+        let sidecar0_path = dir.path().join("pack-00000000.idx");
+
+        {
+            let mut writer = PackWriter::reopen(&pack0_path, PackId(0)).unwrap();
+            writer.seal().unwrap(); // footer written — pack 0 is now sealed
+        }
+        // Remove sidecar if it somehow exists (it shouldn't, but be explicit)
+        let _ = std::fs::remove_file(&sidecar0_path);
+        // No pack-00000001.spk exists — this is the key scenario
+
+        // Phase 3: reopen the store — must find pack 0 (sealed, no sidecar),
+        //   rebuild index from pack body scan, zero lost entries
+        let store2 = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+
+        for (i, hash) in hashes.iter().enumerate() {
+            assert!(
+                store2.get(hash).unwrap().is_some(),
+                "page {i} must be findable after crash-during-rotation recovery"
+            );
+        }
+
+        // Sidecar should have been regenerated by open()
+        assert!(
+            sidecar0_path.exists(),
+            "open() must regenerate missing sidecar for sealed pack"
+        );
+    }
+
+    // ── Test 8: sync_spans_rotation (M1 WI4 exit gate) ───────────────────────
+
+    #[test]
+    fn sync_spans_rotation() {
+        let dir = TempDir::new().unwrap();
+
+        // Use a small pack cap so rotation happens cheaply.
+        // Each record = RECORD_HEADER_SIZE (37) + PAGE_SIZE (4096) = 4133 bytes.
+        // Pack header = 20 bytes. Set cap so exactly 5 pages fit (20 + 5*4133 = 20685 bytes).
+        // 6th page would exceed cap.
+        use crate::pack::{RECORD_HEADER_SIZE, PACK_HEADER_SIZE};
+        let record_size = RECORD_HEADER_SIZE + PAGE_SIZE as u64;
+        let pages_per_pack: u64 = 5;
+        let max_pack_bytes = PACK_HEADER_SIZE + pages_per_pack * record_size;
+
+        let opts = StoreOptions {
+            max_pack_bytes,
+            ..StoreOptions::default()
+        };
+
+        let store = PageStore::open(dir.path(), opts).unwrap();
+
+        // Ingest 8 pages in a SINGLE batch — this must span the rotation:
+        // pages 0-4 land in pack 0, pack 0 rotates, pages 5-7 land in pack 1.
+        let pages = make_unique_pages(8);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        let hashes: Vec<PageHash> = pages
+            .iter()
+            .map(|p| PageHash::from_bytes(*blake3::hash(p.as_ref()).as_bytes()))
+            .collect();
+
+        let outcomes = store.ingest(&page_refs).unwrap();
+        assert_eq!(outcomes.len(), 8);
+
+        // Verify pack 0 and pack 1 both exist — confirming rotation happened
+        let pack0_exists = dir.path().join("pack-00000000.spk").exists();
+        let pack1_exists = dir.path().join("pack-00000001.spk").exists();
+        assert!(pack0_exists, "pack 0 must exist after rotation");
+        assert!(pack1_exists, "pack 1 must exist after rotation");
+
+        // Call sync() — must cover BOTH packs (pack 0 was sealed mid-ingest, pack 1 is active)
+        store.sync().unwrap();
+
+        // Drop the store and reopen — all 8 pages must still be readable
+        // (this is the observable durability invariant: sync + reopen = no data loss)
+        drop(store);
+
+        let store2 = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+        for (i, hash) in hashes.iter().enumerate() {
+            assert!(
+                store2.get(hash).unwrap().is_some(),
+                "page {i} must be readable after sync-spans-rotation + reopen"
             );
         }
     }

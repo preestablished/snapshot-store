@@ -54,11 +54,25 @@ pub struct PackWriter {
     write_offset: u64,
     record_count: u64,
     sealed: bool,
+    /// Rotation threshold; PACK_MAX_BYTES by default.
+    max_bytes: u64,
 }
 
 impl PackWriter {
     /// Create a new pack file. `created_unix` is seconds since epoch.
     pub fn create(path: &Path, pack_id: PackId, created_unix: u64) -> Result<Self, PackError> {
+        Self::create_with_max_bytes(path, pack_id, created_unix, PACK_MAX_BYTES)
+    }
+
+    /// Create a new pack file with a custom rotation cap.
+    /// Identical to `create` but accepts an explicit `max_bytes` threshold.
+    /// Set smaller than `PACK_MAX_BYTES` in tests to force rotation cheaply.
+    pub fn create_with_max_bytes(
+        path: &Path,
+        pack_id: PackId,
+        created_unix: u64,
+        max_bytes: u64,
+    ) -> Result<Self, PackError> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -82,6 +96,7 @@ impl PackWriter {
             write_offset: PACK_HEADER_SIZE,
             record_count: 0,
             sealed: false,
+            max_bytes,
         })
     }
 
@@ -163,6 +178,7 @@ impl PackWriter {
             write_offset: offset,
             record_count,
             sealed: false,
+            max_bytes: PACK_MAX_BYTES,
         })
     }
 
@@ -170,9 +186,9 @@ impl PackWriter {
         self.pack_id
     }
 
-    /// True if appending one more record would exceed the 1 GiB cap.
+    /// True if appending one more record would exceed the rotation cap.
     pub fn would_exceed_cap(&self) -> bool {
-        self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > PACK_MAX_BYTES
+        self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > self.max_bytes
     }
 
     /// Append one raw page. Returns the byte offset where the record starts
