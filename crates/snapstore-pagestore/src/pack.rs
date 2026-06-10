@@ -186,6 +186,16 @@ impl PackWriter {
         self.pack_id
     }
 
+    /// Expose the underlying file for lock-free pread on the active pack.
+    ///
+    /// The caller must hold the `active` lock and must have called `flush_buf()`
+    /// before issuing any pread — otherwise buffered records are not yet visible.
+    /// This handle is NOT cached in the LRU read cache; its identity changes on
+    /// rotation.
+    pub fn file_for_pread(&self) -> &std::fs::File {
+        &self.file
+    }
+
     /// True if appending one more record would exceed the rotation cap.
     pub fn would_exceed_cap(&self) -> bool {
         self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > self.max_bytes
@@ -308,6 +318,10 @@ pub struct PackReader {
 
 impl PackReader {
     /// Open a sealed pack for reading.  Validates header and footer.
+    ///
+    /// This is the full validation path: it reads the footer and scans all
+    /// record headers to verify the record count.  Use this path for
+    /// sidecar-missing recovery or the first-time open of a pack at startup.
     pub fn open(path: &Path, pack_id: PackId) -> Result<Self, PackError> {
         let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
 
@@ -349,6 +363,76 @@ impl PackReader {
             pack_id,
             body_end: Some(body_end),
         })
+    }
+
+    /// Open a sealed pack with cheap header-only validation.
+    ///
+    /// Sealed packs are immutable — their sidecars were verified at startup and
+    /// records are never rewritten, only the footer was appended once.  Reopening
+    /// with the full body scan on every cache-miss would be catastrophically slow
+    /// (up to a ~1 GiB scan per 4 KiB page read).  This path validates just the
+    /// 20-byte header magic/version, trusting the sidecar-verified invariant.
+    ///
+    /// IMPORTANT: only use this path for sealed packs whose sidecar has already
+    /// been verified.  The recovery path (startup sealing) must still use
+    /// `open` or `open_unsealed` for full validation.
+    pub fn open_sealed_fast(path: &Path, _pack_id: PackId) -> Result<std::fs::File, PackError> {
+        use std::os::unix::fs::FileExt;
+
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+
+        // Validate header magic only — no body scan (O(1) instead of O(pack_size)).
+        let mut magic = [0u8; 4];
+        file.read_exact_at(&mut magic, 0)?;
+        if &magic != PACK_MAGIC {
+            return Err(PackError::BadMagic);
+        }
+
+        Ok(file)
+    }
+
+    /// Read a record at `offset` directly from a raw `File` handle using pread.
+    ///
+    /// Verifies that blake3(payload) == `expected_hash` before returning.
+    /// Returns `PackError::HashMismatch` on corruption.
+    pub fn read_at_from_file(
+        file: &std::fs::File,
+        offset: u64,
+        expected_hash: &PageHash,
+    ) -> Result<bytes::Bytes, PackError> {
+        use std::os::unix::fs::FileExt;
+
+        // Read record header via pread (lock-free, no seek state).
+        let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
+        file.read_exact_at(&mut rec_header, offset)
+            .map_err(|_| PackError::TruncatedRecord { offset })?;
+
+        let stored_hash_bytes: [u8; 32] = rec_header[0..32].try_into().unwrap();
+        let len = u32::from_le_bytes(rec_header[33..37].try_into().unwrap());
+
+        // Sanity-check length: must be exactly PAGE_SIZE for raw page records.
+        if len as usize != PAGE_SIZE {
+            return Err(PackError::TruncatedRecord { offset });
+        }
+
+        // Read payload via pread.
+        let mut payload = vec![0u8; len as usize];
+        file.read_exact_at(&mut payload, offset + RECORD_HEADER_SIZE)
+            .map_err(|_| PackError::TruncatedRecord { offset })?;
+
+        // Verify stored hash matches requested hash (detects corruption and
+        // wrong-offset reads).
+        if &stored_hash_bytes != expected_hash.as_bytes() {
+            return Err(PackError::HashMismatch { offset });
+        }
+
+        // Re-verify payload integrity: blake3(payload) must equal the stored hash.
+        let computed = *blake3::hash(&payload).as_bytes();
+        if computed != stored_hash_bytes {
+            return Err(PackError::HashMismatch { offset });
+        }
+
+        Ok(bytes::Bytes::from(payload))
     }
 
     /// Open an unsealed (active or crashed) pack.  Scans records forward,

@@ -24,3 +24,7 @@ features = ["html_reports"]
 [[bench]]
 name = "ingest"
 harness = false
+
+[[bench]]
+name = "read_path"
+harness = false
