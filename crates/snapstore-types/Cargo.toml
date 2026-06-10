@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+proto = ["dep:determinism-proto"]
+
 [dependencies]
-determinism-proto = { workspace = true, features = ["snapstore"] }
+determinism-proto = { workspace = true, features = ["snapstore"], optional = true }
