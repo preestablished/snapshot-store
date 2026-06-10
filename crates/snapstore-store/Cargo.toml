@@ -4,15 +4,30 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enable named failpoints at fsync/rename boundaries for crash-consistency
+# testing.  Off by default; NEVER enabled in release builds.
+# Usage: cargo test -p snapstore-store --features failpoints
+failpoints = [
+    "dep:fail",
+    "fail/failpoints",
+    "snapstore-pagestore/failpoints",
+]
+
 [dependencies]
 snapstore-types = { path = "../snapstore-types" }
 snapstore-manifest = { path = "../snapstore-manifest" }
 snapstore-pagestore = { path = "../snapstore-pagestore" }
-snapstore-meta = { path = "../snapstore-meta" }
 blake3 = "1"
 bytes = "1"
 thiserror = "2"
+fail = { version = "0.5", optional = true }
 
 [dev-dependencies]
 snapstore-testgen = { path = "../snapstore-testgen" }
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "put_snapshot"
+harness = false

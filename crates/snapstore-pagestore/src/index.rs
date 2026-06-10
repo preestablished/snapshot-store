@@ -5,6 +5,15 @@ use std::path::Path;
 use parking_lot::RwLock;
 use snapstore_types::{PackId, PageHash, PageLoc};
 
+// ── Failpoint macro ───────────────────────────────────────────────────────────
+
+macro_rules! fail_point {
+    ($name:expr) => {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!($name);
+    };
+}
+
 use crate::pack::PackReader;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -160,6 +169,10 @@ impl ShardedIndex {
                 .open(&tmp_path)?;
             file.write_all(&buf)?;
             file.flush()?;
+            // Failpoint: after sidecar bytes written, before its fsync.
+            fail_point!("sidecar-write");
+            // Failpoint: immediately before sidecar fsync.
+            fail_point!("sidecar-fsync");
             file.sync_data()?;
         }
         std::fs::rename(&tmp_path, path)?;

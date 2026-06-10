@@ -404,6 +404,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fail"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.8.6",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1454,11 +1465,23 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 name = "snapstore-client"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bytes",
+ "hyper-util",
  "prost",
+ "prost-types",
  "protoc-bin-vendored",
+ "snapstore-manifest",
+ "snapstore-types",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
+ "tonic-types",
+ "tower 0.5.3",
+ "tracing",
 ]
 
 [[package]]
@@ -1504,6 +1527,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "fail",
  "parking_lot",
  "rayon",
  "snapstore-testgen",
@@ -1529,8 +1553,9 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "criterion",
+ "fail",
  "snapstore-manifest",
- "snapstore-meta",
  "snapstore-pagestore",
  "snapstore-testgen",
  "snapstore-types",
@@ -1728,6 +1753,17 @@ dependencies = [
  "prost-types",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tonic-types"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0081d8ee0847d01271392a5aebe960a4600f5d4da6c67648a6382a0940f8b367"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
 ]
 
 [[package]]

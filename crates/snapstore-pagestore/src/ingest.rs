@@ -6,6 +6,18 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use snapstore_types::{PackId, PageHash, PageLoc, PAGE_SIZE};
 
+// ── Failpoint macro ───────────────────────────────────────────────────────────
+
+/// Invoke a named failpoint when the `failpoints` feature is enabled.
+///
+/// Expands to nothing on default (non-failpoints) builds — zero overhead.
+macro_rules! fail_point {
+    ($name:expr) => {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!($name);
+    };
+}
+
 use crate::index::{rebuild_from_pack, IndexError, ShardedIndex};
 use crate::pack::{
     PackError, PackReader, PackWriter, PACK_FOOTER_SIZE, PACK_HEADER_SIZE, RECORD_HEADER_SIZE,
@@ -269,6 +281,9 @@ impl PageStore {
                 if active.writer.would_exceed_cap() {
                     let old_pack_id = active.pack_id;
                     active.dirty_since_sync.insert(old_pack_id);
+
+                    // Failpoint: mid-rotation between sealing old pack and opening new one.
+                    fail_point!("pack-rotate-seal");
                     active.writer.seal_no_sync()?;
 
                     // Write sidecar for the now-sealed pack.
@@ -294,6 +309,8 @@ impl PageStore {
                     // because sealing only appended a footer — record offsets are unchanged.
                 }
 
+                // Failpoint: after record bytes buffered/written, before any sync.
+                fail_point!("pack-append");
                 let offset = active.writer.append(&hash, pages[page_idx])?;
                 let current_pack_id = active.pack_id;
                 let loc = PageLoc {
@@ -540,6 +557,17 @@ impl PageStore {
         PackReader::read_at_from_file(&handle, loc.offset, hash).map_err(StoreError::Pack)
     }
 
+    /// Index-only batch presence check for `hashes`.
+    ///
+    /// Returns one `bool` per input hash (`true` = present in the index,
+    /// `false` = not found).  This is a pure `ShardedIndex` lookup — no
+    /// payload is read and no pack file is opened.  Used by
+    /// `SnapshotStore::put_snapshot` to collect the full set of missing pages
+    /// before returning `PutError::MissingPages`.
+    pub fn contains_batch(&self, hashes: &[PageHash]) -> Result<Vec<bool>, StoreError> {
+        Ok(hashes.iter().map(|h| self.index.get(h).is_some()).collect())
+    }
+
     /// Evict a cached read handle for `pack`.
     ///
     /// Called by M7 GC before unlinking a pack file so the next reader opens a
@@ -562,6 +590,8 @@ impl PageStore {
         for &pack_id in &dirty {
             let path = pack_path(&self.dir, pack_id);
             let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            // Failpoint: immediately before the batch fdatasync call.
+            fail_point!("pack-fdatasync");
             file.sync_data()?;
         }
 
