@@ -646,6 +646,10 @@ fn blocking_put_snapshot_from_parts_32mib_does_not_hang() {
         let _ = done_tx.send(sref);
     });
 
+    // The worker is deliberately NOT joined: on regression it is wedged in
+    // ep_poll forever, and a join would turn this watchdog back into the
+    // unbounded hang it exists to prevent. 120s (vs the ~30s retry budget)
+    // so only the non-retryable deadlock can trip it.
     let sref = done_rx
         .recv_timeout(std::time::Duration::from_secs(120))
         .expect("32 MiB put_snapshot_from_parts hung >120s — bead 0vl regression");

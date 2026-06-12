@@ -156,7 +156,11 @@ impl SnapstoreClient {
                 // iterator stream. Pre-filling a bounded channel here deadlocks
                 // once the message count exceeds the capacity, because nothing
                 // drains the receiver until `put_pages` is awaited (>16 chunks
-                // = >4096 pages hung forever; bead 0vl).
+                // = >4096 pages hung forever; bead 0vl). Two consequences a
+                // future edit must keep: `messages` (~the full page payload)
+                // stays resident for the RPC's duration, and it is rebuilt on
+                // every retry attempt because the iterator stream is
+                // single-use — construction must stay inside this closure.
                 let response = inner
                     .put_pages(tokio_stream::iter(messages))
                     .await
