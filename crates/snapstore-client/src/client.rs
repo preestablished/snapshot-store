@@ -3,7 +3,6 @@
 use bytes::Bytes;
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::{LogId, PageHash, SnapshotRef};
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
 use crate::{
@@ -153,16 +152,13 @@ impl SnapstoreClient {
 
                 let local_batch_hash = *local_hasher.finalize().as_bytes();
 
-                let (tx, rx) = tokio::sync::mpsc::channel(16);
-                for msg in messages {
-                    tx.send(msg)
-                        .await
-                        .map_err(|_| ClientError::Transport("send channel closed".into()))?;
-                }
-                drop(tx);
-
+                // All messages are already materialized: hand tonic a plain
+                // iterator stream. Pre-filling a bounded channel here deadlocks
+                // once the message count exceeds the capacity, because nothing
+                // drains the receiver until `put_pages` is awaited (>16 chunks
+                // = >4096 pages hung forever; bead 0vl).
                 let response = inner
-                    .put_pages(ReceiverStream::new(rx))
+                    .put_pages(tokio_stream::iter(messages))
                     .await
                     .map_err(decode_status)?;
                 let resp = response.into_inner();

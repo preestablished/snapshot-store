@@ -604,6 +604,61 @@ fn blocking_facade_smoke() {
     assert_eq!(new, 1);
 }
 
+// ── test: put larger than 16 chunks does not hang (bead 0vl) ─────────────────
+
+/// Regression for the iteration-84 hang: 8192 pages (32 MiB) chunk into 32
+/// `PutPagesRequest` messages. The old `put_pages` pre-filled a bounded(16)
+/// mpsc channel before tonic ever polled the receiver, so the 17th send
+/// parked forever — the blocking facade sat in ep_poll with no error and
+/// zero CPU. 4096 pages (exactly 16 chunks) masked the bug. The watchdog
+/// thread turns any regression back into a loud failure instead of a hung
+/// CI job.
+#[test]
+fn blocking_put_snapshot_from_parts_32mib_does_not_hang() {
+    let dir = TempDir::new().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir_path = dir.path().to_owned();
+    let (sock_path, _handle) = rt.block_on(async {
+        let server = FlakyServer::new(vec![]);
+        start_flaky_server(server, &dir_path).await
+    });
+
+    let n_pages = 8192u64;
+    let worker_sock = sock_path.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let client = crate::blocking::SnapstoreClient::connect(Transport::Uds(worker_sock))
+            .expect("blocking connect");
+        let pages: Vec<(u64, Vec<u8>)> = (0..n_pages)
+            .map(|i| {
+                let mut data = vec![0u8; 4096];
+                data[..8].copy_from_slice(&i.to_le_bytes());
+                (i, data)
+            })
+            .collect();
+        let sref = client
+            .put_snapshot_from_parts(None, n_pages * 4096, pages, plain_blob())
+            .expect("put_snapshot_from_parts");
+        let _ = done_tx.send(sref);
+    });
+
+    let sref = done_rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("32 MiB put_snapshot_from_parts hung >120s — bead 0vl regression");
+
+    // Roundtrip: the stored container decodes and references every page.
+    let client = crate::blocking::SnapstoreClient::connect(Transport::Uds(sock_path))
+        .expect("blocking connect");
+    let container = client.get_snapshot(sref).expect("get_snapshot");
+    let manifest = snapstore_manifest::Manifest::decode(&container).expect("manifest decodes");
+    assert_eq!(manifest.entries.len() as u64, n_pages);
+    assert_eq!(manifest.guest_ram_bytes, n_pages * 4096);
+}
+
 // ── test: put_pages deduplication ────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
