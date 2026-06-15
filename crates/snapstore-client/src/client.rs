@@ -131,23 +131,21 @@ impl SnapstoreClient {
                 // Compute the local batch_blake3 as we prepare messages.
                 let mut local_hasher = blake3::Hasher::new();
                 let mut messages: Vec<PutPagesRequest> = Vec::new();
-                let mut chunk_pages = Vec::<bytes::Bytes>::new();
+                let mut chunk_pages = Vec::<Vec<u8>>::with_capacity(256);
 
                 for (_, data) in &pages {
                     let ph = blake3::hash(data);
                     local_hasher.update(ph.as_bytes());
-                    chunk_pages.push(Bytes::from(data.clone()));
+                    chunk_pages.push(data.clone());
                     if chunk_pages.len() == 256 {
                         messages.push(PutPagesRequest {
-                            pages: chunk_pages.iter().map(|b| b.to_vec()).collect(),
+                            pages: std::mem::take(&mut chunk_pages),
                         });
-                        chunk_pages.clear();
+                        chunk_pages.reserve(256);
                     }
                 }
                 if !chunk_pages.is_empty() {
-                    messages.push(PutPagesRequest {
-                        pages: chunk_pages.iter().map(|b| b.to_vec()).collect(),
-                    });
+                    messages.push(PutPagesRequest { pages: chunk_pages });
                 }
 
                 let local_batch_hash = *local_hasher.finalize().as_bytes();
