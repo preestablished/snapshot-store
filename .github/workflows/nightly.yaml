@@ -1,0 +1,75 @@
+# Nightly durability + fuzz + perf jobs (phase-2 plan 04 WI5).
+#
+# Runner decision (recorded per the plan): GitHub-hosted ubuntu-latest.
+# Empirical wall-clock on the 6-core reference box: 1,000 randomized kill
+# cycles + matrix ×50 ≈ 6 minutes in debug — far inside a nightly budget,
+# so a self-hosted runner is not warranted. Kill/fd semantics need Linux,
+# which ubuntu-latest provides. The disk-bound BENCH GATES are still only
+# meaningful on the reference box (docs/bench-baseline.md); the nightly
+# perf job here is a regression smoke, not a gate measurement.
+name: nightly
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+jobs:
+  # Gate S5 sign-off profile: 1,000 randomized kill cycles, zero invariant
+  # violations; failpoint matrix (9 boundaries) × 50; SQLite batch-atomicity
+  # loop × 200.
+  crash-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+          ref: ca9ee9048d7fca8eec5fe512011b011128e2b0c3
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run -p snapstore-crash --features failpoints -- run --cycles 1000 --seed ${{ github.run_id }} --matrix-passes 50
+        working-directory: repo
+      - run: cargo run -p snapstore-crash --features failpoints -- run --scenario sqlite-batch --cycles 200 --seed ${{ github.run_id }} --matrix-passes 0
+        working-directory: repo
+
+  # 10-minute libFuzzer run on Manifest::decode (01 WI1 AC; the phase-1 M2
+  # fuzz AC was never delivered — this is its home now).
+  manifest-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+          ref: ca9ee9048d7fca8eec5fe512011b011128e2b0c3
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz run manifest_decode -- -max_total_time=600
+        working-directory: repo
+
+  # Perf regression smoke: criterion benches in quick mode. Numbers are
+  # informational on shared runners; gate measurements live on the
+  # reference box (docs/bench-baseline.md).
+  perf-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+          ref: ca9ee9048d7fca8eec5fe512011b011128e2b0c3
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo bench -p snapstore-pagestore --bench read_path -- --warm-up-time 1 --measurement-time 5
+        working-directory: repo
+      - run: cargo bench -p snapstore-store --bench put_snapshot -- --warm-up-time 1 --measurement-time 5
+        working-directory: repo

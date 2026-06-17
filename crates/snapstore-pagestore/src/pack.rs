@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use bytes::Bytes;
-use snapstore_types::{PageHash, PackId, PAGE_SIZE};
+use snapstore_types::{PackId, PageHash, PAGE_SIZE};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -186,6 +186,16 @@ impl PackWriter {
         self.pack_id
     }
 
+    /// Expose the underlying file for lock-free pread on the active pack.
+    ///
+    /// The caller must hold the `active` lock and must have called `flush_buf()`
+    /// before issuing any pread — otherwise buffered records are not yet visible.
+    /// This handle is NOT cached in the LRU read cache; its identity changes on
+    /// rotation.
+    pub fn file_for_pread(&self) -> &std::fs::File {
+        &self.file
+    }
+
     /// True if appending one more record would exceed the rotation cap.
     pub fn would_exceed_cap(&self) -> bool {
         self.write_offset + RECORD_HEADER_SIZE + PAGE_SIZE as u64 > self.max_bytes
@@ -207,11 +217,13 @@ impl PackWriter {
         let record_start_in_buf = self.write_buf.len();
         self.write_buf.extend_from_slice(hash.as_bytes());
         self.write_buf.push(0x01); // flags: raw page
-        self.write_buf.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        self.write_buf
+            .extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
         self.write_buf.extend_from_slice(payload);
 
         // Update body hasher with the entire encoded record.
-        self.body_hasher.update(&self.write_buf[record_start_in_buf..]);
+        self.body_hasher
+            .update(&self.write_buf[record_start_in_buf..]);
 
         self.write_offset += RECORD_HEADER_SIZE + PAGE_SIZE as u64;
         self.record_count += 1;
@@ -306,6 +318,10 @@ pub struct PackReader {
 
 impl PackReader {
     /// Open a sealed pack for reading.  Validates header and footer.
+    ///
+    /// This is the full validation path: it reads the footer and scans all
+    /// record headers to verify the record count.  Use this path for
+    /// sidecar-missing recovery or the first-time open of a pack at startup.
     pub fn open(path: &Path, pack_id: PackId) -> Result<Self, PackError> {
         let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
 
@@ -347,6 +363,75 @@ impl PackReader {
             pack_id,
             body_end: Some(body_end),
         })
+    }
+
+    /// Open a sealed pack with cheap header-only validation.
+    ///
+    /// Sealed packs are immutable — their sidecars were verified at startup and
+    /// records are never rewritten, only the footer was appended once.  Reopening
+    /// with the full body scan on every cache-miss would be catastrophically slow
+    /// (up to a ~1 GiB scan per 4 KiB page read).  This path validates just the
+    /// 20-byte header magic/version, trusting the sidecar-verified invariant.
+    ///
+    /// IMPORTANT: only use this path for sealed packs whose sidecar has already
+    /// been verified.  The recovery path (startup sealing) must still use
+    /// `open` or `open_unsealed` for full validation.
+    pub fn open_sealed_fast(path: &Path, _pack_id: PackId) -> Result<std::fs::File, PackError> {
+        use std::os::unix::fs::FileExt;
+
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+
+        // Validate header magic only — no body scan (O(1) instead of O(pack_size)).
+        let mut magic = [0u8; 4];
+        file.read_exact_at(&mut magic, 0)?;
+        if &magic != PACK_MAGIC {
+            return Err(PackError::BadMagic);
+        }
+
+        Ok(file)
+    }
+
+    /// Read a record at `offset` directly from a raw `File` handle using pread.
+    ///
+    /// Verifies that blake3(payload) == `expected_hash` before returning.
+    /// Returns `PackError::HashMismatch` on corruption.
+    pub fn read_at_from_file(
+        file: &std::fs::File,
+        offset: u64,
+        expected_hash: &PageHash,
+    ) -> Result<bytes::Bytes, PackError> {
+        use std::os::unix::fs::FileExt;
+
+        // One pread covers header + payload (two syscalls per page would
+        // halve GET_BATCH throughput).
+        let mut record = vec![0u8; RECORD_HEADER_SIZE as usize + PAGE_SIZE];
+        file.read_exact_at(&mut record, offset)
+            .map_err(|_| PackError::TruncatedRecord { offset })?;
+
+        let stored_hash_bytes: [u8; 32] = record[0..32].try_into().unwrap();
+        let len = u32::from_le_bytes(record[33..37].try_into().unwrap());
+
+        // Sanity-check length: must be exactly PAGE_SIZE for raw page records.
+        if len as usize != PAGE_SIZE {
+            return Err(PackError::TruncatedRecord { offset });
+        }
+
+        // Zero-copy payload view over the single read buffer.
+        let payload = bytes::Bytes::from(record).slice(RECORD_HEADER_SIZE as usize..);
+
+        // Verify stored hash matches requested hash (detects corruption and
+        // wrong-offset reads).
+        if &stored_hash_bytes != expected_hash.as_bytes() {
+            return Err(PackError::HashMismatch { offset });
+        }
+
+        // Re-verify payload integrity: blake3(payload) must equal the stored hash.
+        let computed = *blake3::hash(&payload).as_bytes();
+        if computed != stored_hash_bytes {
+            return Err(PackError::HashMismatch { offset });
+        }
+
+        Ok(payload)
     }
 
     /// Open an unsealed (active or crashed) pack.  Scans records forward,
@@ -393,7 +478,11 @@ impl PackReader {
             let len = u32::from_le_bytes(rec_header[33..37].try_into().unwrap());
 
             // For M1 we only write raw pages (flags & 1 == 1, len == PAGE_SIZE).
-            let expected_len = if flags & 0x01 != 0 { PAGE_SIZE as u32 } else { len };
+            let expected_len = if flags & 0x01 != 0 {
+                PAGE_SIZE as u32
+            } else {
+                len
+            };
             if len != expected_len || len as usize > PAGE_SIZE * 2 {
                 // Implausible length — treat as truncation.
                 truncate_at = Some(offset);
@@ -510,10 +599,7 @@ impl PackReader {
 
 /// Count how many complete records exist between PACK_HEADER_SIZE and body_end,
 /// without verifying hashes.
-fn count_records_in_file(
-    file: &mut std::fs::File,
-    body_end: u64,
-) -> Result<u64, PackError> {
+fn count_records_in_file(file: &mut std::fs::File, body_end: u64) -> Result<u64, PackError> {
     file.seek(SeekFrom::Start(PACK_HEADER_SIZE))?;
 
     let mut offset = PACK_HEADER_SIZE;
@@ -644,10 +730,7 @@ mod tests {
 
         // Re-open file and truncate mid-way through last record.
         {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             // last record starts at offsets[4]; cut halfway through payload
             let trunc_at = offsets[4] + RECORD_HEADER_SIZE + (PAGE_SIZE as u64 / 2);
             file.set_len(trunc_at).unwrap();

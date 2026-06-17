@@ -2,7 +2,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use snapstore_types::{PAGE_SIZE, PageHash};
+use snapstore_types::{PageHash, PAGE_SIZE};
 
 /// Statistical profile describing a synthetic guest workload.
 #[derive(Clone, Debug)]
@@ -82,7 +82,11 @@ fn generate_page(
         let base_byte: u8 = page_rng.gen();
         let mut page = Box::new([0u8; PAGE_SIZE]);
         for i in 0..PAGE_SIZE {
-            let variation: u8 = if i % 64 == 0 { page_rng.gen::<u8>() & 0x0F } else { 0 };
+            let variation: u8 = if i % 64 == 0 {
+                page_rng.gen::<u8>() & 0x0F
+            } else {
+                0
+            };
             page[i] = base_byte.wrapping_add(variation);
         }
         page
@@ -215,7 +219,10 @@ mod tests {
                 break;
             }
         }
-        assert!(all_identical, "same seed + profile must produce byte-identical pages");
+        assert!(
+            all_identical,
+            "same seed + profile must produce byte-identical pages"
+        );
     }
 
     #[test]
@@ -230,7 +237,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_identical, "different seeds must produce different page content");
+        assert!(
+            !all_identical,
+            "different seeds must produce different page content"
+        );
     }
 
     #[test]
@@ -310,16 +320,14 @@ mod tests {
         let profile = small_all_unique();
         let mut guest = SyntheticGuest::new(77, profile);
 
-        let snapshot: Vec<[u8; PAGE_SIZE]> = (0..TEST_PAGES)
-            .map(|i| *guest.pages[i])
-            .collect();
+        let snapshot: Vec<[u8; PAGE_SIZE]> = (0..TEST_PAGES).map(|i| *guest.pages[i]).collect();
 
         let dirty = guest.step_epoch();
         assert!(!dirty.is_empty(), "at least one page must be dirtied");
 
-        let any_changed = dirty.iter().any(|&idx| {
-            guest.pages[idx as usize].as_ref() != &snapshot[idx as usize]
-        });
+        let any_changed = dirty
+            .iter()
+            .any(|&idx| guest.pages[idx as usize].as_ref() != &snapshot[idx as usize]);
         assert!(any_changed, "step_epoch must actually modify page content");
     }
 }

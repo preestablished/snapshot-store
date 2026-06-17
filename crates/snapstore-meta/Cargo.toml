@@ -8,6 +8,9 @@ license.workspace = true
 snapstore-types = { path = "../snapstore-types" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
+crossbeam-channel = "0.5"
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

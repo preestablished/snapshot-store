@@ -1,0 +1,429 @@
+// determinism.snapstore.v1 — the snapshot-store service surface.
+//
+// CANONICAL COPY (vendored): per ARCHITECTURE §1's "canonical until
+// control-plane exists" rule, this file is the source of truth until
+// control-plane fulfils the adopt-snapstore-proto-v1 request and publishes
+// generated code from determinism-proto; at that point this file is deleted
+// and the generated re-exports swap to the published crate (phase-2 plan,
+// 00-overview risk 2).
+//
+// Conventions:
+// - All hashes/refs are 32-byte BLAKE3 values carried as `bytes` (length
+//   validated at the RPC boundary).
+// - node_id is a caller-assigned u64, unique per experiment; root = 0.
+// - Logical timestamps (created_at / updated_at / last_visited_at) are the
+//   meta DB's logical counter, not wall-clock time.
+// - Container blobs (.spm manifests, SILG input logs) are carried and stored
+//   byte-identically; their BLAKE3 footers are self-verifying.
+
+syntax = "proto3";
+
+package determinism.snapstore.v1;
+
+service SnapshotStore {
+  // ── pages & snapshots ─────────────────────────────────────────────────
+  // Client-streamed page upload. Each message carries at most 256 pages of
+  // exactly 4096 bytes. The server hashes every page itself (clients cannot
+  // lie about content addresses).
+  rpc PutPages(stream PutPagesRequest) returns (PutPagesResponse);
+  // Store a .spm manifest container. Pages it references must already be
+  // present and durable (FAILED_PRECONDITION + MissingPages detail if not).
+  rpc PutSnapshot(PutSnapshotRequest) returns (PutSnapshotResponse);
+  // Fetch the stored container byte-identically.
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  // Stream the resolved page set of a snapshot. Mode A (full flatten) when
+  // baseline_ref is empty; Mode B (delta vs an ancestor baseline) otherwise.
+  rpc ResolvePages(ResolvePagesRequest) returns (stream ResolvePagesResponse);
+  // Bulk existence probe, at most 4096 hashes per call.
+  rpc HasPages(HasPagesRequest) returns (HasPagesResponse);
+
+  // ── input logs ────────────────────────────────────────────────────────
+  rpc PutInputLog(PutInputLogRequest) returns (PutInputLogResponse);
+  rpc GetInputLog(GetInputLogRequest) returns (GetInputLogResponse);
+
+  // ── tree ──────────────────────────────────────────────────────────────
+  // Idempotent on (experiment_id, node_id): replaying an identical create
+  // returns the stored row; key reuse with different immutable fields is
+  // ALREADY_EXISTS. snapshot_ref must resolve to a stored manifest
+  // (NOT_FOUND otherwise — the P0 commit-ordering signal).
+  rpc CreateNode(CreateNodeRequest) returns (CreateNodeResponse);
+  // Bulk partial updates in one transaction, all-or-nothing; unknown ids
+  // roll back the batch (NOT_FOUND + MissingNodes detail).
+  rpc UpdateNodes(UpdateNodesRequest) returns (UpdateNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc GetChildren(GetChildrenRequest) returns (GetChildrenResponse);
+  // Root-first path from the experiment root to the named node.
+  rpc GetPath(GetPathRequest) returns (GetPathResponse);
+  // Filtered scan, server-streamed at most 512 nodes per message.
+  rpc QueryNodes(QueryNodesRequest) returns (stream QueryNodesResponse);
+
+  // ── metadata KV ───────────────────────────────────────────────────────
+  rpc PutMetadata(PutMetadataRequest) returns (PutMetadataResponse);
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+  rpc DeleteMetadata(DeleteMetadataRequest) returns (DeleteMetadataResponse);
+
+  // ── lifecycle ─────────────────────────────────────────────────────────
+  rpc PruneSubtree(PruneSubtreeRequest) returns (PruneSubtreeResponse);
+  rpc Pin(PinRequest) returns (PinResponse);
+  rpc Unpin(UnpinRequest) returns (UnpinResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  // UNIMPLEMENTED until M7 (GC milestone).
+  rpc TriggerGc(TriggerGcRequest) returns (TriggerGcResponse);
+}
+
+// ── shared types ──────────────────────────────────────────────────────────
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_FRONTIER = 1;
+  NODE_STATUS_EXPANDED = 2;
+  NODE_STATUS_PRUNED = 3;
+  NODE_STATUS_GOAL = 4;
+}
+
+// The full node row. 15 fields — this shape replaces the phase-0
+// hand-written NodeMeta in determinism-proto.
+message NodeMeta {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+  // Unset iff this is the experiment root (node_id 0).
+  optional uint64 parent_node_id = 3;
+  uint64 depth = 4;
+  bytes snapshot_ref = 5;
+  // Empty if the node has no input log (root).
+  bytes input_log_id = 6;
+  NodeStatus status = 7;
+  optional double score = 8;
+  uint64 visit_count = 9;
+  uint64 icount = 10;
+  uint64 virtual_ns = 11;
+  uint64 created_at = 12;
+  uint64 updated_at = 13;
+  // 0 = never visited.
+  uint64 last_visited_at = 14;
+  // Opaque caller-owned blob.
+  bytes attrs = 15;
+}
+
+// ── error details (google.rpc.Status detail payloads) ────────────────────
+
+// Attached to FAILED_PRECONDITION from PutSnapshot: the exact set of
+// referenced pages that are not present-and-durable, or (parent_ref
+// non-empty) the parent manifest that is missing.
+message MissingPages {
+  repeated bytes page_hashes = 1;
+  bytes parent_ref = 2;
+}
+
+// Attached to NOT_FOUND from UpdateNodes: every node id in the rejected
+// batch that does not exist (the whole batch was rolled back).
+message MissingNodes {
+  repeated uint64 node_ids = 1;
+}
+
+// Attached to FAILED_PRECONDITION on KV CAS mismatch. generation 0 means
+// the key is currently absent.
+message CurrentGeneration {
+  uint64 generation = 1;
+}
+
+// ── pages & snapshots ─────────────────────────────────────────────────────
+
+message PutPagesRequest {
+  // Each element exactly 4096 bytes; at most 256 per message.
+  repeated bytes pages = 1;
+}
+
+message PutPagesResponse {
+  uint64 pages_new = 1;
+  uint64 pages_deduped = 2;
+  // BLAKE3 over the concatenated per-page hashes in stream order — clients
+  // that hashed locally cross-check this (mismatch = P0).
+  bytes batch_blake3 = 3;
+}
+
+message PutSnapshotRequest {
+  // A complete .spm container, stored byte-identically.
+  bytes container = 1;
+}
+
+message PutSnapshotResponse {
+  bytes snapshot_ref = 1;
+}
+
+message GetSnapshotRequest {
+  bytes snapshot_ref = 1;
+}
+
+message GetSnapshotResponse {
+  bytes container = 1;
+}
+
+message ResolvePagesRequest {
+  bytes snapshot_ref = 1;
+  // Empty = Mode A (full flatten). Otherwise must be an ancestor of
+  // snapshot_ref (INVALID_ARGUMENT if not in the parent chain) and the
+  // stream carries only entries the child chain adds/changes (Mode B).
+  bytes baseline_ref = 2;
+  // When true, payloads are omitted (hash listing only).
+  bool hashes_only = 3;
+}
+
+message ResolvedPage {
+  uint64 page_index = 1;
+  bytes page_hash = 2;
+  // Empty when hashes_only.
+  bytes payload = 3;
+}
+
+message ResolvePagesResponse {
+  // Ascending by page_index across the whole stream; at most 512 per message.
+  repeated ResolvedPage pages = 1;
+}
+
+message HasPagesRequest {
+  repeated bytes page_hashes = 1;
+}
+
+message HasPagesResponse {
+  // Parallel to request order.
+  repeated bool present = 1;
+}
+
+// ── input logs ────────────────────────────────────────────────────────────
+
+message PutInputLogRequest {
+  // A complete SILG container, stored byte-identically.
+  bytes container = 1;
+}
+
+message PutInputLogResponse {
+  bytes log_id = 1;
+  bool newly_stored = 2;
+}
+
+message GetInputLogRequest {
+  bytes log_id = 1;
+}
+
+message GetInputLogResponse {
+  bytes container = 1;
+}
+
+// ── tree ──────────────────────────────────────────────────────────────────
+
+message CreateNodeRequest {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+  // Unset iff node_id == 0 (root rules enforced server-side).
+  optional uint64 parent_node_id = 3;
+  bytes snapshot_ref = 4;
+  // Empty = no input log. If inline_input_log is set, it must be a valid
+  // SILG container whose log_id equals this field; it is stored in the same
+  // transaction as the node row.
+  bytes input_log_id = 5;
+  bytes inline_input_log = 6;
+  // UNSPECIFIED defaults to FRONTIER.
+  NodeStatus status = 7;
+  optional double score = 8;
+  uint64 icount = 9;
+  uint64 virtual_ns = 10;
+  bytes attrs = 11;
+}
+
+message CreateNodeResponse {
+  NodeMeta node = 1;
+}
+
+message NodeUpdate {
+  uint64 node_id = 1;
+  optional NodeStatus status = 2;
+  optional double score = 3;
+  optional bytes attrs = 4;
+  optional int64 visit_count_delta = 5;
+  // Stamp last_visited_at with this transaction's logical counter.
+  bool touch_visited = 6;
+  optional uint64 icount = 7;
+  optional uint64 virtual_ns = 8;
+}
+
+message UpdateNodesRequest {
+  string experiment_id = 1;
+  repeated NodeUpdate updates = 2;
+}
+
+message UpdateNodesResponse {
+  // The logical counter stamped on every row of this batch.
+  uint64 updated_at = 1;
+}
+
+message GetNodeRequest {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+}
+
+message GetNodeResponse {
+  NodeMeta node = 1;
+}
+
+message GetChildrenRequest {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+}
+
+message GetChildrenResponse {
+  repeated NodeMeta nodes = 1;
+}
+
+message GetPathRequest {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+  bool include_logs = 3;
+}
+
+message PathElement {
+  NodeMeta node = 1;
+  // Full SILG container; empty unless include_logs and the node has one.
+  bytes input_log_container = 2;
+}
+
+message GetPathResponse {
+  // Root-first.
+  repeated PathElement elements = 1;
+}
+
+enum QueryOrder {
+  QUERY_ORDER_UNSPECIFIED = 0;  // defaults to CREATED_AT
+  QUERY_ORDER_CREATED_AT = 1;
+  QUERY_ORDER_UPDATED_AT = 2;
+  QUERY_ORDER_NODE_ID = 3;
+}
+
+message QueryNodesRequest {
+  string experiment_id = 1;
+  optional NodeStatus status = 2;
+  optional uint64 parent_node_id = 3;
+  optional uint64 min_depth = 4;
+  optional uint64 max_depth = 5;
+  // Exclusive cursors over the logical counter.
+  optional uint64 created_after = 6;
+  optional uint64 updated_after = 7;
+  QueryOrder order = 8;
+  // 0 = server default (512); capped at 4096.
+  uint32 limit = 9;
+}
+
+message QueryNodesResponse {
+  // At most 512 per message.
+  repeated NodeMeta nodes = 1;
+}
+
+// ── metadata KV ───────────────────────────────────────────────────────────
+
+message PutMetadataRequest {
+  // 1..=512 bytes.
+  bytes key = 1;
+  // <= 16 MiB.
+  bytes value = 2;
+  // Unset = unconditional upsert; 0 = create-only; N = must match current
+  // generation (FAILED_PRECONDITION + CurrentGeneration on mismatch).
+  optional uint64 expected_generation = 3;
+}
+
+message PutMetadataResponse {
+  uint64 generation = 1;
+}
+
+message GetMetadataRequest {
+  bytes key = 1;
+}
+
+message GetMetadataResponse {
+  bytes value = 1;
+  uint64 generation = 2;
+}
+
+message DeleteMetadataRequest {
+  bytes key = 1;
+  optional uint64 expected_generation = 2;
+}
+
+message DeleteMetadataResponse {
+  bool deleted = 1;
+}
+
+// ── lifecycle ─────────────────────────────────────────────────────────────
+
+message PruneSubtreeRequest {
+  string experiment_id = 1;
+  uint64 node_id = 2;
+  // The experiment root is protected unless set.
+  bool allow_root = 3;
+}
+
+message PruneSubtreeResponse {
+  uint64 nodes_pruned = 1;
+}
+
+message PinRequest {
+  bytes snapshot_ref = 1;
+  string note = 2;
+}
+
+message PinResponse {
+  bool newly_pinned = 1;
+}
+
+message UnpinRequest {
+  bytes snapshot_ref = 1;
+}
+
+message UnpinResponse {
+  bool was_pinned = 1;
+}
+
+message StatsRequest {
+  // Empty = global stats only.
+  string experiment_id = 1;
+}
+
+message ExperimentStats {
+  string experiment_id = 1;
+  uint64 nodes_total = 2;
+  uint64 nodes_frontier = 3;
+  uint64 nodes_expanded = 4;
+  uint64 nodes_pruned = 5;
+  uint64 nodes_goal = 6;
+  uint64 max_depth = 7;
+  uint64 input_logs_total = 8;
+  uint64 input_log_bytes = 9;
+}
+
+message StoreStats {
+  // Maintained counters (recomputable at startup), not on-demand scans.
+  uint64 unique_pages = 1;
+  uint64 physical_page_bytes = 2;
+  uint64 manifests_total = 3;
+  // Sum of guest_ram_bytes over stored manifests (every manifest flattens
+  // to full coverage, so its logical size is exactly guest_ram_bytes).
+  uint64 logical_page_bytes = 4;
+  double dedup_ratio = 5;
+  uint64 experiments_total = 6;
+  uint64 nodes_total = 7;
+  uint64 pins_total = 8;
+  uint64 tombstones_total = 9;
+  uint64 logical_counter = 10;
+  // Zero until M7; post-GC live-vs-stored exactness is M7's problem.
+  uint64 gc_runs_total = 11;
+  uint64 gc_pages_reclaimed_total = 12;
+}
+
+message StatsResponse {
+  StoreStats store = 1;
+  // Present when experiment_id was given.
+  optional ExperimentStats experiment = 2;
+}
+
+message TriggerGcRequest {}
+
+message TriggerGcResponse {}
