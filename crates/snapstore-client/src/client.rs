@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use snapstore_manifest::DeviceBlob;
-use snapstore_types::{LogId, PageHash, SnapshotRef};
+use snapstore_types::{LogId, PageHash, SnapshotRef, PAGE_SIZE};
 use tonic::transport::Channel;
 
 use crate::{
@@ -30,10 +30,11 @@ use crate::{
 /// # Page-channel fast path (Linux only)
 ///
 /// When the `Transport::Auto` configuration includes a `page_channel_path` that
-/// exists and connects, `put_pages` sends page bytes over the SEQPACKET channel
-/// instead of gRPC.  Every operation keeps its pure-gRPC equivalent; any
-/// `ChannelError` that is not `CrossCheckMismatch` causes a silent fallback to
-/// gRPC (logged at WARN level).
+/// exists and connects, bulk page bytes may move over the SEQPACKET channel:
+/// `put_pages` sends page payloads through `PUT_BATCH`, and
+/// `resolve_pages(..., hashes_only=false)` receives committed page hashes over
+/// gRPC before fetching payloads through `GET_BATCH`. Metadata and control flow
+/// stay on gRPC, and every operation keeps its pure-gRPC equivalent.
 ///
 /// `CrossCheckMismatch` is a P0 determinism signal — it surfaces as
 /// `ClientError::BatchBlake3Mismatch` and is never retried or fallen back.
@@ -237,7 +238,63 @@ impl SnapstoreClient {
     ///
     /// Returns `Vec<(page_index, page_hash, Option<payload>)>` where payload
     /// is `None` when `hashes_only` is true.
+    ///
+    /// # Page-channel fast path
+    ///
+    /// On Linux, when the client was constructed via `Transport::Auto` with a
+    /// connected `page_channel_path` and `hashes_only` is false, metadata and
+    /// ordered page hashes are first resolved through gRPC with
+    /// `hashes_only=true`. Payload bytes are then fetched by hash over
+    /// page-channel `GET_BATCH`, validated against the resolved hashes, and
+    /// attached to the returned entries. Ordinary channel failures fall back to
+    /// the pure-gRPC payload stream; consistency or integrity failures do not.
     pub async fn resolve_pages(
+        &self,
+        snapshot_ref: SnapshotRef,
+        baseline_ref: Option<SnapshotRef>,
+        hashes_only: bool,
+    ) -> ClientResult<Vec<(u64, PageHash, Option<Bytes>)>> {
+        #[cfg(target_os = "linux")]
+        if !hashes_only {
+            if let Some(ref pc) = self.page_channel {
+                let resolved = self
+                    .resolve_pages_via_grpc(snapshot_ref.clone(), baseline_ref.clone(), true)
+                    .await?;
+                if resolved.is_empty() {
+                    return Ok(resolved);
+                }
+
+                let resolved_hashes: Vec<(u64, PageHash)> = resolved
+                    .iter()
+                    .map(|(page_index, page_hash, _)| (*page_index, *page_hash))
+                    .collect();
+                match resolve_payloads_via_channel(pc.as_ref(), &resolved_hashes) {
+                    Ok(payloads) => {
+                        let with_payloads = resolved_hashes
+                            .into_iter()
+                            .zip(payloads)
+                            .map(|((page_index, page_hash), payload)| {
+                                (page_index, page_hash, Some(payload))
+                            })
+                            .collect();
+                        return Ok(with_payloads);
+                    }
+                    Err(ResolveViaChannelError::Fatal(err)) => return Err(err),
+                    Err(ResolveViaChannelError::Fallback(err)) => {
+                        tracing::warn!(
+                            err = %err,
+                            "page-channel: GET_BATCH failed, falling back to gRPC resolve_pages"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.resolve_pages_via_grpc(snapshot_ref, baseline_ref, hashes_only)
+            .await
+    }
+
+    async fn resolve_pages_via_grpc(
         &self,
         snapshot_ref: SnapshotRef,
         baseline_ref: Option<SnapshotRef>,
@@ -836,6 +893,173 @@ fn put_pages_via_channel(
     Ok((total_new, total_deduped))
 }
 
+#[cfg(target_os = "linux")]
+enum ResolveViaChannelError {
+    Fallback(snapstore_localpath::ChannelError),
+    Fatal(ClientError),
+}
+
+/// Fetch resolved page payloads by hash through page-channel `GET_BATCH`.
+///
+/// The helper uses dense ordinal slots rather than page indexes so sparse guest
+/// address spaces cannot imply large client-side allocations.
+#[cfg(target_os = "linux")]
+fn resolve_payloads_via_channel(
+    pc: &snapstore_localpath::client::PageChannelClient,
+    resolved: &[(u64, PageHash)],
+) -> Result<Vec<Bytes>, ResolveViaChannelError> {
+    use snapstore_localpath::proto::GET_BATCH_MAX_PER_DATAGRAM;
+
+    if resolved.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut channel_results = Vec::with_capacity(resolved.len());
+    for (chunk_index, chunk) in resolved
+        .chunks(GET_BATCH_MAX_PER_DATAGRAM as usize)
+        .enumerate()
+    {
+        let base = chunk_index * GET_BATCH_MAX_PER_DATAGRAM as usize;
+        let reqs: Vec<(PageHash, u64)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, (_, page_hash))| (*page_hash, (base + i) as u64))
+            .collect();
+        let mut got = pc.get_batch(&reqs).map_err(classify_get_batch_error)?;
+        channel_results.append(&mut got);
+    }
+
+    attach_payloads_from_channel_results(resolved, channel_results)
+        .map_err(ResolveViaChannelError::Fatal)
+}
+
+#[cfg(target_os = "linux")]
+fn classify_get_batch_error(err: snapstore_localpath::ChannelError) -> ResolveViaChannelError {
+    use snapstore_localpath::{
+        proto::ErrorCode,
+        ChannelError::{CrossCheckMismatch, Io, Peer, Protocol, Unsupported, Wire},
+    };
+
+    match err {
+        Io(e) => ResolveViaChannelError::Fallback(Io(e)),
+        Unsupported => ResolveViaChannelError::Fallback(Unsupported),
+        Peer {
+            code: ErrorCode::Overload,
+            detail,
+        } => ResolveViaChannelError::Fallback(Peer {
+            code: ErrorCode::Overload,
+            detail,
+        }),
+        Protocol(msg) if msg.contains("server closed connection") => {
+            ResolveViaChannelError::Fallback(Protocol(msg))
+        }
+        Peer {
+            code: ErrorCode::NotFound,
+            detail,
+        } => ResolveViaChannelError::Fatal(ClientError::corrupt_payload(
+            "page-channel GET_BATCH returned NotFound for a hash from ResolvePages",
+            "all committed ResolvePages hashes readable through the connected page channel",
+            detail,
+        )),
+        Peer { code, detail } => ResolveViaChannelError::Fatal(ClientError::corrupt_payload(
+            "page-channel GET_BATCH peer error",
+            "valid GET_BATCH_DATA response",
+            format!("{code:?}: {detail}"),
+        )),
+        Wire(e) => ResolveViaChannelError::Fatal(ClientError::corrupt_payload(
+            "page-channel GET_BATCH wire error",
+            "valid GET_BATCH_DATA response",
+            e.to_string(),
+        )),
+        Protocol(msg) => ResolveViaChannelError::Fatal(ClientError::corrupt_payload(
+            "page-channel GET_BATCH protocol violation",
+            "valid GET_BATCH_DATA response",
+            msg,
+        )),
+        CrossCheckMismatch { expected, actual } => {
+            ResolveViaChannelError::Fatal(ClientError::BatchBlake3Mismatch { expected, actual })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_payloads_from_channel_results(
+    resolved: &[(u64, PageHash)],
+    channel_results: Vec<(u64, Vec<u8>)>,
+) -> ClientResult<Vec<Bytes>> {
+    if channel_results.len() != resolved.len() {
+        return Err(ClientError::corrupt_payload(
+            "page-channel GET_BATCH scatter cardinality mismatch",
+            resolved.len().to_string(),
+            channel_results.len().to_string(),
+        ));
+    }
+
+    let mut payloads: Vec<Option<Bytes>> = vec![None; resolved.len()];
+    for (dst_slot, payload) in channel_results {
+        let slot = usize::try_from(dst_slot).map_err(|_| {
+            ClientError::corrupt_payload(
+                "page-channel GET_BATCH returned dst_slot outside usize range",
+                format!("0..{}", resolved.len()),
+                dst_slot.to_string(),
+            )
+        })?;
+        if slot >= resolved.len() {
+            return Err(ClientError::corrupt_payload(
+                "page-channel GET_BATCH returned out-of-range dst_slot",
+                format!("0..{}", resolved.len()),
+                dst_slot.to_string(),
+            ));
+        }
+        if payloads[slot].is_some() {
+            return Err(ClientError::corrupt_payload(
+                "page-channel GET_BATCH returned duplicate dst_slot",
+                "unique dense ordinal slots",
+                dst_slot.to_string(),
+            ));
+        }
+        if payload.len() != PAGE_SIZE {
+            return Err(ClientError::corrupt_payload(
+                format!(
+                    "page-channel GET_BATCH returned wrong payload length for page_index {}",
+                    resolved[slot].0
+                ),
+                PAGE_SIZE.to_string(),
+                payload.len().to_string(),
+            ));
+        }
+
+        let actual = blake3::hash(&payload);
+        let expected = resolved[slot].1;
+        if actual.as_bytes() != expected.as_bytes() {
+            return Err(ClientError::corrupt_payload(
+                format!(
+                    "page-channel GET_BATCH payload hash mismatch for page_index {}",
+                    resolved[slot].0
+                ),
+                hex(expected.as_bytes()),
+                hex(actual.as_bytes()),
+            ));
+        }
+
+        payloads[slot] = Some(Bytes::from(payload));
+    }
+
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(slot, payload)| {
+            payload.ok_or_else(|| {
+                ClientError::corrupt_payload(
+                    "page-channel GET_BATCH missing dst_slot",
+                    slot.to_string(),
+                    "<missing>".to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
 // ── footer verification helpers ───────────────────────────────────────────────
 
 /// Verify a `.spm` container's BLAKE3 footer against the expected
@@ -894,4 +1118,101 @@ fn verify_input_log_footer(container: &[u8], log_id: &LogId) -> ClientResult<()>
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod page_channel_resolve_tests {
+    use super::*;
+
+    fn page(seed: u8) -> Vec<u8> {
+        let mut data = vec![0u8; PAGE_SIZE];
+        data[0] = seed;
+        data[PAGE_SIZE - 1] = seed.wrapping_mul(17);
+        data
+    }
+
+    fn hash(data: &[u8]) -> PageHash {
+        PageHash::from_bytes(*blake3::hash(data).as_bytes())
+    }
+
+    fn assert_corrupt_context(err: ClientError, expected_context: &str) {
+        match err {
+            ClientError::CorruptPayload(detail) => {
+                assert!(
+                    detail.context.contains(expected_context),
+                    "context {:?} did not contain {:?}",
+                    detail.context,
+                    expected_context
+                );
+            }
+            other => panic!("expected CorruptPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_payloads_uses_dense_ordinals_for_sparse_duplicate_hashes() {
+        let p0 = page(1);
+        let p2 = page(2);
+        let resolved = vec![(0, hash(&p0)), (1_000_000, hash(&p0)), (7, hash(&p2))];
+        let payloads = attach_payloads_from_channel_results(
+            &resolved,
+            vec![(2, p2.clone()), (0, p0.clone()), (1, p0.clone())],
+        )
+        .expect("valid scatter");
+
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0], Bytes::from(p0.clone()));
+        assert_eq!(payloads[1], Bytes::from(p0));
+        assert_eq!(payloads[2], Bytes::from(p2));
+    }
+
+    #[test]
+    fn attach_payloads_rejects_duplicate_slots() {
+        let p0 = page(1);
+        let p1 = page(2);
+        let resolved = vec![(0, hash(&p0)), (1, hash(&p1))];
+        let err = attach_payloads_from_channel_results(&resolved, vec![(0, p0.clone()), (0, p0)])
+            .expect_err("duplicate slot must fail");
+        assert_corrupt_context(err, "duplicate dst_slot");
+    }
+
+    #[test]
+    fn attach_payloads_rejects_out_of_range_slots() {
+        let p0 = page(1);
+        let resolved = vec![(0, hash(&p0))];
+        let err = attach_payloads_from_channel_results(&resolved, vec![(4, p0)])
+            .expect_err("out-of-range slot must fail");
+        assert_corrupt_context(err, "out-of-range dst_slot");
+    }
+
+    #[test]
+    fn attach_payloads_rejects_missing_slots() {
+        let p0 = page(1);
+        let p1 = page(2);
+        let resolved = vec![(0, hash(&p0)), (1, hash(&p1))];
+        let err = attach_payloads_from_channel_results(&resolved, vec![(0, p0)])
+            .expect_err("missing slot must fail");
+        assert_corrupt_context(err, "cardinality mismatch");
+    }
+
+    #[test]
+    fn attach_payloads_rejects_wrong_length() {
+        let p0 = page(1);
+        let mut short = p0.clone();
+        short.pop();
+        let resolved = vec![(0, hash(&p0))];
+        let err = attach_payloads_from_channel_results(&resolved, vec![(0, short)])
+            .expect_err("wrong length must fail");
+        assert_corrupt_context(err, "wrong payload length");
+    }
+
+    #[test]
+    fn attach_payloads_rejects_hash_mismatch() {
+        let p0 = page(1);
+        let p1 = page(2);
+        let resolved = vec![(0, hash(&p0))];
+        let err = attach_payloads_from_channel_results(&resolved, vec![(0, p1)])
+            .expect_err("hash mismatch must fail");
+        assert_corrupt_context(err, "payload hash mismatch");
+    }
 }

@@ -75,6 +75,20 @@ impl ClientError {
         }))
     }
 
+    /// Build a general `CorruptPayload` error when the expected/actual values
+    /// are already formatted for the caller's context.
+    pub(crate) fn corrupt_payload(
+        context: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        ClientError::CorruptPayload(Box::new(CorruptDetail {
+            context: context.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+        }))
+    }
+
     /// Whether this error is non-retryable: caller-bug or explicit state conflict.
     pub fn is_non_retryable(&self) -> bool {
         matches!(

@@ -34,6 +34,8 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
 blake3 = "1"
+prometheus = { workspace = true }
+nix = { version = "0.29", features = ["socket"] }
 snapstore-server = { path = "../snapstore-server" }
 snapstore-types = { path = "../snapstore-types" }
 

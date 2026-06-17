@@ -6,8 +6,9 @@
 //! - `Tcp(addr)` — TCP gRPC.
 //! - `Auto { uds_path, tcp_addr, page_channel_path }` — try UDS first; if the
 //!   socket file is absent or the initial connect probe fails, fall back to TCP.
-//!   The `page_channel_path` slot is reserved for the M5 page-channel arm
-//!   (added in WI3) and is currently unused.
+//!   When `page_channel_path` is present and connects on Linux, the high-level
+//!   client may use the co-located page channel for bulk page payload bytes
+//!   while retaining gRPC for metadata and control flow.
 
 use std::path::PathBuf;
 
@@ -24,17 +25,19 @@ use crate::error::ClientError;
 /// 2. Attempts a short connect probe.
 /// 3. On any failure falls back to `tcp_addr`.
 ///
-/// The `page_channel_path` field is present **now** so that WI3 only needs to
-/// add the arm; until then its presence is documented and it is ignored at
-/// runtime.
+/// When `page_channel_path` is present, the async/blocking clients try to
+/// connect a Linux page-channel socket during construction. A successful page
+/// channel is an optimization for bulk page bytes (`put_pages` uploads and
+/// restore payload fetches); UDS/TCP gRPC remains the required control plane
+/// and the fallback data path.
 #[derive(Clone, Debug)]
 pub enum Transport {
     /// UDS if the socket exists and connects, else TCP. `page_channel_path` is
-    /// reserved for the M5 page-channel arm (WI3 adds the active code path).
+    /// optional co-located page-channel acceleration for bulk page payloads.
     Auto {
         uds_path: PathBuf,
         tcp_addr: String,
-        /// Reserved for WI3 (page-channel fast path). Currently unused.
+        /// Optional Linux page-channel socket for co-located bulk page bytes.
         page_channel_path: Option<PathBuf>,
     },
     /// Explicit Unix-domain socket.
