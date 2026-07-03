@@ -36,6 +36,16 @@ jobs:
         working-directory: repo
       - run: cargo test -p snapstore-store -p snapstore-crash -p snapstore-meta --features failpoints
         working-directory: repo
+      # M7 GC property suite (gate AC 1, 04-property-suite.md).  The
+      # gc-test-hooks feature is separate from failpoints, so it needs its
+      # own clippy pass; the gc_properties target has required-features and
+      # is skipped by the plain --workspace run above.
+      - run: cargo clippy -p snapstore-server --tests --features snapstore-server/gc-test-hooks -- -D warnings
+        working-directory: repo
+      - run: cargo test -p snapstore-server --test gc_properties --features snapstore-server/gc-test-hooks
+        working-directory: repo
+        env:
+          GC_PROP_CASES: "500"
 
   # M6 PR smoke: randomized kill cycles + one full failpoint-matrix pass
   # (gate S5 PR profile). Required for merge.

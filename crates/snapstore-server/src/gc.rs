@@ -52,6 +52,13 @@ pub struct GcReport {
     pub packs_deleted: u64,
     pub missing_root_manifests: u64,
     pub duration_ms: u64,
+    /// Subtree roots actually reaped this cycle (tombstones whose rows were
+    /// deleted, i.e. `reap_tombstone` returned > 0), as
+    /// `(experiment_id, node_id)`.  Used by the crash harness's `gc_done`
+    /// journal line so recovery can compute the reachable root set without
+    /// re-deriving grace-cycle arithmetic (`.agents/plans/phase3-m7-gc-exit-gate/05-crash-harness.md`
+    /// §1).
+    pub reaped_subtrees: Vec<(String, u64)>,
 }
 
 /// Errors from `run_gc_cycle` / `GcRunner::run`.
@@ -180,7 +187,13 @@ pub fn run_gc_cycle(
         prior_state.last_fence_counter
     };
     for t in meta.list_tombstones(horizon)? {
-        report.nodes_reaped += meta.reap_tombstone(&t.experiment_id, t.node_id)?;
+        let n = meta.reap_tombstone(&t.experiment_id, t.node_id)?;
+        if n > 0 {
+            report
+                .reaped_subtrees
+                .push((t.experiment_id.as_str().to_string(), t.node_id.0));
+        }
+        report.nodes_reaped += n;
     }
 
     // 2. Optionally rotate the active pack so all pre-cycle data becomes

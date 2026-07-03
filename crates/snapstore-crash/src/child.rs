@@ -72,6 +72,17 @@ impl Journal {
         writeln!(self.writer, "{op}\t{key}\t{step}")?;
         self.writer.flush()
     }
+
+    /// Append a journal line whose third field is an arbitrary string rather
+    /// than a plain step counter (used by `gc_done`, whose third field is
+    /// `reaped=<exp:node,...>` per 05-crash-harness.md §1 — re-deriving
+    /// grace-cycle arithmetic during journal replay would be fragile, so the
+    /// reaped-subtree facts travel in the journal line itself).  Called ONLY
+    /// after the op returned Ok.
+    fn record_raw(&mut self, op: &str, key: &str, rest: &str) -> std::io::Result<()> {
+        writeln!(self.writer, "{op}\t{key}\t{rest}")?;
+        self.writer.flush()
+    }
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -82,7 +93,12 @@ const GUEST_RAM_BYTES: u64 = PAGES as u64 * PAGE_SIZE as u64;
 // ── run_child ─────────────────────────────────────────────────────────────────
 
 /// Entry point for the child process.
-pub fn run_child(scratch: &Path, seed: u64, ops: u64, scenario: Scenario) {
+///
+/// `force_gc`: when true (armed by the parent for `--failpoint gc-*` matrix
+/// runs), the `Default` scenario forces `gc` ops early and repeatedly so an
+/// armed GC failpoint is guaranteed to be hit within the op budget (05
+/// §2) — mirrors how the sqlite-batch scenario forces its own path.
+pub fn run_child(scratch: &Path, seed: u64, ops: u64, scenario: Scenario, force_gc: bool) {
     // Arm failpoints from the environment before touching anything.
     #[cfg(feature = "failpoints")]
     let _scenario_guard = fail::FailScenario::setup();
@@ -97,7 +113,7 @@ pub fn run_child(scratch: &Path, seed: u64, ops: u64, scenario: Scenario) {
     let mut rng = StdRng::seed_from_u64(seed);
 
     match scenario {
-        Scenario::Default => run_default(&store, &meta, &mut rng, &mut journal, ops),
+        Scenario::Default => run_default(&store, &meta, &mut rng, &mut journal, ops, force_gc),
         Scenario::SqliteBatch => run_sqlite_batch(&store, &meta, &mut rng, &mut journal, ops),
         Scenario::FullStack => {
             // The full-stack scenario does not use a child process for the
@@ -118,6 +134,7 @@ fn run_default(
     rng: &mut StdRng,
     journal: &mut Journal,
     ops: u64,
+    force_gc: bool,
 ) {
     let exp_a = ExperimentId::new("exp-A").unwrap();
     let exp_b = ExperimentId::new("exp-B").unwrap();
@@ -126,6 +143,13 @@ fn run_default(
     let mut node_ids: Vec<(bool, NodeId)> = Vec::new(); // true = exp-A
 
     let mut prev_ref: Option<SnapshotRef> = None;
+
+    // Committed snapshot refs, for `pin` op candidates.
+    let mut snap_refs: Vec<SnapshotRef> = Vec::new();
+    // Currently-pinned refs (per this child's view), for `unpin` op candidates.
+    let mut pinned_refs: Vec<SnapshotRef> = Vec::new();
+    // Local GC cycle counter for the `gc_done` journal line.
+    let mut gc_cycle: u64 = 0;
 
     for step in 0..ops {
         let exp_a_turn = step % 2 == 0;
@@ -176,6 +200,7 @@ fn run_default(
                 } else {
                     journal.record("put_snapshot_delta", &key, step).ok();
                 }
+                snap_refs.push(snap_ref.clone());
                 prev_ref = Some(snap_ref);
             }
             Err(_) => {
@@ -221,6 +246,19 @@ fn run_default(
                 journal
                     .record("create_node", &format!("{}/0", exp.as_str()), step)
                     .ok();
+                // Node linkage for journal-replay reachability (05 §3 item
+                // 1): key = exp/node/parent ("-" = none), rest = the node's
+                // snapshot-ref hex. Lets recovery compute reaped-subtree
+                // CLOSURES from `gc_done` roots (descendant node rows are
+                // reaped along with the listed subtree root) without
+                // re-deriving anything from meta.
+                journal
+                    .record_raw(
+                        "node_edge",
+                        &format!("{}/0/-", exp.as_str()),
+                        &hex_ref(&snap_ref),
+                    )
+                    .ok();
                 node_ids.push((exp_a_turn, NodeId(0)));
             }
             Some(NodeId(0))
@@ -254,6 +292,14 @@ fn run_default(
                     "create_node",
                     &format!("{}/{}", exp.as_str(), row.node_id.0),
                     step,
+                )
+                .ok();
+            let parent_str = parent_node_id.map_or("-".to_string(), |p| p.0.to_string());
+            journal
+                .record_raw(
+                    "node_edge",
+                    &format!("{}/{}/{}", exp.as_str(), row.node_id.0, parent_str),
+                    &hex_ref(&snap_ref),
                 )
                 .ok();
             node_ids.push((exp_a_turn, node_id));
@@ -317,8 +363,106 @@ fn run_default(
                 .collect();
 
             if let Some((_, leaf_id)) = leaf_candidates.last() {
-                let _ = meta.prune_subtree(exp.clone(), *leaf_id, false);
-                // Not journaled — prune success is not part of recovery invariants tested here.
+                if meta.prune_subtree(exp.clone(), *leaf_id, false).is_ok() {
+                    // Journaled so recovery can mark this subtree's refs
+                    // INDETERMINATE when a kill lands inside a GC cycle
+                    // (destruction may have happened without the `gc_done`
+                    // ack ever reaching the journal — see gc_start below).
+                    journal
+                        .record("prune", &format!("{}/{}", exp.as_str(), leaf_id.0), step)
+                        .ok();
+                }
+            }
+        }
+
+        // ── pin / unpin every ~16 steps ──────────────────────────────────────
+        //
+        // Appended after the existing op arms rather than interleaved with
+        // them, so old seeds' pre-existing RNG-stream draws (ingest/delta
+        // sizing, node-parent selection, etc.) stay reproducible — this
+        // extension only adds NEW draws at the tail of each step, it never
+        // reorders or removes an existing arm (05 §1).  Adding these draws
+        // does perturb which value later draws in the SAME step observe from
+        // `rng` on steps where a pin/unpin/gc happens; that is an accepted,
+        // documented deviation, not silent seed corruption.
+        if step % 16 == 0 && !snap_refs.is_empty() {
+            // Occasionally unpin a previously-pinned ref instead of pinning.
+            if !pinned_refs.is_empty() && rng.gen::<u32>() % 3 == 0 {
+                let idx = rng.gen::<usize>() % pinned_refs.len();
+                let target = pinned_refs[idx].clone();
+                if meta.unpin(&target).unwrap_or(false) {
+                    journal.record("unpin", &hex_ref(&target), step).ok();
+                    pinned_refs.remove(idx);
+                }
+            } else {
+                let idx = rng.gen::<usize>() % snap_refs.len();
+                let target = snap_refs[idx].clone();
+                if meta.pin(target.clone(), None).is_ok() {
+                    journal.record("pin", &hex_ref(&target), step).ok();
+                    if !pinned_refs.iter().any(|r| r == &target) {
+                        pinned_refs.push(target);
+                    }
+                }
+            }
+        }
+
+        // ── gc every ~24 steps (or forced, for the gc-* failpoint matrix) ────
+        let due_for_gc = if force_gc {
+            // Force early and repeatedly so an armed `gc-*` failpoint is
+            // guaranteed to be reached within the op budget (05 §2).
+            step % 2 == 0
+        } else {
+            step > 0 && step % 24 == 0
+        };
+        if due_for_gc {
+            if force_gc {
+                // The pack-sweep failpoints (gc-compact-copy, gc-compact-seal,
+                // gc-index-repoint, gc-pack-unlink) only fire when a sealed
+                // pack below the fence falls under the compaction threshold.
+                // The normal workload's packs are ~100% live (every page is
+                // referenced by a node's manifest chain), so those boundaries
+                // would never be reached. Ingest garbage pages (never
+                // referenced by any manifest — dead at mark time) so the pack
+                // is mostly dead, and rotate-first below so it is sweepable
+                // THIS cycle.
+                let garbage: Vec<[u8; PAGE_SIZE]> = (0..24)
+                    .map(|i| make_page(seed_from(step ^ 0xdead_beef_dead_beef, i)))
+                    .collect();
+                let garbage_refs: Vec<&[u8; PAGE_SIZE]> = garbage.iter().collect();
+                let _ = store.pages().ingest(&garbage_refs);
+            }
+            let opts = snapstore_server::gc::GcOpts {
+                compact_threshold: 0.5,
+                // Forced mode sweeps pre-cycle data immediately (see above);
+                // the normal workload keeps the production default (false).
+                rotate_active_first: force_gc,
+                tombstone_grace_cycles: 1,
+            };
+            let hooks = snapstore_store::gc::GcHooks::none();
+            // Intent line BEFORE the cycle: a `gc_start` without a matching
+            // `gc_done` tells recovery the kill landed inside GC, so pruned
+            // subtrees may have been reaped without their `gc_done` ack ever
+            // being journaled (destruction is durable before the journal
+            // write). Recovery treats journaled-pruned refs as INDETERMINATE
+            // in that case: allowed to be gone, never required to be.
+            journal
+                .record("gc_start", &(gc_cycle + 1).to_string(), step)
+                .ok();
+            if let Ok(report) = snapstore_server::gc::run_gc_cycle(store, meta, &opts, &hooks) {
+                gc_cycle += 1;
+                let reaped: String = report
+                    .reaped_subtrees
+                    .iter()
+                    .map(|(exp_id, node_id)| format!("{exp_id}:{node_id}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                journal
+                    .record_raw(
+                        "gc_done",
+                        &gc_cycle.to_string(),
+                        &format!("reaped={reaped}"),
+                    )
+                    .ok();
             }
         }
     }

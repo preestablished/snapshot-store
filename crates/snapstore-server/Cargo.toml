@@ -8,6 +8,19 @@ license.workspace = true
 name = "snapstore-server"
 path = "src/main.rs"
 
+[features]
+# M7 GC property-suite instrumentation (04-property-suite.md).  A crate
+# cannot dev-depend on itself with features, so the store's test-hooks
+# feature is forwarded through the server's own.  NEVER enabled in
+# release builds.
+gc-test-hooks = ["snapstore-store/gc-test-hooks"]
+
+# Declared with required-features so plain `cargo test --workspace` stays
+# green (the hooks types are feature-gated out otherwise).
+[[test]]
+name = "gc_properties"
+required-features = ["gc-test-hooks"]
+
 [dependencies]
 # workspace deps
 prost        = { workspace = true }
@@ -46,6 +59,7 @@ parking_lot   = "0.12"
 nix = { version = "0.29", features = ["socket", "uio", "fs", "mman"] }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 snapstore-testgen = { path = "../snapstore-testgen" }
 snapstore-client  = { path = "../snapstore-client" }

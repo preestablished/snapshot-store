@@ -24,6 +24,17 @@ use crate::pack::{
 };
 use crate::read_cache::ReadHandleCache;
 
+// ── Test-only race instrumentation (M7 property suite) ───────────────────────
+
+/// Process-wide count of ENOENT retries taken by `read_sealed_with_retry`.
+///
+/// The M7 GC property suite (`snapstore-server/tests/gc_properties.rs`)
+/// uses this as *proof* that the R2 repoint→unlink race window was
+/// actually exercised by its racing reader — not merely survived.
+/// Test-only by construction: never compiled into release builds.
+#[cfg(any(test, feature = "gc-test-hooks"))]
+pub static GC_READ_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -173,19 +184,26 @@ impl PageStore {
             for (i, &pack_id) in unsealed_packs.iter().enumerate() {
                 let path = pack_path(dir, pack_id);
                 if i < last_idx {
-                    // Seal this old unseal pack and populate the index.
-                    let entries = seal_existing_pack(&path, pack_id)?;
-                    index.insert_batch(entries.into_iter().map(|(h, o)| {
-                        (
-                            h,
-                            PageLoc {
-                                pack: pack_id,
-                                offset: o,
-                            },
-                        )
-                    }));
+                    // Seal this old unsealed pack and populate the index.
+                    // Sidecar written from the scanned records, not an index
+                    // scan — same shadowing hazard as the sealed-pack rebuild
+                    // below (a duplicate hash already indexed from an earlier
+                    // pack would silently drop this pack's sidecar entry).
+                    let entries: Vec<(PageHash, PageLoc)> = seal_existing_pack(&path, pack_id)?
+                        .into_iter()
+                        .map(|(h, o)| {
+                            (
+                                h,
+                                PageLoc {
+                                    pack: pack_id,
+                                    offset: o,
+                                },
+                            )
+                        })
+                        .collect();
                     let sidecar = sidecar_path(dir, pack_id);
-                    index.write_sidecar(&sidecar, pack_id)?;
+                    crate::index::write_sidecar_entries(&sidecar, &entries)?;
+                    index.insert_batch(entries);
                     sealed_packs.push(pack_id);
                 } else {
                     // Highest-numbered unsealed: this will be the active pack.
@@ -200,10 +218,21 @@ impl PageStore {
             let sidecar = sidecar_path(dir, pack_id);
             let loaded = index.load_sidecar(&sidecar);
             if loaded.is_err() {
-                // Missing or corrupt sidecar: rebuild from the pack.
+                // Missing or corrupt sidecar: rebuild from the pack. The
+                // sidecar MUST be written from the scanned records, never
+                // from an index scan (`write_sidecar`): `insert_batch` keeps
+                // pre-existing locations (`or_insert`), so an orphan GC pack
+                // whose records duplicate an older pack (kill landed between
+                // GcPackWriter's seal fsync and its sidecar write) would
+                // contribute ZERO index entries here, and an index-scan
+                // sidecar would be written CRC-valid but EMPTY — the silent
+                // empty-sidecar failure mode of 01-storage-surfaces.md §2:
+                // on the next open it loads "fine" and the rebuild fallback
+                // never fires. Found by the M7 crash harness
+                // (gc-compact-seal / SidecarRecordCountMismatch).
                 let entries = rebuild_from_pack(&p, pack_id, true)?;
+                crate::index::write_sidecar_entries(&sidecar, &entries)?;
                 index.insert_batch(entries);
-                index.write_sidecar(&sidecar, pack_id)?;
             }
         }
 
@@ -562,12 +591,23 @@ impl PageStore {
     ) -> Result<Option<bytes::Bytes>, StoreError> {
         match self.read_from_cached_handle(hash, loc) {
             Ok(data) => Ok(Some(data)),
-            Err(StoreError::Pack(PackError::Io(ref e)))
+            // Both ENOENT shapes must retry: `get_or_open` failures arrive
+            // as StoreError::Io (and are the COMMON case for the R2 race —
+            // a fresh open of a pack GC just unlinked), while
+            // `read_at_from_file` failures arrive as StoreError::Pack.
+            // Matching only the Pack shape (as originally written) made
+            // the retry unreachable for the very race it exists for —
+            // found by the M7 property suite's R2 racing reader
+            // (gc_properties.rs, GC_PROP_SEED=42 GC_PROP_CASES=500:
+            // "R2 reader during GC: ... No such file or directory").
+            Err(StoreError::Pack(PackError::Io(ref e)) | StoreError::Io(ref e))
                 if e.kind() == std::io::ErrorKind::NotFound =>
             {
                 // M7 GC relies on this retry: GC repoints the index then unlinks the
                 // old pack.  Drop the stale cached handle, re-consult the index for a
                 // (possibly new) location, and retry once.
+                #[cfg(any(test, feature = "gc-test-hooks"))]
+                GC_READ_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_cache.invalidate(loc.pack);
 
                 // Re-consult the index.
@@ -721,7 +761,16 @@ impl PageStore {
     /// intervening writes.
     pub fn rotate_active(&self) -> Result<PackId, StoreError> {
         let mut active = self.active.lock();
-        if active.writer.record_count() == 0 {
+        // Skipping the rotation is only safe when the active pack is empty
+        // AND already the highest allocated id.  GC compaction packs
+        // (`create_gc_pack`) draw ids from the same allocator and can sit
+        // ABOVE an idle active pack; a GC fence taken at the stale active
+        // id would then never cover them, making a prior cycle's
+        // compaction output unreclaimable until unrelated ingest rotates
+        // past it.  Found by the M7 property suite (gc_properties.rs,
+        // minimal tape: CommitOrphan -> Pin -> aggressive Gc -> Unpin ->
+        // aggressive Gc leaves the unpinned pages live forever).
+        if active.writer.record_count() == 0 && active.pack_id.0 + 1 == active.next_pack_id.0 {
             return Ok(active.pack_id);
         }
         self.rotate_locked(&mut active)
@@ -821,6 +870,20 @@ impl PageStore {
         let idx_path = sidecar_path(&self.dir, pack);
         let spk_path = pack_path(&self.dir, pack);
 
+        // Drop the pack from the deferred-fdatasync set BEFORE unlinking.
+        // `rotate_locked` defers the sealed pack's fdatasync to the next
+        // `sync()`; if GC unlinks the pack first, that sync() would fail
+        // with ENOENT and every subsequent put_snapshot with it.  Found by
+        // the M7 property suite (gc_properties.rs, minimal tape:
+        // CommitOrphan -> aggressive Gc -> CommitFull).  Lock order
+        // (gate -> active) matches put_snapshot's sync() path, and sync()
+        // holds `active` across its whole fdatasync loop, so removal here
+        // can never race a sync that already snapshotted the dirty set.
+        {
+            let mut active = self.active.lock();
+            active.dirty_since_sync.remove(&pack);
+        }
+
         // Failpoint: immediately before the .idx unlink.
         fail_point!("gc-pack-unlink");
 
@@ -883,6 +946,8 @@ impl GcPackWriter {
     /// crash recovery to converge; see 01-storage-surfaces.md §2).
     pub fn seal_and_publish(mut self) -> Result<(PackId, Vec<(PageHash, u64)>), StoreError> {
         self.writer.seal()?;
+
+        fail_point!("gc-compact-seal");
 
         let sidecar = sidecar_path(&self.dir, self.pack_id);
         let loc_entries: Vec<(PageHash, PageLoc)> = self

@@ -32,6 +32,13 @@ pub enum GcPoint {
     AfterCopy(PackId),
     BeforeFinalize(PackId),
     AfterRepoint(PackId),
+    /// Fired after the old pack file is unlinked.  On the normal path this
+    /// is after repoint (post-gate, R2 upheld).  Under
+    /// `Sabotage::UnlinkBeforeRepoint` it fires *between* unlink and
+    /// repoint — inside the torn-read window the sabotage opens — so the
+    /// negative proof can deterministically observe the R2 violation with
+    /// an in-window read instead of relying on thread timing.
+    AfterUnlink(PackId),
     BeforeManifestSweep,
 }
 
@@ -343,6 +350,13 @@ impl SnapshotStore {
                     // Negative-proof mode: violate R2 on purpose.
                     self.pages().invalidate_pack_handle(p);
                     self.pages().delete_pack(p)?;
+                    // Fire inside the unlink→repoint window (still under
+                    // the gate): a read of a live page of `p` here MUST
+                    // fail — that failure is the torn read the negative
+                    // proof asserts.  Callbacks fired here must not
+                    // commit (they would deadlock on the sweep gate);
+                    // the suite only reads.
+                    hooks.fire(GcPoint::AfterUnlink(p));
                 }
                 let mid = copied_all.len() / 2;
                 for (i, (h, new_loc)) in copied_all.iter().enumerate() {
@@ -384,6 +398,7 @@ impl SnapshotStore {
         if !hooks.is(Sabotage::UnlinkBeforeRepoint) {
             self.pages().invalidate_pack_handle(p);
             self.pages().delete_pack(p)?;
+            hooks.fire(GcPoint::AfterUnlink(p));
         }
         Ok(())
     }

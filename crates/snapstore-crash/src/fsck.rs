@@ -60,6 +60,18 @@ pub enum Violation {
         footer_count: u64,
         sidecar_count: u64,
     },
+    /// A sealed pack has a (CRC-valid) sidecar present, but the sidecar's
+    /// entry count does not match the number of records physically scanned
+    /// from the pack body. Catches the empty-sidecar failure mode where
+    /// `load_sidecar` succeeds with 0 entries and the rebuild-from-scan
+    /// fallback never fires because the sidecar "loaded fine" (01 §2
+    /// `GcPackWriter` caution). A sealed pack with a MISSING sidecar is fine
+    /// — `open()` rebuilds it — so this only fires when a sidecar exists.
+    SidecarRecordCountMismatch {
+        pack_path: String,
+        sidecar_count: u64,
+        pack_record_count: u64,
+    },
     /// A node row references an `input_log_id` that has no row in `input_logs`.
     MissingInputLog {
         node_key: String,
@@ -91,6 +103,7 @@ impl Violation {
             Violation::BadSidecarCrc { .. } => "BadSidecarCrc",
             Violation::BadManifestFooter { .. } => "BadManifestFooter",
             Violation::BadPackFooter { .. } => "BadPackFooter",
+            Violation::SidecarRecordCountMismatch { .. } => "SidecarRecordCountMismatch",
             Violation::MissingInputLog { .. } => "MissingInputLog",
             Violation::BadManifestDecode { .. } => "BadManifestDecode",
             Violation::RecordHashMismatch { .. } => "RecordHashMismatch",
@@ -171,11 +184,27 @@ pub fn fsck(store_root: &Path, meta_db_path: &Path, deep: bool) -> FsckReport {
         if sealed {
             match load_sidecar_raw(&sidecar) {
                 Ok(entries) => {
-                    sidecar_counts.insert(*pack_id, entries.len() as u64);
+                    let sidecar_count = entries.len() as u64;
+                    sidecar_counts.insert(*pack_id, sidecar_count);
                     for (hash, loc) in entries {
                         page_index.entry(hash).or_insert(loc);
                     }
                     counts.sidecars_scanned += 1;
+
+                    // Sidecar-integrity check: a sealed pack WITH a sidecar
+                    // present must have sidecar entry count == pack record
+                    // count (scanned from the pack body, independent of the
+                    // SPKF footer's own claimed count).
+                    if let Ok(records) = scan_pack_headers(pack_path) {
+                        let pack_record_count = records.len() as u64;
+                        if pack_record_count != sidecar_count {
+                            v.push(Violation::SidecarRecordCountMismatch {
+                                pack_path: pack_path.to_string_lossy().into_owned(),
+                                sidecar_count,
+                                pack_record_count,
+                            });
+                        }
+                    }
                 }
                 Err(bad_crc) => {
                     if bad_crc && sidecar.exists() {

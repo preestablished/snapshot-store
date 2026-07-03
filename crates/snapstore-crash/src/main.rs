@@ -11,12 +11,14 @@
 mod child;
 mod fsck;
 mod fullstack;
+mod gc_fixture;
 mod harness;
 
 // Re-export for integration tests.
 pub use child::Scenario;
 pub use fsck::{FsckReport, Violation};
 pub use fullstack::find_server_binary;
+pub use gc_fixture::{populate_gc_fixture, GcFixtureOpts, GcFixtureSummary};
 pub use harness::{run_cycles, RunOptions, Summary};
 
 use snapstore_types::PAGE_SIZE;
@@ -49,6 +51,11 @@ enum Cmd {
         /// Workload scenario.
         #[arg(long, default_value = "default")]
         scenario: String,
+        /// Force `gc` ops early and repeatedly (armed by the parent for the
+        /// `--failpoint gc-*` matrix so the failpoint is reached within the
+        /// op budget). `Default` scenario only.
+        #[arg(long, default_value_t = false)]
+        force_gc: bool,
     },
     /// Parent: spawn + kill children, recover, check invariants.
     Run {
@@ -84,6 +91,24 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         deep: bool,
     },
+    /// Populate a store with a seeded fork-tree fixture, prune subtrees, pin
+    /// a sample of survivors, and write the expected surviving-ref set — the
+    /// joint restore-after-GC verification artifact (06 §3). Does NOT run
+    /// GC itself; the bridge side triggers it via a scratch server.
+    PopulateGcFixture {
+        /// Output directory: receives the populated store + fixture files.
+        #[arg(long)]
+        dir: PathBuf,
+        /// PRNG seed for deterministic generation.
+        #[arg(long)]
+        seed: u64,
+        /// Minimum number of nodes (snapshots) to generate.
+        #[arg(long, default_value_t = 1000)]
+        nodes: u64,
+        /// Minimum number of non-root subtrees to prune.
+        #[arg(long, default_value_t = 100)]
+        pruned_subtrees: u64,
+    },
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -98,12 +123,13 @@ fn main() {
             seed,
             ops,
             scenario,
+            force_gc,
         } => {
             let sc: child::Scenario = scenario.parse().unwrap_or_else(|e| {
                 eprintln!("bad scenario: {e}");
                 std::process::exit(1);
             });
-            child::run_child(&dir, seed, ops, sc);
+            child::run_child(&dir, seed, ops, sc, force_gc);
         }
 
         // ── run ──────────────────────────────────────────────────────────────
@@ -139,7 +165,7 @@ fn main() {
             println!(
                 "DONE  cycles={} inv_failures={} fsck_violations={} \
                  matrix_cycles={} matrix_failures={} \
-                 elapsed={:.2}s cycles/s={:.1}",
+                 elapsed={:.2}s cycles/s={:.1} total_leaked_pages={}",
                 summary.total_cycles,
                 summary.invariant_failures,
                 summary.fsck_violations,
@@ -147,6 +173,7 @@ fn main() {
                 summary.matrix_failures,
                 summary.elapsed_secs,
                 summary.cycles_per_sec,
+                summary.total_leaked_pages,
             );
 
             let failed =
@@ -168,6 +195,38 @@ fn main() {
             println!("{json}");
             if !report.ok() {
                 std::process::exit(1);
+            }
+        }
+
+        // ── populate-gc-fixture ──────────────────────────────────────────────
+        Cmd::PopulateGcFixture {
+            dir,
+            seed,
+            nodes,
+            pruned_subtrees,
+        } => {
+            let opts = gc_fixture::GcFixtureOpts {
+                dir,
+                seed,
+                nodes,
+                pruned_subtrees,
+            };
+            match gc_fixture::populate_gc_fixture(&opts) {
+                Ok(summary) => {
+                    println!(
+                        "populate-gc-fixture: nodes={} pruned_subtrees={} pinned={} \
+                         surviving_refs={} dir={}",
+                        summary.nodes_created,
+                        summary.subtrees_pruned,
+                        summary.refs_pinned,
+                        summary.surviving_refs,
+                        opts.dir.display(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("populate-gc-fixture failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }

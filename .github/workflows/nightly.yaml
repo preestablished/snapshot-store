@@ -34,6 +34,37 @@ jobs:
       - run: cargo run -p snapstore-crash --features failpoints -- run --scenario sqlite-batch --cycles 200 --seed ${{ github.run_id }} --matrix-passes 0
         working-directory: repo
 
+  # M7 GC property suite, deep profile (gate AC 1, 04-property-suite.md
+  # §6): 10k cases total with explicit logged seeds (github.run_id + shard)
+  # so the evidence run is reproducible.  Sharded 4 × 2500 per 04 §7 —
+  # measured ~6.5 min / 500 cases on the reference box, so 10k in one slot
+  # would blow the timeout; sharding keeps the count instead of lowering
+  # it.  --nocapture keeps the GC_PROP_SEED=/GC_READ_RETRIES lines in the
+  # job log for scraping; the R2 retry-counter assertion (> 0) is armed at
+  # this case count.
+  gc-properties-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+          ref: ca9ee9048d7fca8eec5fe512011b011128e2b0c3
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p snapstore-server --test gc_properties --features snapstore-server/gc-test-hooks -- --nocapture
+        working-directory: repo
+        env:
+          GC_PROP_CASES: "2500"
+          GC_PROP_SEED: ${{ github.run_id }}${{ matrix.shard }}
+
   # 10-minute libFuzzer run on Manifest::decode (01 WI1 AC; the phase-1 M2
   # fuzz AC was never delivered — this is its home now).
   manifest-fuzz:

@@ -9,6 +9,10 @@ license.workspace = true
 # testing.  Off by default; NEVER enabled in release builds.
 # Usage: cargo test -p snapstore-pagestore --features failpoints
 failpoints = ["dep:fail", "fail/failpoints"]
+# Test-only GC instrumentation (M7 property suite): exposes the
+# read-retry counter proving the R2 repoint/unlink race was exercised.
+# NEVER enabled in release builds.
+gc-test-hooks = []
 
 [dependencies]
 snapstore-types = { path = "../snapstore-types" }

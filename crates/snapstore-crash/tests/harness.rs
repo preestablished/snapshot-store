@@ -515,3 +515,182 @@ fn full_stack_five_cycles() {
         "full-stack invariant failures in 5 cycles: {summary:?}"
     );
 }
+
+// ── Part 4: M7 GC crash-harness extension (WI5) ──────────────────────────────
+
+/// 5 randomized kill cycles with the extended `Default` workload (pin/unpin
+/// every ~16 steps, an in-process GC cycle every ~24 steps). `ops_per_cycle`
+/// is large enough that every cycle reaches at least one `gc` op. Asserts
+/// zero invariant / fsck violations (05 §4's PR-smoke bar, at a small scale).
+#[test]
+fn randomized_kill_cycles_5_with_gc_workload() {
+    let opts = RunOptions {
+        cycles: 5,
+        seed: 424242,
+        matrix_passes: 0,
+        ops_per_cycle: 80,
+        scenario: Scenario::Default,
+        failpoint: None,
+    };
+    let summary = run_cycles(&opts);
+    assert_eq!(
+        summary.invariant_failures, 0,
+        "invariant failures in 5 GC-workload cycles: {summary:?}"
+    );
+    assert_eq!(
+        summary.fsck_violations, 0,
+        "fsck violations in 5 GC-workload cycles: {summary:?}"
+    );
+}
+
+/// Arm a single GC failpoint (`gc-index-repoint`, mid-repoint-loop — one of
+/// the six new boundaries from 02 §7 / 05 §2) for one cycle and assert
+/// recovery is green. `--force-gc` (armed automatically by `run_cycles` for
+/// any `gc-*` failpoint) guarantees the child reaches a GC cycle within its
+/// op budget.
+#[cfg(feature = "failpoints")]
+#[test]
+fn gc_failpoint_index_repoint_single_cycle_recovers_green() {
+    let opts = RunOptions {
+        cycles: 1,
+        seed: 13579,
+        matrix_passes: 0,
+        ops_per_cycle: 40,
+        scenario: Scenario::Default,
+        failpoint: Some("gc-index-repoint".to_string()),
+    };
+    let summary = run_cycles(&opts);
+    assert_eq!(
+        summary.invariant_failures, 0,
+        "invariant failures with gc-index-repoint armed: {summary:?}"
+    );
+    assert_eq!(
+        summary.fsck_violations, 0,
+        "fsck violations with gc-index-repoint armed: {summary:?}"
+    );
+}
+
+/// All six new GC failpoints are present in the matrix.
+#[test]
+fn gc_failpoints_present_in_matrix() {
+    for fp in [
+        "gc-compact-copy",
+        "gc-compact-seal",
+        "gc-index-repoint",
+        "gc-pack-unlink",
+        "gc-manifest-unlink",
+        "gc-reap-txn",
+    ] {
+        assert!(
+            snapstore_crash::harness::FAILPOINTS.contains(&fp),
+            "expected {fp} in FAILPOINTS matrix"
+        );
+    }
+}
+
+/// A sealed pack whose (CRC-valid) sidecar has fewer entries than the pack
+/// physically contains must trip `SidecarRecordCountMismatch`.
+#[test]
+fn fsck_detects_sidecar_record_count_mismatch() {
+    use snapstore_pagestore::index::ShardedIndex;
+    use snapstore_pagestore::pack::PackWriter;
+    use snapstore_types::{PackId, PageHash, PageLoc, PAGE_SIZE};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    build_small_store(dir.path());
+
+    let pdir = pages_dir(dir.path());
+    let pack_id = PackId(77);
+    let pack_file = pdir.join("pack-0000004d.spk");
+
+    // Seal a pack with TWO records.
+    let page1 = [0xCCu8; PAGE_SIZE];
+    let page2 = [0xDDu8; PAGE_SIZE];
+    let hash1 = PageHash::from_bytes(*blake3::hash(&page1).as_bytes());
+    let hash2 = PageHash::from_bytes(*blake3::hash(&page2).as_bytes());
+    {
+        let mut w = PackWriter::create(&pack_file, pack_id, 0).unwrap();
+        w.append(&hash1, &page1).unwrap();
+        w.append(&hash2, &page2).unwrap();
+        w.seal().unwrap();
+    }
+
+    // Write a sidecar with only ONE entry (wrong count vs. the 2 physical
+    // records) — a CRC-valid sidecar with a stale/short entry list.
+    let sidecar_path = pdir.join("pack-0000004d.idx");
+    {
+        let idx = ShardedIndex::new();
+        idx.insert(
+            hash1,
+            PageLoc {
+                pack: pack_id,
+                offset: 20,
+            },
+        );
+        idx.write_sidecar(&sidecar_path, pack_id).unwrap();
+    }
+
+    let report = snapstore_crash::fsck::fsck(&store_root(dir.path()), &meta_db(dir.path()), false);
+    let classes: Vec<&str> = report.violations.iter().map(|v| v.class()).collect();
+    assert!(
+        classes.contains(&"SidecarRecordCountMismatch"),
+        "expected SidecarRecordCountMismatch, got: {classes:?}"
+    );
+}
+
+/// `populate-gc-fixture` smoke test at a small scale: the expected-refs file
+/// exists, parses as one lowercase 64-hex ref per line, and every listed ref
+/// resolves in the populated store.
+#[test]
+fn populate_gc_fixture_smoke() {
+    use snapstore_crash::gc_fixture::{populate_gc_fixture, GcFixtureOpts};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let opts = GcFixtureOpts {
+        dir: dir.path().to_path_buf(),
+        seed: 2468,
+        nodes: 30,
+        pruned_subtrees: 3,
+    };
+    let summary = populate_gc_fixture(&opts).expect("populate_gc_fixture failed");
+    assert!(summary.nodes_created >= 30);
+    assert!(summary.subtrees_pruned >= 1);
+    assert!(summary.surviving_refs > 0);
+
+    let refs_path = dir.path().join("expected-surviving-refs.txt");
+    assert!(refs_path.exists(), "expected-surviving-refs.txt missing");
+    let contents = std::fs::read_to_string(&refs_path).unwrap();
+    let refs: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!refs.is_empty());
+
+    let manifest_path = dir.path().join("fixture-manifest.json");
+    assert!(manifest_path.exists(), "fixture-manifest.json missing");
+
+    let store = snapstore_store::SnapshotStore::open(&store_root(dir.path())).unwrap();
+    for hex in &refs {
+        assert_eq!(hex.len(), 64, "ref must be 64 hex chars: {hex}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "ref must be lowercase hex: {hex}"
+        );
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let s = std::str::from_utf8(chunk).unwrap();
+            bytes[i] = u8::from_str_radix(s, 16).unwrap();
+        }
+        let snap_ref = snapstore_types::SnapshotRef::from_bytes(bytes);
+        store
+            .get_snapshot(&snap_ref)
+            .unwrap_or_else(|e| panic!("expected surviving ref {hex} failed to resolve: {e}"));
+    }
+
+    // Sorted + deduped.
+    let mut sorted = refs.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        refs, sorted,
+        "expected-surviving-refs.txt must be sorted+deduped"
+    );
+}

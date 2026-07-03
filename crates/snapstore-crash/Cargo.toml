@@ -28,6 +28,10 @@ snapstore-manifest = { path = "../snapstore-manifest" }
 snapstore-types    = { path = "../snapstore-types" }
 # Full-stack scenario: blocking client drives the server-under-test via gRPC.
 snapstore-client   = { path = "../snapstore-client" }
+# In-process GC orchestrator (M7): the child workload and the
+# populate-gc-fixture subcommand both call run_gc_cycle directly. No cycle:
+# snapstore-server does not depend on snapstore-crash.
+snapstore-server   = { path = "../snapstore-server" }
 
 # SQLite direct access for fsck (read-only, bypasses snapstore-meta API).
 rusqlite = { version = "0.32", features = ["bundled"] }
