@@ -51,7 +51,13 @@ and `snapstore-client` build.rs regenerate; the re-export seam is
   contend on the same latch.
 
 Stats handler: replace the two hardcoded zeros with `meta.gc_state()`
-values + new fields 13/14. Update the existing UNIMPLEMENTED test at
+values + new fields 13/14. Also settle the debt the code assigns to M7
+(service.rs:957-959 "exact byte accounting is M7's responsibility";
+proto:416): report `physical_page_bytes = unique_pages × 4133` (record =
+37-byte header + 4096 payload; pack header/footer overhead excluded and
+said so in the field comment). Exact-to-the-byte pack accounting is not
+worth a maintained counter; disclose the 4133 definition in
+04-resolution.md. Update the existing UNIMPLEMENTED test at
 `tests/server.rs:788-795` to the new contract (first real assertion, as
 the request notes).
 
@@ -92,8 +98,9 @@ First background task in the server: in `build_server.rs`, when
 `gc.auto`, spawn a tokio task: every `check_interval_secs`, `statvfs`
 (via `nix`, already a dependency) on `data_root`; if used% >=
 `trigger_disk_pct`, run a cycle through the same latch (skip silently if
-already running). Log start/finish at info. Shutdown: select on the
-existing `shutdown_tx` oneshot so `ServerHandle::shutdown` stays clean.
+already running). Log start/finish at info. Shutdown: `subscribe()` to the internal
+shutdown **broadcast** channel (build_server.rs:103 — the handle's
+oneshot at :40 feeds it; do not consume the oneshot itself).
 No 95% hard-refusal work here — that is M9 (`snapstore-agz`).
 
 ## 6. CLI + client
@@ -108,10 +115,29 @@ No 95% hard-refusal work here — that is M9 (`snapstore-agz`).
   success, 2 when `already_running` (script-friendly distinct code).
   Update the CLI test that expects nonzero exit (cli tests:258-262).
 
-## 7. Server-side race-B calls (from 02 §1.2)
+## 7. Server-side race-B calls (from 02 §1.2 — REVISED per review)
 
-- `create_node` handler: call `store.note_live_ref(&snapshot_ref)`
-  **before** the `has_manifest` validation (service.rs:502).
-- `pin` handler: same, before `meta.pin`.
-Document both call sites with a comment pointing at
+Both handlers must hold `gc_commit_gate.read()` across
+register → validate → meta write (inside their existing `spawn_blocking`
+closures; the gate is sync). Use the store's combined API so the
+gate-held requirement is unforgeable:
+
+- `create_node` handler (service.rs:502): under the gate,
+  `store.register_live_ref(&snapshot_ref)` (validating — replaces the
+  bare `has_manifest` check for GC-correctness; keep the NOT_FOUND
+  mapping), then `meta.create_node` **still under the gate read lock**.
+- `pin` handler (service.rs:870-900): note it currently has NO manifest
+  validation at all — pinning an unknown/swept ref succeeds today and
+  would create a dangling pin. Under the gate:
+  `store.register_live_ref(&r)` → FAILED_PRECONDITION on failure → then
+  `meta.pin`. This is a small behavior change (previously-accepted
+  garbage pins now rejected); disclose it in 04-resolution.md.
+
+Holding a sync RwLock read guard across a MetaDb actor round-trip is
+bounded (actor batches, ms-scale) and only ever blocks the GC fence/
+finalize instants, not other commits (read locks are shared). Document
+both call sites with a comment pointing at
 `.agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md §1`.
+
+Also rewrite the duplicated "no TOCTOU" comment at service.rs:1015-1018
+(see 01 §3).

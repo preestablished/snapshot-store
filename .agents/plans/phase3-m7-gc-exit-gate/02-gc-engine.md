@@ -22,32 +22,68 @@ can reference unmarked pages sitting in pre-fence packs. Two concrete races:
   concurrent `CreateNode` (or `Pin`) validates `has_manifest` → sweep
   unlinks the manifest → the node/pin row lands dangling.
 
-Protocol (D5), three parts:
+Protocol (D5), three parts. **Revised after adversarial review** (see
+`07-review-log.md`): registration alone is NOT protection — sweep progress
+is irreversible per pack, so a late root arriving after its pages' pack was
+finalized must be *rejected*, not just recorded. The mechanism is a gated,
+**validating** registration.
 
-1. **Widen the gate read lock** in `put_snapshot` to cover steps 3–6:
-   acquire `gc_commit_gate.read()` **before** the `contains_batch` presence
-   check (currently step 5, after it — lib.rs:389). The group-commit
-   barrier (step 4) stays inside the read lock. Cost: the fence write
-   acquisition now waits for in-flight commits including their fdatasync —
-   acceptable, it happens once per cycle plus once per finalized pack.
-2. **Late-roots registration.** `SnapshotStore` gains an epoch-scoped set:
+1. **Widen the gate read lock** in `put_snapshot` to cover steps **2–6**:
+   acquire `gc_commit_gate.read()` **before** the delta parent check
+   (step 2, lib.rs:355-365) and the `contains_batch` presence check
+   (step 3) — not after them as today (lib.rs:389). The group-commit
+   barrier (step 4) stays inside the read lock (no deadlock: the flusher
+   never touches the gate; verified lock order gate → active → shard is
+   consistent everywhere). Cost: the fence write acquisition now waits for
+   in-flight commits including their fdatasync — acceptable, once per
+   cycle plus once per finalized pack/manifest batch.
+2. **Gated, validating live-ref registration** on `SnapshotStore`:
 
    ```rust
-   /// Some(..) while a GC cycle is running. note_live_ref() appends; the
-   /// sweep drains under the gate write lock.
+   /// Some(..) while a GC cycle is running.
    gc_epoch: Mutex<Option<GcEpochState>>,   // GcEpochState { late_roots: Vec<SnapshotRef>, fence_pack: PackId }
 
-   pub fn note_live_ref(&self, r: &SnapshotRef);  // no-op when no epoch
+   /// MUST be called while holding gc_commit_gate.read() (take a guard
+   /// param or expose a combined `with_commit_gate(|reg| ...)` API so the
+   /// requirement is unforgeable). Steps:
+   ///   1. If an epoch is active, append `r` to late_roots.
+   ///   2. Validate r's full dependency closure: walk the manifest chain
+   ///      (every .spm present + decodes) and contains_batch every chain
+   ///      manifest's page hashes; any miss → Err (chain broken / pages
+   ///      collected).
+   /// Registration precedes validation, so there is no TOCTOU: finalize
+   /// removes index entries / unlinks manifests only under gate.write()
+   /// after draining late_roots — a ref registered before the drain gets
+   /// marked; one registered after observes the post-finalize state and
+   /// its validation fails cleanly.
+   pub fn register_live_ref(&self, r: &SnapshotRef) -> Result<(), StoreError>;
    ```
 
-   Callers: `put_snapshot` itself (after the manifest is durable, still
-   under the read lock); the **server** before `create_node`'s
-   `has_manifest` validation (service.rs:502) and before `pin`
-   (service.rs — Pin handler). Registering before validation means: if the
-   manifest is still there, it is now protected; if already swept, the
-   validation fails NOT_FOUND — correct either way.
-3. **Finalize-under-write with straggler drain** (per pack, and once for
-   the manifest sweep) — §5 below.
+   Callers, all under `gc_commit_gate.read()`:
+   - `put_snapshot` itself: after the manifest is durable, register the
+     new ref (cheap: its own chain was just validated by steps 2–3; for a
+     delta, the parent-chain closure must be validated too — the parent
+     may be a pre-fence orphan whose pages a finalized pack already
+     dropped). **Including the idempotent early-return path**
+     (lib.rs:404-406) — a blind-retry re-put of a doomed manifest must
+     register or fail, never silently Ok.
+   - the **server** `create_node` handler: hold the gate read lock across
+     register → `has_manifest` → `meta.create_node` (service.rs:502).
+     Failure → NOT_FOUND.
+   - the **server** `pin` handler: same shape (service.rs:870-900 — note
+     it currently has NO manifest validation at all; this adds it).
+     Failure → FAILED_PRECONDITION. This also fixes dangling-pin creation
+     (fsck `DanglingPin`), which the crash-harness invariant (05 §3)
+     depends on.
+
+   Holding the gate across the meta write closes the epoch-install race:
+   a CreateNode in flight across `begin_gc_epoch` either commits its row
+   before the fence write acquisition (visible to the root snapshot) or
+   starts after epoch install (registration live).
+3. **Finalize-under-write with straggler drain** (per pack, and per
+   manifest-unlink batch) — §5/§6 below. Straggler mark-walks must ingest
+   the full closure of drained refs (chain manifests into `visited`,
+   chain pages into `mark`).
 
 ## 2. Epoch / fence API on SnapshotStore
 
@@ -73,10 +109,21 @@ R3 satisfied: no manifest can publish between the root snapshot and the
 fence record because both happen inside one write-lock hold and commits
 hold the read lock across presence-check→publish.
 
-R4: the `gc_epoch` Mutex<Option<..>> doubles as the "one GC at a time"
-latch; `TriggerGc` returns `already_running` when occupied. No
-`mark-<epoch>.state` resume file — a crashed GC is simply discarded
-(ARCHITECTURE R4 allows this; extra copies reclaimed next cycle).
+R4: the epoch latch alone is NOT enough — reap (step 1) and rotate
+(step 2) run before `begin_gc_epoch`, so two racing triggers (RPC +
+watermark) would double-reap/double-rotate. `run_gc_cycle` takes a
+cycle-scope `try_lock` mutex at entry (owned by the orchestrator; the
+loser returns `AlreadyRunning` immediately); `begin_gc_epoch` stays as the
+store-level backstop. No `mark-<epoch>.state` resume file — a crashed GC
+is simply discarded (ARCHITECTURE R4 allows this; extra copies reclaimed
+next cycle).
+
+Gate type: switch `gc_commit_gate` to `parking_lot::RwLock<()>` (already a
+workspace dependency via pagestore). A GC panic while holding the write
+lock must not poison the gate — with `std::sync::RwLock`, poisoning would
+permanently error every subsequent `put_snapshot` (lib.rs:389-392 maps
+poison to error) until restart. The failpoint runs panic on purpose;
+parking_lot has no poisoning. Adjust put_snapshot's error mapping.
 
 ## 3. Cycle structure (orchestrator, snapstore-server/src/gc.rs)
 
@@ -135,10 +182,15 @@ For each sealed pack `p < fence_pack` (snapshot the list once,
    already points elsewhere (earlier compaction, duplicate) are dead by
    definition. `live = records ∩ mark` (plus everything if `p >= fence`,
    excluded already).
-2. `liveness = live_bytes / total_record_bytes` (record = 4133 bytes,
-   pack.rs:9-19; total from scan or sidecar count). If
+2. If the pack has zero index records → skip straight to finalize/unlink
+   (explicit branch; do NOT rely on `NaN >= threshold` being false).
+   Else `liveness = live_bytes / total_record_bytes` (record = 4133
+   bytes, pack.rs:9-19; total from scan or sidecar count). If
    `liveness >= compact_threshold` → leave the pack alone (dead bytes wait
-   for a later cycle), continue.
+   for a later cycle), continue. Note for tests: threshold 1.01 compacts
+   even 100%-live packs (1.0 < 1.01) — intended, but it means the
+   quiescent property rewrites all pre-fence data each cycle; say so in
+   the suite comments (04 §3).
 3. **Copy:** `w = pages().create_gc_pack()`; for each live record
    `read_record(p, off, hash)` → `w.append(hash, payload)`.
    Failpoint `gc-compact-copy` inside the loop.
@@ -153,10 +205,12 @@ For each sealed pack `p < fence_pack` (snapshot the list once,
        let stragglers = drain_late_roots();
        if stragglers.is_empty() { break /* holding _w */ }
        drop(_w);
-       mark-walk stragglers (may add hashes to `mark`);
+       mark-walk stragglers' FULL closures (chain manifests → visited,
+           chain pages → mark);
        for any newly-live record of p not yet copied: copy+publish it
-           (append to a fresh gc pack or reopen — simplest: a small
-           follow-up gc pack per straggler round);
+           (a small follow-up gc pack per straggler round — but skip pack
+           creation entirely when the straggler round adds no records of
+           p, to avoid empty packs);
    }
    // still holding the write lock:
    for each live record: index.repoint_if_in_pack(hash, p, new_loc);
@@ -185,22 +239,33 @@ Accounting: pages_reclaimed += dead records; bytes_reclaimed += dead ×
 
 ## 6. Manifest sweep
 
-Delete every stored manifest not in `visited` (mark's memoized set),
-using the same finalize discipline: take gate write, drain/walk
-stragglers (their chains join `visited`), then compute
-`doomed = list_manifest_refs() - visited`, **release the write lock**, and
-`delete_manifest` each doomed ref (unlink order is crash-safe: a manifest
-deleted twice is idempotent, one deleted-then-referenced is impossible
-because anything referenced got into `visited`/late-roots before its
-referencing row committed — Race B protocol). `list_manifest_refs`
-(lib.rs:573) walks the shard dirs; fine off the hot path.
+Delete every stored manifest not in `visited` (mark's memoized set).
+**Unlinks happen under the gate write lock, in batches** — the earlier
+draft released the lock before unlinking, which reopened Race B via the
+idempotent re-put + CreateNode window (review finding; see
+`07-review-log.md`).
 
-Subtle: `visited` must also include every ref in the late-roots drains
-*and* every manifest committed after the fence. Post-fence manifests all
-passed through `note_live_ref` in put_snapshot (§1.2), so they are in the
-drains by construction. Assert this in a debug check: after the final
-drain, re-list manifests and verify none is younger than the fence yet
-doomed (belt-and-braces; cheap).
+1. Compute `candidates = list_manifest_refs() - visited` **outside** any
+   lock (lib.rs:573 walks the shard dirs — holding the write lock across
+   that walk would stall all commits for O(manifests) I/O).
+2. Loop over `candidates` in batches (e.g. 256):
+   - take `gc_commit_gate.write()`;
+   - drain late_roots; mark-walk their closures (chains → `visited`,
+     pages → `mark`); if the drain was non-empty, subtract the newly
+     visited refs from all remaining candidates;
+   - `delete_manifest` each ref in the batch still not in `visited`
+     (idempotent — Ok(false) if already gone);
+   - release, next batch.
+
+   Registrations are serialized with the gate (§1.2), so a
+   `register_live_ref` lands either before a batch's drain (ref joins
+   `visited`, survives) or after that batch's unlinks (its validation
+   observes the missing manifest and fails the caller cleanly).
+3. `visited` includes every post-fence manifest by construction: every
+   `put_snapshot` — including the exists-early-return path — registers
+   under the read lock (§1.2). Keep the belt-and-braces debug assert:
+   before each batch's unlinks, no candidate is younger than the fence
+   (track refs registered this epoch in GcEpochState for the check).
 
 ## 7. Failpoints (all behind the existing `failpoints` feature)
 
@@ -209,9 +274,9 @@ doomed (belt-and-braces; cheap).
 | `gc-compact-copy` | inside the copy loop, per record |
 | `gc-compact-seal` | between gc-pack fsync and sidecar write |
 | `gc-index-repoint` | mid-repoint loop (some entries moved, some not) |
-| `gc-pack-unlink` | between .spk unlink and .idx unlink |
+| `gc-pack-unlink` | before the .idx unlink (which precedes the .spk unlink — order rationale in 01 §2) |
 | `gc-manifest-unlink` | before a manifest unlink |
-| `gc-reap-txn` | inside reap_tombstone, before COMMIT |
+| `gc-reap-txn` | inside reap_tombstone, before COMMIT (needs the new snapstore-meta failpoints feature — 01 §4) |
 
 Use the local `fail_point!` macro pattern (store lib.rs:36-41). Add all six
 to the crash-harness matrix list (05).
@@ -243,7 +308,7 @@ Default (no feature): `GcHooks` is a zero-sized no-op struct so
   sweepable.
 - Straggler loop: hook injects a commit at `BeforeFinalize` referencing a
   doomed page → page survives, manifest survives.
-- Race B replay: hook injects note_live_ref+create_node-shaped access at
+- Race B replay: hook injects register_live_ref+create_node-shaped access at
   `BeforeManifestSweep` → manifest survives.
 - Crashed-GC recovery: kill after publish (step 4) → reopen → both copies
   readable, next cycle reclaims (also covered by 05 at process level).

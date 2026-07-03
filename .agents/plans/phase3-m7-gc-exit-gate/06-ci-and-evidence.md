@@ -13,9 +13,13 @@ checkout block verbatim):
           GC_PROP_CASES: "500"
 ```
 
-Also add `snapstore-server` (and any crate gaining the `gc-test-hooks` /
-new failpoints code) to the existing failpoints clippy line
-(ci.yaml:35) so the feature stays `-D warnings` clean.
+Feature-lint wiring (two separate concerns — do not conflate):
+- failpoints: add `snapstore-meta` to the existing failpoints clippy/test
+  lines (ci.yaml:35/37) — it gains the feature for `gc-reap-txn` (01 §4).
+  snapstore-server does NOT get a failpoints feature.
+- gc-test-hooks: a NEW step `cargo clippy -p snapstore-server --tests
+  --features snapstore-server/gc-test-hooks -- -D warnings` (the
+  failpoints line cannot lint this code — different feature).
 
 `nightly.yaml`, new job:
 
@@ -61,18 +65,33 @@ re-runs and recomputes hashes).
 
 ## 3. Joint verification artifact (acceptance item 5 — bridge drives it)
 
-Using the suite's own generator as a library (expose a
-`gc_model::populate(store, meta, seed, params)` helper from the test
-support module, or a tiny `snapstore-crash` subcommand if reuse across
-processes is easier): populate a **scratch** snapstore data root with a
-fork tree of ≥1,000 nodes across a few experiments including ≥100 pruned
-subtrees; run `TriggerGc{compact_aggressively:true}` against a scratch
-server on that root; confirm collection ran via the response counts and
-Stats. Hand back:
+Mechanism (decided — review flagged "a test module can't be invoked"):
+a `snapstore-crash` subcommand:
+
+```
+cargo run -p snapstore-crash -- populate-gc-fixture \
+  --dir <scratch-data-root> --seed <u64> --nodes 1000 --pruned-subtrees 100
+```
+
+It reuses the generator via a small shared module (put the op-tape
+generator + model in `snapstore-crash/src/gc_fixture.rs`, re-exported for
+the property suite to import — snapstore-server already dev-depends on
+nothing from crash, so the dependency goes crash → server-lib for
+`run_gc_cycle` (no cycle: server does not depend on crash; verified).
+The subcommand writes, into `--dir`:
+
+- the populated store (≥1,000 nodes across ≥3 experiments, ≥100 pruned
+  subtrees, pins on a sample of survivors),
+- `expected-surviving-refs.txt` — one lowercase 64-hex ref per line,
+  sorted, exactly the model's reachable manifest set,
+- `fixture-manifest.json` — seed, params, git rev, counts.
+
+Then: run `TriggerGc{compact_aggressively:true}` against a scratch server
+on that root; confirm collection ran via the response counts and Stats.
+Hand back:
 
 - the scratch data-root path (leave the directory in place),
-- `expected-surviving-refs.txt` (one hex ref per line — every ref the
-  model says is reachable),
+- `expected-surviving-refs.txt`,
 - the exact server binary + config used.
 
 The bridge drives a scratch `dh-workerd` against it and restores every
@@ -106,6 +125,11 @@ pass before the bead close is honored.
   mention it in the handback.
 
 ## 6. Suggested implementation order (for the coding agent)
+
+Note: the 00-overview diagram shows WI4 depending only on WI2, but WI4's
+RPC smoke test needs WI3's TriggerGc handler, and WI5's child needs
+`run_gc_cycle` importable (placed by WI2/WI3). Follow THIS linear order;
+do not parallelize WI4 ahead of WI3.
 
 1. WI1 (01) — surfaces + unit tests; `cargo test --workspace` green.
 2. WI2 (02) — engine + in-crate tests; failpoints compile under the

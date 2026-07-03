@@ -17,7 +17,12 @@ Extend the `Default` scenario op mix (child.rs:115-325):
   both can use — if the dependency feels heavy, re-export it from
   snapstore-store behind the orchestration closure from 02 §2). Journal
   `gc_done\t<cycle>` after Ok. Use default GcOpts (threshold 0.5, grace 1)
-  — production shape, not the exactness shape.
+  — production shape, not the exactness shape. The `gc_done` journal line
+  must carry the facts recovery needs, NOT leave them to be re-derived:
+  `gc_done\t<cycle>\treaped=<exp:node,...>` (the reaped subtree roots) —
+  re-deriving grace arithmetic (tombstone created_at vs previous fence
+  counter) during journal replay would be fragile and was flagged in
+  review.
 - Keep op counts/seeds derived from the existing `StdRng::seed_from_u64`
   stream so old seeds stay reproducible (append new ops to the dispatch
   table; do not reorder existing arms).
@@ -43,12 +48,16 @@ sqlite-batch forces its path).
 After kill → reopen → fsck --deep → journal replay, add checks:
 
 1. Every journaled (acknowledged) snapshot still resolves with correct
-   bytes **unless** its node was journaled as pruned and a journaled
-   `gc_done` covering it exists (reachability per the journal's own
-   root-set replay: nodes + pins − reaped prunes).
+   bytes **unless** a journaled `gc_done` line lists its subtree as
+   reaped (reachability per the journal's own root-set replay:
+   nodes + pins − the reaped sets carried in `gc_done` lines — no grace
+   arithmetic re-derivation).
 2. Every journaled pin's ref resolves (R5) — fsck's `DanglingPin` and
-   `MissingPage` violations (fsck.rs:38-81) already catch the on-disk
-   side; the journal check catches "acknowledged then lost".
+   `MissingPage` violations (fsck.rs:4-13) already catch the on-disk
+   side; the journal check catches "acknowledged then lost". (This
+   invariant is only sound because the Pin handler now validates under
+   the gate — 03 §7; without that fix, dangling pins were creatable and
+   this check would flake.)
 3. **Space-leak tolerance:** do NOT assert exact physical == reachable
    after recovery. Instead: run one full in-process GC cycle
    post-recovery, then assert no fsck violations and all
@@ -59,6 +68,11 @@ After kill → reopen → fsck --deep → journal replay, add checks:
    gc-pack creation and seal, reopen must succeed and either adopt or
    seal the orphan pack; assert reopen + fsck green (this is the runt/
    unsealed-pack window the phase-2 harness memory warns about).
+5. Sidecar-integrity assertion (from 01 §2's GcPackWriter caution): for
+   every sealed pack with a sidecar present, sidecar entry count ==
+   pack record count — catches the empty-sidecar failure mode where
+   `load_sidecar` succeeds with 0 entries and the rebuild fallback never
+   fires. Cheap to add inside fsck's pack pass.
 
 ## 4. Matrix + cycle targets (gate AC 3)
 

@@ -1,10 +1,31 @@
 # WI4 — Model-Based Property Suite (the Phase 3 gate)
 
 Location (D1): `crates/snapstore-server/tests/gc_properties.rs`, plus a
-`tests/gc_model/` support module. Dev-deps: `proptest`,
-`snapstore-manifest` with `features = ["test-strategies"]` (the precedent:
-manifest Cargo.toml `test-strategies = ["dep:proptest"]`), `snapstore-store`
-and `snapstore-server` with `features = ["gc-test-hooks"]`.
+`tests/gc_model/` support module. Dev-deps: `proptest` (workspace lock has
+1.11.0 — the seeded-runner API in §6 is valid there), `snapstore-manifest`
+with `features = ["test-strategies"]` (the precedent: manifest Cargo.toml
+`test-strategies = ["dep:proptest"]`).
+
+Feature plumbing (exact — three traps here):
+- snapstore-server `[features]`: `gc-test-hooks =
+  ["snapstore-store/gc-test-hooks"]` (a crate CANNOT dev-depend on itself
+  with features; forward the store feature through the server's own).
+- Declare the target with required-features so plain
+  `cargo test --workspace` stays green (the hooks types are feature-gated
+  out otherwise — note snapstore-store's `#[cfg(any(test, ...))]` `test`
+  cfg does NOT apply to dependents):
+  ```toml
+  [[test]]
+  name = "gc_properties"
+  required-features = ["gc-test-hooks"]
+  ```
+- CI invocation: `cargo test -p snapstore-server --test gc_properties
+  --features snapstore-server/gc-test-hooks` (valid syntax), plus a
+  matching clippy invocation — the existing failpoints clippy line
+  (ci.yaml:35) does NOT cover `gc-test-hooks` code (different feature,
+  different crates); add a separate `cargo clippy -p snapstore-server
+  --tests --features snapstore-server/gc-test-hooks -- -D warnings` step
+  (06 §1).
 
 Everything here runs **in-process** against `SnapshotStore` + `MetaDb` +
 `run_gc_cycle` on TempDirs — no gRPC in the property loop (speed,
@@ -68,9 +89,21 @@ brute force, per IMPLEMENTATION-PLAN §M7's oracle rule.
 
 `GcOpts { compact_threshold: 1.01, rotate_active_first: true, tombstone_grace_cycles: 0 }`
 for the quiescent-exactness property — threshold > 1.0 forces compaction of
-every pack containing any dead record (liveness < threshold), and rotation
-first makes all data sweepable; without these, whole-pack granularity
-legitimately retains garbage and completeness cannot be exact. A second
+every pre-fence pack, INCLUDING 100%-live ones (1.0 < 1.01; the quiescent
+property therefore rewrites all data each cycle — intended, comment it),
+and rotation first makes all data sweepable; without these, whole-pack
+granularity legitimately retains garbage and completeness cannot be exact.
+
+**Legal-outcome rule the model must encode:** an acked `PutPages` whose
+pages were never referenced by a committed manifest MAY be collected (they
+are unreachable; natural rotation with 64 KiB test packs constantly moves
+them below the fence). A later `put_snapshot` referencing them then
+correctly fails `MissingPages`, and the client re-puts (idempotent). The
+generator must either re-put pages at commit time or treat that failure as
+a legal outcome — NOT an R1 violation. Disclose this deviation from
+ARCHITECTURE §4.3's "pages ≥ fence_pack are protected" intuition in
+04-resolution.md (that rule protects only the current active pack, not
+earlier unmanifested ingest). A second
 property run uses default opts (0.5) and asserts **safety only** plus
 "physical ⊇ reachable" (leak-bounded, no exactness) — proving the
 production config path too.
