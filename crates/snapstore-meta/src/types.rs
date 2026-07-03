@@ -32,6 +32,25 @@ pub struct PinRow {
     pub created_at: u64,
 }
 
+/// A tombstoned subtree-root row (mirrors the `tombstones` table,
+/// 001_initial.sql).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TombstoneRow {
+    pub experiment_id: ExperimentId,
+    pub node_id: NodeId,
+    pub created_at: u64,
+}
+
+/// Persisted M7 GC cycle state (the `gc_state` singleton row,
+/// 002_gc_state.sql).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcStateRow {
+    pub cycles_total: u64,
+    pub last_fence_counter: u64,
+    pub last_finished_at: u64,
+    pub last_freed_bytes: u64,
+}
+
 /// Aggregate statistics.
 #[derive(Clone, Debug, Default)]
 pub struct StatsRow {

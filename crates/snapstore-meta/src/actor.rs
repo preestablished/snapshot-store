@@ -1,10 +1,24 @@
 use crate::error::MetaError;
 use crate::pool::{log_id_to_sql, node_id_to_sql, snapshot_ref_to_sql, status_to_sql};
-use crate::types::{CreateNodeParams, NodeRow, NodeUpdate};
+use crate::types::{CreateNodeParams, GcStateRow, NodeRow, NodeUpdate};
 use crate::{MetaConfig, INPUT_LOG_MIN_BYTES, KV_KEY_MAX, KV_VALUE_MAX};
 use crossbeam_channel::{Receiver, Sender};
 use rusqlite::{params, Connection, OptionalExtension};
 use snapstore_types::{ExperimentId, LogId, NodeId, NodeStatus, SnapshotRef};
+
+// ---------------------------------------------------------------------------
+// Failpoint shim (mirrors crates/snapstore-store/src/lib.rs:36-41)
+// ---------------------------------------------------------------------------
+
+/// Invoke a named failpoint when the `failpoints` feature is enabled.
+///
+/// When the feature is off this macro expands to nothing — zero overhead.
+macro_rules! fail_point {
+    ($name:expr) => {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!($name);
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Command enum
@@ -50,6 +64,15 @@ pub enum ActorCmd {
         node_id: NodeId,
         allow_root: bool,
         reply: Sender<Result<u64, MetaError>>,
+    },
+    ReapTombstone {
+        experiment_id: ExperimentId,
+        node_id: NodeId,
+        reply: Sender<Result<u64, MetaError>>,
+    },
+    SetGcState {
+        state: GcStateRow,
+        reply: Sender<Result<(), MetaError>>,
     },
     Shutdown,
 }
@@ -111,6 +134,12 @@ fn dispatch_cmd(conn: &Connection, cmd: &ActorCmd, counter: u64, config: &MetaCo
             *allow_root,
             counter,
         )),
+        ActorCmd::ReapTombstone {
+            experiment_id,
+            node_id,
+            ..
+        } => CmdResult::U64(reap_tombstone_impl(conn, experiment_id, *node_id)),
+        ActorCmd::SetGcState { state, .. } => CmdResult::Unit(set_gc_state_impl(conn, state)),
         ActorCmd::Shutdown => CmdResult::Unit(Ok(())),
     }
 }
@@ -139,6 +168,12 @@ fn send_result(cmd: ActorCmd, result: CmdResult) {
             let _ = reply.send(r);
         }
         (ActorCmd::PruneSubtree { reply, .. }, CmdResult::U64(r)) => {
+            let _ = reply.send(r);
+        }
+        (ActorCmd::ReapTombstone { reply, .. }, CmdResult::U64(r)) => {
+            let _ = reply.send(r);
+        }
+        (ActorCmd::SetGcState { reply, .. }, CmdResult::Unit(r)) => {
             let _ = reply.send(r);
         }
         (ActorCmd::Shutdown, _) => {}
@@ -173,6 +208,12 @@ fn send_error(cmd: ActorCmd, e: MetaError) {
             let _ = reply.send(Err(e));
         }
         ActorCmd::PruneSubtree { reply, .. } => {
+            let _ = reply.send(Err(e));
+        }
+        ActorCmd::ReapTombstone { reply, .. } => {
+            let _ = reply.send(Err(e));
+        }
+        ActorCmd::SetGcState { reply, .. } => {
             let _ = reply.send(Err(e));
         }
         ActorCmd::Shutdown => {}
@@ -853,4 +894,125 @@ fn prune_subtree_impl(
     )?;
 
     Ok(rows_updated as u64)
+}
+
+/// Reap one tombstoned subtree rooted at `(experiment_id, node_id)`.
+///
+/// Mirrors `prune_subtree_impl`'s recursive-CTE pattern. Collects the
+/// subtree via a recursive CTE, verifies every row in it is `PRUNED`
+/// (defense in depth: a non-PRUNED descendant indicates a prune/reap bug —
+/// abort rather than delete live rows), deletes the subtree's node rows,
+/// deletes any `input_logs` no longer referenced by a surviving node, and
+/// deletes the tombstone row. One transaction (the caller's SAVEPOINT).
+///
+/// Idempotent: returns `Ok(0)` if the root row is already gone (already
+/// reaped under crash-retry).
+///
+/// # FK ordering
+/// `nodes` has `FOREIGN KEY (experiment_id, parent_node_id) REFERENCES
+/// nodes(experiment_id, node_id)` and the writer connection runs with
+/// `PRAGMA foreign_keys=ON` (schema.rs). SQLite's *immediate* (default,
+/// non-`DEFERRABLE`) foreign-key constraints are still checked only once
+/// the triggering statement has finished executing — not per intermediate
+/// row — so a single `DELETE ... WHERE (experiment_id, node_id) IN
+/// (subtree)` that removes the *entire* closed subtree in one statement
+/// never observes a dangling child mid-statement: by the time the FK
+/// constraint is checked, every row that referenced a deleted parent has
+/// itself already been deleted. This is exercised directly by
+/// `tests::reap_deletes_multi_level_subtree_single_statement`.
+fn reap_tombstone_impl(
+    conn: &Connection,
+    experiment_id: &ExperimentId,
+    node_id: NodeId,
+) -> Result<u64, MetaError> {
+    let exp_str = experiment_id.as_str();
+    let node_sql = node_id_to_sql(node_id);
+
+    // Idempotent: nothing to do if the root row is already gone.
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE experiment_id=?1 AND node_id=?2",
+            params![exp_str, node_sql],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !exists {
+        return Ok(0);
+    }
+
+    let pruned_status = NodeStatus::Pruned.as_u8() as i64;
+
+    // Defense-in-depth: every row in the subtree must already be PRUNED.
+    let non_pruned_count: i64 = conn.query_row(
+        "WITH RECURSIVE subtree(experiment_id, node_id) AS (
+            SELECT experiment_id, node_id FROM nodes
+            WHERE experiment_id=?1 AND node_id=?2
+            UNION ALL
+            SELECT n.experiment_id, n.node_id FROM nodes n
+            JOIN subtree s ON n.experiment_id=s.experiment_id AND n.parent_node_id=s.node_id
+         )
+         SELECT COUNT(*) FROM nodes
+         WHERE (experiment_id, node_id) IN (SELECT experiment_id, node_id FROM subtree)
+           AND status != ?3",
+        params![exp_str, node_sql, pruned_status],
+        |row| row.get(0),
+    )?;
+    if non_pruned_count > 0 {
+        return Err(MetaError::InvalidArgument(format!(
+            "reap_tombstone: subtree rooted at ({exp_str}, {node_id:?}) has \
+             {non_pruned_count} non-PRUNED row(s); refusing to delete"
+        )));
+    }
+
+    fail_point!("gc-reap-txn");
+
+    // Delete the subtree's node rows in one statement (see FK-ordering note
+    // on this function).
+    let rows_deleted = conn.execute(
+        "WITH RECURSIVE subtree(experiment_id, node_id) AS (
+            SELECT experiment_id, node_id FROM nodes
+            WHERE experiment_id=?1 AND node_id=?2
+            UNION ALL
+            SELECT n.experiment_id, n.node_id FROM nodes n
+            JOIN subtree s ON n.experiment_id=s.experiment_id AND n.parent_node_id=s.node_id
+         )
+         DELETE FROM nodes
+         WHERE (experiment_id, node_id) IN (SELECT experiment_id, node_id FROM subtree)",
+        params![exp_str, node_sql],
+    )?;
+
+    // Delete input_logs no longer referenced by any surviving node.
+    conn.execute(
+        "DELETE FROM input_logs WHERE log_id NOT IN (
+            SELECT input_log_id FROM nodes WHERE input_log_id IS NOT NULL
+         )",
+        [],
+    )?;
+
+    // Delete the tombstone row.
+    conn.execute(
+        "DELETE FROM tombstones WHERE experiment_id=?1 AND node_id=?2",
+        params![exp_str, node_sql],
+    )?;
+
+    Ok(rows_deleted as u64)
+}
+
+fn set_gc_state_impl(conn: &Connection, s: &GcStateRow) -> Result<(), MetaError> {
+    let rows = conn.execute(
+        "UPDATE gc_state SET cycles_total=?1, last_fence_counter=?2, \
+         last_finished_at=?3, last_freed_bytes=?4 WHERE id=1",
+        params![
+            s.cycles_total as i64,
+            s.last_fence_counter as i64,
+            s.last_finished_at as i64,
+            s.last_freed_bytes as i64,
+        ],
+    )?;
+    if rows == 0 {
+        return Err(MetaError::Io(
+            "set_gc_state: singleton gc_state row (id=1) missing".into(),
+        ));
+    }
+    Ok(())
 }

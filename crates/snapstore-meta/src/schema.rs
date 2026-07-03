@@ -4,7 +4,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 const MIGRATION_001: &str = include_str!("migrations/001_initial.sql");
-const SUPPORTED_VERSION: i64 = 1;
+const MIGRATION_002: &str = include_str!("migrations/002_gc_state.sql");
+const SUPPORTED_VERSION: i64 = 2;
 
 /// Open a writer connection, apply WAL pragmas, run migration if needed.
 pub fn open_writer(path: &Path) -> Result<Connection, MetaError> {
@@ -37,52 +38,109 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<(), MetaError> {
     Ok(())
 }
 
+/// Version-stepping migration runner.
+///
+/// Reads the current `schema_version` (treating "no `meta` table at all" as
+/// version 0) and, while it is below `SUPPORTED_VERSION`, applies migration
+/// `v+1` — DDL + seed data + `UPDATE meta SET schema_version = v+1` + a
+/// `_migrations` row — all inside ONE transaction per step (`apply_migration_step`).
+/// This lets a store land on any past `schema_version` (including the
+/// original single-migration v1 stores) and step forward one version at a
+/// time to `SUPPORTED_VERSION`, instead of short-circuiting after the first
+/// migration ever applied to a given DB file.
+///
+/// Crash-safety: each step's DDL + seed + version bump commit atomically
+/// (the phase-2 crash harness kills inside exactly this window), so a kill
+/// mid-step leaves the DB at the pre-step version, safely retryable on
+/// reopen.
 fn run_migration(conn: &Connection) -> Result<(), MetaError> {
-    // Check whether the meta table (our schema sentinel) exists.
-    let has_meta: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)?;
+    loop {
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)?;
 
-    if has_meta {
-        // Already migrated — check version. The row read is `optional` to
-        // self-heal stores initialized before seeding moved into the
-        // migration transaction (table present, singleton row missing).
-        let version: Option<i64> = conn
-            .query_row("SELECT schema_version FROM meta WHERE id=1", [], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        match version {
-            Some(v) if v > SUPPORTED_VERSION => {
-                return Err(MetaError::FutureVersion {
-                    found: v,
-                    supported: SUPPORTED_VERSION,
-                });
+        let current_version: i64 = if !has_meta {
+            0
+        } else {
+            // The row read is `optional` to self-heal stores initialized
+            // before seeding moved into the migration transaction (table
+            // present, singleton row missing).
+            let version: Option<i64> = conn
+                .query_row("SELECT schema_version FROM meta WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match version {
+                Some(v) => v,
+                None => {
+                    seed_meta_rows(conn)?;
+                    continue;
+                }
             }
-            Some(_) => return Ok(()),
-            None => {
-                seed_meta_rows(conn)?;
-                return Ok(());
-            }
+        };
+
+        if current_version > SUPPORTED_VERSION {
+            return Err(MetaError::FutureVersion {
+                found: current_version,
+                supported: SUPPORTED_VERSION,
+            });
+        }
+        if current_version == SUPPORTED_VERSION {
+            return Ok(());
+        }
+
+        apply_migration_step(conn, current_version + 1)?;
+        // Loop again: re-read the version and apply the next step, if any.
+    }
+}
+
+/// Apply migration step `target_version` (i.e. step from `target_version - 1`
+/// to `target_version`) inside one transaction.
+///
+/// A kill at any instant leaves either the pre-step version fully intact or
+/// the post-step version fully intact — a committed-DDL-but-unstamped state
+/// must be unreachable.
+fn apply_migration_step(conn: &Connection, target_version: i64) -> Result<(), MetaError> {
+    let tx = conn.unchecked_transaction()?;
+    match target_version {
+        1 => {
+            tx.execute_batch(MIGRATION_001)?;
+            seed_meta_rows(&tx)?;
+        }
+        2 => {
+            tx.execute_batch(MIGRATION_002)?;
+            tx.execute("UPDATE meta SET schema_version=2 WHERE id=1", [])?;
+            let now = now_unix();
+            tx.execute(
+                "INSERT OR IGNORE INTO _migrations (id, name, applied_at) VALUES (2, '002_gc_state', ?1)",
+                params![now],
+            )?;
+        }
+        v => {
+            return Err(MetaError::Io(format!(
+                "no migration DDL defined for schema version {v}"
+            )));
         }
     }
-
-    // First open — DDL and the seed rows commit as ONE transaction.
-    // A kill at any instant leaves either a fully initialized DB or an
-    // empty file; a committed-DDL-but-unseeded state must be unreachable
-    // (the M6 harness kills children inside this exact window).
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(MIGRATION_001)?;
-    seed_meta_rows(&tx)?;
     tx.commit()?;
-
     Ok(())
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seed the meta singleton row (schema_version=1) and the `_migrations` row
+/// for 001. Used both by the first-open path (step to v1) and the self-heal
+/// path (table present, singleton row missing — legacy pre-seed-in-txn
+/// stores).
 fn seed_meta_rows(conn: &Connection) -> Result<(), MetaError> {
     let store_uuid = Uuid::new_v4().to_string();
     conn.execute(
@@ -90,10 +148,7 @@ fn seed_meta_rows(conn: &Connection) -> Result<(), MetaError> {
          VALUES (1, 1, ?1, 0)",
         params![store_uuid],
     )?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = now_unix();
     conn.execute(
         "INSERT OR IGNORE INTO _migrations (id, name, applied_at) VALUES (1, '001_initial', ?1)",
         params![now],

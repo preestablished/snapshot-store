@@ -77,6 +77,11 @@ struct ActiveState {
     dirty_since_sync: HashSet<PackId>,
     /// True if new pack files were created since the last sync() call.
     new_files_since_sync: bool,
+    /// Shared allocator for the next fresh pack id, consumed by both ingest
+    /// rotation and `create_gc_pack`. A single counter is required so a GC
+    /// pack id can never collide with a subsequently-rotated ingest pack id
+    /// (see `PageStore::open`'s initialization and `create_gc_pack`).
+    next_pack_id: PackId,
 }
 
 // ── PageStore ─────────────────────────────────────────────────────────────────
@@ -221,6 +226,12 @@ impl PageStore {
             (writer, new_id, true)
         };
 
+        // Shared pack-id allocator: max(discovered)+1. `pack_ids` at this
+        // point already includes the freshly-created active pack when one
+        // was created above (the `else` branch pushes `new_id` onto it), so
+        // this is careful to not collide with it.
+        let next_pack_id = PackId(pack_ids.iter().map(|id| id.0).max().map_or(0, |m| m + 1));
+
         let read_handle_cap = opts.read_handle_cap;
         Ok(PageStore {
             dir: dir.to_path_buf(),
@@ -230,6 +241,7 @@ impl PageStore {
                 pack_id,
                 dirty_since_sync: HashSet::new(),
                 new_files_since_sync: new_file,
+                next_pack_id,
             }),
             opts,
             read_cache: ReadHandleCache::new(dir.to_path_buf(), read_handle_cap),
@@ -294,35 +306,14 @@ impl PageStore {
                 // Rotate pack if the next record would exceed the cap.
                 // Use seal_no_sync() to avoid blocking the hot path on fdatasync;
                 // dirty packs (including sealed ones) are fsynced lazily by sync().
+                //
+                // Note: we do NOT insert the sealed pack's fd into read_cache here.
+                // The fd in the writer was opened for read+write; we don't cache it.
+                // The read_cache will open a read-only fd on the first cache-miss
+                // read of this newly-sealed pack.  The cached fd will stay valid
+                // because sealing only appended a footer — record offsets are unchanged.
                 if active.writer.would_exceed_cap() {
-                    let old_pack_id = active.pack_id;
-                    active.dirty_since_sync.insert(old_pack_id);
-
-                    // Failpoint: mid-rotation between sealing old pack and opening new one.
-                    fail_point!("pack-rotate-seal");
-                    active.writer.seal_no_sync()?;
-
-                    // Write sidecar for the now-sealed pack.
-                    let sidecar = sidecar_path(&self.dir, old_pack_id);
-                    self.index.write_sidecar(&sidecar, old_pack_id)?;
-
-                    // Create the next pack with the configured cap.
-                    let new_id = PackId(old_pack_id.0 + 1);
-                    let new_path = pack_path(&self.dir, new_id);
-                    active.writer = PackWriter::create_with_max_bytes(
-                        &new_path,
-                        new_id,
-                        unix_now(),
-                        self.opts.max_pack_bytes,
-                    )?;
-                    active.pack_id = new_id;
-                    active.new_files_since_sync = true;
-
-                    // Note: we do NOT insert the sealed pack's fd into read_cache here.
-                    // The fd in the writer was opened for read+write; we don't cache it.
-                    // The read_cache will open a read-only fd on the first cache-miss
-                    // read of this newly-sealed pack.  The cached fd will stay valid
-                    // because sealing only appended a footer — record offsets are unchanged.
+                    self.rotate_locked(&mut active)?;
                 }
 
                 // Failpoint: after record bytes buffered/written, before any sync.
@@ -649,6 +640,32 @@ impl PageStore {
         self.read_cache.invalidate(pack);
     }
 
+    /// All index entries currently pointing into `pack` (GC sweep's
+    /// "records something still points at" view).  Passthrough to
+    /// `ShardedIndex::entries_for_pack`.
+    pub fn pack_entries(&self, pack: PackId) -> Vec<(PageHash, PageLoc)> {
+        self.index.entries_for_pack(pack)
+    }
+
+    /// Repoint `hash` to `new_loc` iff its current entry still points into
+    /// `expected_pack` (GC compaction finalize).  See
+    /// `ShardedIndex::repoint_if_in_pack`.
+    pub fn repoint_if_in_pack(
+        &self,
+        hash: &PageHash,
+        expected_pack: PackId,
+        new_loc: PageLoc,
+    ) -> bool {
+        self.index.repoint_if_in_pack(hash, expected_pack, new_loc)
+    }
+
+    /// Remove `hash` iff its current entry still points into
+    /// `expected_pack` (GC sweep of dead records).  See
+    /// `ShardedIndex::remove_if_in_pack`.
+    pub fn remove_if_in_pack(&self, hash: &PageHash, expected_pack: PackId) -> bool {
+        self.index.remove_if_in_pack(hash, expected_pack)
+    }
+
     /// Flush buffered writes and fdatasync all dirty packs.
     pub fn sync(&self) -> Result<(), StoreError> {
         let mut active = self.active.lock();
@@ -677,6 +694,213 @@ impl PageStore {
         }
 
         Ok(())
+    }
+
+    // ── M7 GC surfaces ──────────────────────────────────────────────────────
+
+    /// Sealed pack ids (everything discovered on disk except the active
+    /// pack), ascending. Snapshot at call time.
+    pub fn sealed_pack_ids(&self) -> Result<Vec<PackId>, StoreError> {
+        let active_id = self.active_pack_id();
+        let mut ids = discover_packs(&self.dir)?;
+        ids.retain(|&id| id != active_id);
+        Ok(ids)
+    }
+
+    /// Current active pack id (brief `active` lock).
+    pub fn active_pack_id(&self) -> PackId {
+        self.active.lock().pack_id
+    }
+
+    /// Seal the active pack (flush + seal_no_sync + sidecar, exactly the
+    /// rotation path used when a pack fills up) and open a fresh one.
+    /// Returns the (possibly unchanged) active pack id.
+    ///
+    /// A no-op when the active pack has zero records — this avoids pack-id
+    /// churn when called repeatedly (e.g. by aggressive GC fencing) with no
+    /// intervening writes.
+    pub fn rotate_active(&self) -> Result<PackId, StoreError> {
+        let mut active = self.active.lock();
+        if active.writer.record_count() == 0 {
+            return Ok(active.pack_id);
+        }
+        self.rotate_locked(&mut active)
+    }
+
+    /// Seal `active`'s current pack and open a fresh one, allocating the new
+    /// pack id from the shared `next_pack_id` counter. Caller must hold the
+    /// `active` lock (passed in). Shared by the hot ingest-rotation path and
+    /// `rotate_active` so both draw ids from the same allocator — this is
+    /// what keeps GC-allocated pack ids (`create_gc_pack`) from ever
+    /// colliding with a subsequently-rotated ingest pack id.
+    fn rotate_locked(&self, active: &mut ActiveState) -> Result<PackId, StoreError> {
+        let old_pack_id = active.pack_id;
+        active.dirty_since_sync.insert(old_pack_id);
+
+        // Failpoint: mid-rotation between sealing old pack and opening new one.
+        fail_point!("pack-rotate-seal");
+        active.writer.seal_no_sync()?;
+
+        // Write sidecar for the now-sealed pack.
+        let sidecar = sidecar_path(&self.dir, old_pack_id);
+        self.index.write_sidecar(&sidecar, old_pack_id)?;
+
+        // Create the next pack with the configured cap, drawing the id from
+        // the shared allocator.
+        let new_id = active.next_pack_id;
+        active.next_pack_id = PackId(new_id.0 + 1);
+        let new_path = pack_path(&self.dir, new_id);
+        active.writer = PackWriter::create_with_max_bytes(
+            &new_path,
+            new_id,
+            unix_now(),
+            self.opts.max_pack_bytes,
+        )?;
+        active.pack_id = new_id;
+        active.new_files_since_sync = true;
+
+        Ok(new_id)
+    }
+
+    /// All (offset, hash) records in a sealed pack, in file order.
+    /// Thin wrapper over `PackReader::open` + `scan`.
+    pub fn scan_pack(&self, pack: PackId) -> Result<Vec<(u64, PageHash)>, StoreError> {
+        let path = pack_path(&self.dir, pack);
+        let reader = PackReader::open(&path, pack)?;
+        Ok(reader.scan()?)
+    }
+
+    /// Read one record's payload from a sealed pack at a known offset,
+    /// verifying hash. Compaction's copy read.
+    pub fn read_record(
+        &self,
+        pack: PackId,
+        offset: u64,
+        expected: &PageHash,
+    ) -> Result<bytes::Bytes, StoreError> {
+        self.read_from_cached_handle(expected, PageLoc { pack, offset })
+    }
+
+    /// Allocate a fresh pack id for a GC compaction destination and return a
+    /// writer for it. The pack is NOT the active ingest pack; the caller
+    /// (the GC engine) owns append ordering and must call
+    /// `seal_and_publish` when done.
+    ///
+    /// The id is drawn from the same `next_pack_id` allocator used by ingest
+    /// rotation, so a GC pack id can never collide with a later
+    /// ingest-rotated pack id.
+    pub fn create_gc_pack(&self) -> Result<GcPackWriter, StoreError> {
+        let mut active = self.active.lock();
+        let id = active.next_pack_id;
+        active.next_pack_id = PackId(id.0 + 1);
+        drop(active);
+
+        let path = pack_path(&self.dir, id);
+        let writer =
+            PackWriter::create_with_max_bytes(&path, id, unix_now(), self.opts.max_pack_bytes)?;
+
+        Ok(GcPackWriter {
+            writer,
+            pack_id: id,
+            dir: self.dir.clone(),
+            entries: Vec::new(),
+        })
+    }
+
+    /// Unlink a sealed pack and its sidecar. Caller must have already
+    /// repointed/removed every index entry for it and called
+    /// `invalidate_pack_handle`.
+    ///
+    /// Order: unlink `.idx` FIRST, then `.spk`, then fsync the pages dir.
+    /// Rationale: `discover_packs` keys on `.spk` files, so crashing between
+    /// the two unlinks must not leave an orphan `.idx` whose pack id is no
+    /// longer discovered (it would leak forever); `.idx`-first instead
+    /// leaves a sealed pack with a missing sidecar, which `open()` rebuilds
+    /// cleanly.
+    pub fn delete_pack(&self, pack: PackId) -> Result<(), StoreError> {
+        let idx_path = sidecar_path(&self.dir, pack);
+        let spk_path = pack_path(&self.dir, pack);
+
+        // Failpoint: immediately before the .idx unlink.
+        fail_point!("gc-pack-unlink");
+
+        remove_file_if_exists(&idx_path)?;
+        remove_file_if_exists(&spk_path)?;
+
+        let dir_file = std::fs::File::open(&self.dir)?;
+        dir_file.sync_all()?;
+
+        Ok(())
+    }
+}
+
+// ── GcPackWriter ─────────────────────────────────────────────────────────────
+
+/// A writer for a GC-owned pack (compaction destination), allocated by
+/// `PageStore::create_gc_pack`. Fresh pack ids above the current fence,
+/// never the active ingest pack — normal `ingest()` dedups against the
+/// index so it can never re-copy an already-indexed page, and sharing the
+/// active pack would couple GC to the single pack-writer.
+pub struct GcPackWriter {
+    writer: PackWriter,
+    pack_id: PackId,
+    dir: PathBuf,
+    /// Records appended so far, in append order: (hash, offset).
+    entries: Vec<(PageHash, u64)>,
+}
+
+impl GcPackWriter {
+    /// Append one page's payload. Returns the byte offset of the new record.
+    pub fn append(
+        &mut self,
+        hash: &PageHash,
+        payload: &[u8; PAGE_SIZE],
+    ) -> Result<u64, StoreError> {
+        let offset = self.writer.append(hash, payload)?;
+        self.entries.push((*hash, offset));
+        Ok(offset)
+    }
+
+    /// The pack id this writer is writing to.
+    pub fn pack_id(&self) -> PackId {
+        self.pack_id
+    }
+
+    /// Seal the pack (full fsync via `PackWriter::seal`), then write its
+    /// sidecar FROM THE WRITER'S OWN ACCUMULATED RECORD LIST — never via
+    /// `ShardedIndex::write_sidecar`. At publish time the index still
+    /// points every one of these hashes at the OLD (pre-compaction) pack,
+    /// so scanning the index for "entries in this new pack" would find
+    /// none and silently write a CRC-valid EMPTY sidecar. A crash after the
+    /// old pack is unlinked would then reopen this pack with an empty
+    /// sidecar, "successfully" — the rebuild-from-scan fallback never fires
+    /// because the sidecar loaded fine — and every compacted page becomes
+    /// unreachable (a silent R1/R2 violation).
+    ///
+    /// Does NOT touch the index. The caller repoints/removes index entries
+    /// afterwards (compaction is not atomic with publication by design —
+    /// the pack existing on disk with a valid sidecar is sufficient for
+    /// crash recovery to converge; see 01-storage-surfaces.md §2).
+    pub fn seal_and_publish(mut self) -> Result<(PackId, Vec<(PageHash, u64)>), StoreError> {
+        self.writer.seal()?;
+
+        let sidecar = sidecar_path(&self.dir, self.pack_id);
+        let loc_entries: Vec<(PageHash, PageLoc)> = self
+            .entries
+            .iter()
+            .map(|&(hash, offset)| {
+                (
+                    hash,
+                    PageLoc {
+                        pack: self.pack_id,
+                        offset,
+                    },
+                )
+            })
+            .collect();
+        crate::index::write_sidecar_entries(&sidecar, &loc_entries)?;
+
+        Ok((self.pack_id, self.entries))
     }
 }
 
@@ -813,6 +1037,16 @@ fn reopen_pack_for_append(
     // Use PackWriter::reopen to reconstruct writer state from the (now clean) file.
     let writer = PackWriter::reopen(path, pack_id)?;
     Ok(writer)
+}
+
+/// Remove a file, treating "already absent" as success (idempotent under
+/// crash-retry — `delete_pack` may be retried after a partial unlink).
+fn remove_file_if_exists(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::Io(e)),
+    }
 }
 
 /// Current Unix time in seconds.
@@ -1406,6 +1640,301 @@ mod tests {
         assert!(
             result.is_err(),
             "reading a corrupted page must return an error, got: {:?}",
+            result
+        );
+    }
+
+    // ── Test 15: rotate_active skips an empty active pack ─────────────────────
+
+    #[test]
+    fn rotate_active_skips_empty_pack() {
+        let dir = TempDir::new().unwrap();
+        let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+
+        let before = store.active_pack_id();
+        let returned = store.rotate_active().unwrap();
+        assert_eq!(
+            returned, before,
+            "rotate_active on an empty pack must not allocate a new pack id"
+        );
+        assert_eq!(store.active_pack_id(), before);
+
+        // No pack-00000001.spk should have been created.
+        assert!(!dir.path().join("pack-00000001.spk").exists());
+
+        // Once something is written, rotate_active must actually rotate.
+        let pages = make_unique_pages(2);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        store.ingest(&page_refs).unwrap();
+
+        let rotated = store.rotate_active().unwrap();
+        assert_ne!(rotated, before, "non-empty active pack must rotate");
+        assert_eq!(store.active_pack_id(), rotated);
+
+        // Second call on the now-empty fresh active pack is a no-op again.
+        let again = store.rotate_active().unwrap();
+        assert_eq!(again, rotated);
+    }
+
+    // ── Test 16: create_gc_pack ids never collide with rotation ids ──────────
+
+    #[test]
+    fn gc_pack_id_never_collides_with_rotation() {
+        use crate::pack::{PACK_HEADER_SIZE, RECORD_HEADER_SIZE};
+
+        let dir = TempDir::new().unwrap();
+        // Small cap: 2 pages per pack, so ingest forces rotation cheaply.
+        let record_size = RECORD_HEADER_SIZE + PAGE_SIZE as u64;
+        let max_pack_bytes = PACK_HEADER_SIZE + 2 * record_size;
+        let opts = StoreOptions {
+            max_pack_bytes,
+            ..StoreOptions::default()
+        };
+        let store = PageStore::open(dir.path(), opts).unwrap();
+
+        // Allocate a GC pack before any ingest rotation happens.
+        let gc_writer = store.create_gc_pack().unwrap();
+        let gc_pack_id = gc_writer.pack_id();
+        // Publish it immediately (empty pack is fine for this test).
+        let (published_id, entries) = gc_writer.seal_and_publish().unwrap();
+        assert_eq!(published_id, gc_pack_id);
+        assert!(entries.is_empty());
+
+        // Now force many ingest rotations via a single large batch.
+        let pages = make_unique_pages(40);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        store.ingest(&page_refs).unwrap();
+
+        // Collect every pack id that now exists on disk.
+        let mut all_ids: Vec<u32> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.strip_prefix("pack-")
+                    .and_then(|s| s.strip_suffix(".spk"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            })
+            .collect();
+        all_ids.sort();
+
+        // No duplicate pack ids on disk (the GC pack's id must never have
+        // been reused by ingest rotation).
+        let mut dedup = all_ids.clone();
+        dedup.dedup();
+        assert_eq!(
+            all_ids, dedup,
+            "no pack id may be reused between GC and ingest rotation: {:?}",
+            all_ids
+        );
+        assert!(
+            all_ids.contains(&gc_pack_id.0),
+            "GC pack file must still exist on disk"
+        );
+
+        // Allocate a second GC pack after rotation and confirm it's still
+        // fresh (not equal to any existing id, in particular not the active
+        // ingest pack's id).
+        let gc_writer2 = store.create_gc_pack().unwrap();
+        let gc_pack_id2 = gc_writer2.pack_id();
+        assert!(
+            !all_ids.contains(&gc_pack_id2.0),
+            "freshly allocated GC pack id must not collide with any existing pack"
+        );
+        assert_ne!(gc_pack_id2, store.active_pack_id());
+    }
+
+    // ── Test 17: seal_and_publish's sidecar has exactly the appended entries ──
+
+    #[test]
+    fn gc_pack_seal_and_publish_sidecar_exact() {
+        let dir = TempDir::new().unwrap();
+        let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+
+        let pages = make_unique_pages(6);
+        let hashes: Vec<PageHash> = pages
+            .iter()
+            .map(|p| PageHash::from_bytes(*blake3::hash(p.as_ref()).as_bytes()))
+            .collect();
+
+        let mut gc_writer = store.create_gc_pack().unwrap();
+        let gc_pack_id = gc_writer.pack_id();
+        let mut expected_offsets = Vec::new();
+        for (hash, page) in hashes.iter().zip(pages.iter()) {
+            let off = gc_writer.append(hash, page).unwrap();
+            expected_offsets.push((*hash, off));
+        }
+
+        let (published_id, returned_entries) = gc_writer.seal_and_publish().unwrap();
+        assert_eq!(published_id, gc_pack_id);
+        assert_eq!(returned_entries.len(), 6);
+        let mut returned_sorted = returned_entries.clone();
+        returned_sorted.sort_by_key(|(h, _)| *h.as_bytes());
+        let mut expected_sorted = expected_offsets.clone();
+        expected_sorted.sort_by_key(|(h, _)| *h.as_bytes());
+        assert_eq!(returned_sorted, expected_sorted);
+
+        // Read the sidecar back into a *fresh* index — must contain exactly
+        // the appended entries, nothing more, nothing less. Critically, this
+        // must work even though the store's own index still points every
+        // one of these hashes at their original (pre-compaction) location.
+        let sidecar_path = dir.path().join(format!("pack-{:08x}.idx", gc_pack_id.0));
+        let fresh_index = ShardedIndex::new();
+        let loaded_count = fresh_index.load_sidecar(&sidecar_path).unwrap();
+        assert_eq!(loaded_count, 6);
+
+        for (hash, offset) in &expected_offsets {
+            let loc = fresh_index
+                .get(hash)
+                .expect("hash must be present in the GC pack's sidecar");
+            assert_eq!(loc.pack, gc_pack_id);
+            assert_eq!(loc.offset, *offset);
+        }
+        assert_eq!(fresh_index.len(), 6, "sidecar must have exactly 6 entries");
+    }
+
+    // ── Test 18: delete_pack + reopen never resurrects entries ───────────────
+
+    #[test]
+    fn delete_pack_then_reopen_does_not_resurrect() {
+        use crate::pack::{PACK_HEADER_SIZE, RECORD_HEADER_SIZE};
+
+        let dir = TempDir::new().unwrap();
+        let record_size = RECORD_HEADER_SIZE + PAGE_SIZE as u64;
+        // 3 pages per pack so ingest rotates cleanly.
+        let max_pack_bytes = PACK_HEADER_SIZE + 3 * record_size;
+        let opts = StoreOptions {
+            max_pack_bytes,
+            ..StoreOptions::default()
+        };
+        let store = PageStore::open(dir.path(), opts).unwrap();
+
+        // 3 pages -> pack 0 (sealed after rotation below), then rotate.
+        let pages = make_unique_pages(3);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        let outcomes = store.ingest(&page_refs).unwrap();
+        let hashes: Vec<PageHash> = outcomes.iter().map(|o| o.hash).collect();
+
+        // Force rotation so pack 0 is sealed and there's a distinct active pack.
+        let sealed_id = store.active_pack_id();
+        // Write one more page to force rotation past the 3-page cap.
+        let extra = make_unique_pages_with_offset(1, 1000);
+        let extra_refs: Vec<&[u8; PAGE_SIZE]> = extra.iter().map(|p| p.as_ref()).collect();
+        store.ingest(&extra_refs).unwrap();
+        store.sync().unwrap();
+
+        assert_ne!(
+            store.active_pack_id(),
+            sealed_id,
+            "ingest must have rotated past the original pack"
+        );
+        assert!(store.sealed_pack_ids().unwrap().contains(&sealed_id));
+
+        // Delete the now-sealed, now-orphaned pack directly (simulating GC
+        // having already repointed/removed every index entry for it).
+        store.invalidate_pack_handle(sealed_id);
+        store.delete_pack(sealed_id).unwrap();
+
+        let idx_path = dir.path().join(format!("pack-{:08x}.idx", sealed_id.0));
+        let spk_path = dir.path().join(format!("pack-{:08x}.spk", sealed_id.0));
+        assert!(!idx_path.exists());
+        assert!(!spk_path.exists());
+
+        // Reopening must not resurrect the deleted pack's entries. Note: the
+        // in-memory index in `store` still has stale entries (GC would have
+        // repointed/removed them via ShardedIndex before calling delete_pack
+        // in the real flow) — so we verify via a fresh `open()`, the actual
+        // recovery-invariant surface.
+        drop(store);
+        let store2 = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+        assert!(
+            store2
+                .sealed_pack_ids()
+                .unwrap()
+                .iter()
+                .all(|&id| id != sealed_id),
+            "deleted pack must not reappear after reopen"
+        );
+        for hash in &hashes {
+            assert!(
+                store2.get(hash).unwrap().is_none(),
+                "entries from the deleted pack must not resurrect on reopen"
+            );
+        }
+    }
+
+    // ── Test 19: scan_pack matches ingest outcomes ────────────────────────────
+
+    #[test]
+    fn scan_pack_matches_ingest_outcomes() {
+        let dir = TempDir::new().unwrap();
+        let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+
+        let pages = make_unique_pages(7);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        let outcomes = store.ingest(&page_refs).unwrap();
+        store.sync().unwrap();
+
+        // Force the active pack to seal so scan_pack (sealed-pack API) can
+        // read it.
+        let pack_id = store.rotate_active().unwrap();
+        // rotate_active only rotates if non-empty; the pack we just wrote to
+        // is the *previous* active id, which is now sealed. Determine it via
+        // sealed_pack_ids since we ingested a fresh store (single pack).
+        let sealed = store.sealed_pack_ids().unwrap();
+        assert_eq!(sealed.len(), 1, "expected exactly one sealed pack");
+        let sealed_id = sealed[0];
+        assert_ne!(sealed_id, pack_id);
+
+        let scanned = store.scan_pack(sealed_id).unwrap();
+        assert_eq!(scanned.len(), outcomes.len());
+
+        let mut scanned_hashes: Vec<PageHash> = scanned.iter().map(|(_, h)| *h).collect();
+        let mut outcome_hashes: Vec<PageHash> = outcomes.iter().map(|o| o.hash).collect();
+        scanned_hashes.sort_by_key(|h| *h.as_bytes());
+        outcome_hashes.sort_by_key(|h| *h.as_bytes());
+        assert_eq!(scanned_hashes, outcome_hashes);
+
+        // Offsets from scan_pack must match the offsets ingest reported.
+        for (offset, hash) in &scanned {
+            let outcome = outcomes.iter().find(|o| o.hash == *hash).unwrap();
+            assert_eq!(outcome.loc.offset, *offset);
+            assert_eq!(outcome.loc.pack, sealed_id);
+        }
+    }
+
+    // ── Test 20: read_record round-trips and rejects a wrong hash ────────────
+
+    #[test]
+    fn read_record_round_trip_and_hash_check() {
+        let dir = TempDir::new().unwrap();
+        let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
+
+        let pages = make_unique_pages(4);
+        let page_refs: Vec<&[u8; PAGE_SIZE]> = pages.iter().map(|p| p.as_ref()).collect();
+        let outcomes = store.ingest(&page_refs).unwrap();
+        store.sync().unwrap();
+
+        // Seal the pack so read_record (which goes through the sealed-pack
+        // read-cache path) can be exercised.
+        store.rotate_active().unwrap();
+        let sealed_id = store.sealed_pack_ids().unwrap()[0];
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let data = store
+                .read_record(sealed_id, outcome.loc.offset, &outcome.hash)
+                .unwrap();
+            assert_eq!(data.as_ref(), pages[i].as_ref());
+        }
+
+        // Wrong hash at a valid offset must be rejected.
+        let target = &outcomes[0];
+        let wrong_hash = PageHash::from_bytes([0xEE; 32]);
+        let result = store.read_record(sealed_id, target.loc.offset, &wrong_hash);
+        assert!(
+            result.is_err(),
+            "read_record must reject a mismatched hash, got: {:?}",
             result
         );
     }

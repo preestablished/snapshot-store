@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enable crash-injection failpoints (see actor.rs `fail_point!` shim).
+# Mirrors snapstore-store's failpoints feature; never enabled in release builds.
+failpoints = ["dep:fail"]
+
 [dependencies]
 snapstore-types = { path = "../snapstore-types" }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -11,6 +16,9 @@ thiserror = "2"
 crossbeam-channel = "0.5"
 blake3 = "1"
 uuid = { version = "1", features = ["v4"] }
+
+# Optional failpoint runtime (arming via FAILPOINTS env var).
+fail = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

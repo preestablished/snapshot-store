@@ -32,9 +32,9 @@ jobs:
         working-directory: repo
       # Failpoints feature must also stay lint-clean and green (M6 harness
       # builds with it; it is never enabled in release builds).
-      - run: cargo clippy -p snapstore-crash -p snapstore-store -p snapstore-pagestore --all-targets --features failpoints -- -D warnings
+      - run: cargo clippy -p snapstore-crash -p snapstore-store -p snapstore-pagestore -p snapstore-meta --all-targets --features failpoints -- -D warnings
         working-directory: repo
-      - run: cargo test -p snapstore-store -p snapstore-crash --features failpoints
+      - run: cargo test -p snapstore-store -p snapstore-crash -p snapstore-meta --features failpoints
         working-directory: repo
 
   # M6 PR smoke: randomized kill cycles + one full failpoint-matrix pass

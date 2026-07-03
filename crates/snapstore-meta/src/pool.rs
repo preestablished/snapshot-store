@@ -1,6 +1,6 @@
 use crate::error::MetaError;
 use crate::schema::open_reader;
-use crate::types::{NodeRow, PinRow, QueryFilter, QueryOrder, StatsRow};
+use crate::types::{GcStateRow, NodeRow, PinRow, QueryFilter, QueryOrder, StatsRow, TombstoneRow};
 use rusqlite::{params, Connection, OptionalExtension};
 use snapstore_types::{ExperimentId, LogId, NodeId, NodeStatus, SnapshotRef};
 use std::path::{Path, PathBuf};
@@ -295,6 +295,77 @@ pub fn list_pins(conn: &Connection) -> Result<Vec<PinRow>, MetaError> {
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(MetaError::from)
+}
+
+/// All distinct snapshot_refs that are GC roots: every `nodes.snapshot_ref`
+/// (ALL statuses — PRUNED-but-unreaped rows are conservatively live) plus
+/// every `pins.snapshot_ref`.  A single `UNION` query is one read
+/// statement, which in WAL mode observes one consistent point-in-time
+/// snapshot — no explicit `BEGIN` needed.
+pub fn gc_root_refs(conn: &Connection) -> Result<Vec<SnapshotRef>, MetaError> {
+    let mut stmt = conn.prepare(
+        "SELECT snapshot_ref FROM nodes
+         UNION
+         SELECT snapshot_ref FROM pins",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let blob: Vec<u8> = row.get(0)?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&blob[..32]);
+        Ok(SnapshotRef(arr))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MetaError::from)
+}
+
+/// Tombstoned subtree roots with `created_at <= horizon` (logical counter).
+pub fn list_tombstones(conn: &Connection, horizon: u64) -> Result<Vec<TombstoneRow>, MetaError> {
+    // Clamp so a caller-supplied `u64::MAX` ("no upper bound") doesn't
+    // bit-cast to a negative i64 and exclude every row.
+    let horizon_i64 = horizon.min(i64::MAX as u64) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT experiment_id, node_id, created_at FROM tombstones \
+         WHERE created_at <= ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![horizon_i64], |row| {
+        let experiment_id_str: String = row.get(0)?;
+        let node_id_raw: i64 = row.get(1)?;
+        let created_at: i64 = row.get(2)?;
+        let experiment_id = ExperimentId::new(experiment_id_str).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                0,
+                "experiment_id".into(),
+                rusqlite::types::Type::Text,
+            )
+        })?;
+        Ok(TombstoneRow {
+            experiment_id,
+            node_id: NodeId(node_id_raw as u64),
+            created_at: created_at as u64,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MetaError::from)
+}
+
+/// Persisted M7 GC cycle state (the `gc_state` singleton row).
+pub fn gc_state(conn: &Connection) -> Result<GcStateRow, MetaError> {
+    conn.query_row(
+        "SELECT cycles_total, last_fence_counter, last_finished_at, last_freed_bytes \
+         FROM gc_state WHERE id=1",
+        [],
+        |row| {
+            let cycles_total: i64 = row.get(0)?;
+            let last_fence_counter: i64 = row.get(1)?;
+            let last_finished_at: i64 = row.get(2)?;
+            let last_freed_bytes: i64 = row.get(3)?;
+            Ok(GcStateRow {
+                cycles_total: cycles_total as u64,
+                last_fence_counter: last_fence_counter as u64,
+                last_finished_at: last_finished_at as u64,
+                last_freed_bytes: last_freed_bytes as u64,
+            })
+        },
+    )
+    .map_err(MetaError::from)
 }
 
 pub fn stats(

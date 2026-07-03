@@ -1736,6 +1736,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "crossbeam-channel",
+ "fail",
  "rusqlite",
  "snapstore-types",
  "tempfile",
@@ -1807,6 +1808,7 @@ dependencies = [
  "bytes",
  "criterion",
  "fail",
+ "parking_lot",
  "snapstore-manifest",
  "snapstore-pagestore",
  "snapstore-testgen",

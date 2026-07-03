@@ -39,6 +39,9 @@ macro_rules! fail_point {
         fail::fail_point!($name);
     };
 }
+pub(crate) use fail_point;
+
+pub mod gc;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -257,6 +260,51 @@ impl FlattenCache {
             self.entries.pop_back();
         }
     }
+
+    /// Drop the cached flatten result for `r`, if any.  Called by
+    /// `delete_manifest` so a swept ref cannot serve stale entries.
+    fn remove(&mut self, r: &SnapshotRef) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == r) {
+            self.entries.remove(pos);
+        }
+    }
+}
+
+// ── GC epoch state (M7) ───────────────────────────────────────────────────────
+
+/// Per-cycle state installed by `begin_gc_epoch`.
+///
+/// `late_roots` is the race-closing channel between concurrent commits /
+/// registrations and the sweep: every ref registered while the epoch is
+/// active lands here *before* it is validated, and the sweep drains it
+/// under the `gc_commit_gate` write lock before any irreversible step
+/// (index-entry removal, manifest unlink).  See
+/// `.agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md` §1.
+struct GcEpochState {
+    late_roots: Vec<SnapshotRef>,
+}
+
+/// Proof-of-lock token: holding one means the `gc_commit_gate` read lock
+/// is held.  `register_live_ref` demands it so the
+/// register→validate→publish window is provably fence-serialized.
+pub struct CommitGate<'a>(#[allow(dead_code)] parking_lot::RwLockReadGuard<'a, ()>);
+
+/// Proof-of-lock token for the write side (sweep finalize instants).
+pub struct SweepGate<'a>(#[allow(dead_code)] parking_lot::RwLockWriteGuard<'a, ()>);
+
+/// Fence recorded by `begin_gc_epoch`.
+#[derive(Debug, Clone, Copy)]
+pub struct GcFence {
+    pub fence_pack: snapstore_types::PackId,
+}
+
+/// Errors from `begin_gc_epoch`.
+#[derive(Debug)]
+pub enum GcEpochError<E> {
+    /// An epoch is already active (R4: GC never runs concurrently with itself).
+    AlreadyRunning,
+    /// The caller's root-snapshot closure failed; the epoch was rolled back.
+    Roots(E),
 }
 
 // ── SnapshotStore ─────────────────────────────────────────────────────────────
@@ -271,10 +319,16 @@ pub struct SnapshotStore {
     manifests_dir: PathBuf,
     tmp_dir: PathBuf,
     gc: Arc<GroupCommit>,
-    /// Stub read-lock for every commit; write side taken by M7 mark fence /
-    /// M9 backup consistency point (ARCHITECTURE.md §4.5 R3).  One line now
-    /// avoids hot-path surgery under M7 pressure.
-    gc_commit_gate: std::sync::RwLock<()>,
+    /// R3 commit gate: every commit (and every live-ref registration)
+    /// holds the read side across validate→publish; the M7 mark fence and
+    /// per-pack/per-batch sweep finalizes take the write side.
+    /// parking_lot: a GC panic under the write lock (failpoints run as
+    /// panics) must not poison the gate and brick all commits.
+    gc_commit_gate: parking_lot::RwLock<()>,
+    /// Some(..) while a GC cycle is running (M7).  Guarded by its own
+    /// mutex, but all mutations happen with defined ordering relative to
+    /// `gc_commit_gate` — see `register_live_ref` / `drain_late_roots`.
+    gc_epoch: Mutex<Option<GcEpochState>>,
     flatten_cache: Mutex<FlattenCache>,
     /// Maintained counters; recomputed at open() by walking manifests/.
     manifests_total: std::sync::atomic::AtomicU64,
@@ -318,7 +372,8 @@ impl SnapshotStore {
             manifests_dir,
             tmp_dir,
             gc: Arc::new(GroupCommit::new()),
-            gc_commit_gate: std::sync::RwLock::new(()),
+            gc_commit_gate: parking_lot::RwLock::new(()),
+            gc_epoch: Mutex::new(None),
             flatten_cache: Mutex::new(FlattenCache::new(opts.flatten_cache_entries)),
             manifests_total: std::sync::atomic::AtomicU64::new(manifests_total),
             logical_page_bytes: std::sync::atomic::AtomicU64::new(logical_page_bytes),
@@ -348,8 +403,15 @@ impl SnapshotStore {
     /// 6. Atomic write to manifests/<shard>/<hex>.spm via tmp/ + fsync + rename
     ///    + parent-dir fsync.  Content-addressed ⇒ idempotent on duplicate.
     pub fn put_snapshot(&self, container: &[u8]) -> Result<SnapshotRef, PutError> {
-        // Step 1 — decode and validate.
+        // Step 1 — decode and validate (lock-free).
         let manifest = Manifest::decode(container)?;
+
+        // R3 + M7 race protocol: hold the commit gate (read side) across
+        // parent check → presence check → durability → publish →
+        // registration, so a GC finalize (write side) can never interleave
+        // with this commit's validate-then-publish window.  See
+        // .agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md §1.
+        let gate = self.commit_gate();
 
         // Step 2 — delta parent checks.
         if manifest.delta {
@@ -377,19 +439,12 @@ impl SnapshotStore {
             return Err(PutError::MissingPages(missing));
         }
 
-        // Step 4 — group-commit durability barrier.
+        // Step 4 — group-commit durability barrier (still under the gate:
+        // the flusher never touches the gate, so no lock-order inversion;
+        // the fence write acquisition simply waits out in-flight commits
+        // including their fdatasync).
         let gc = Arc::clone(&self.gc);
         gc.barrier(|| self.pages.sync())?;
-
-        // Step 5 — gc_commit_gate read lock (no-op stub until M7/M9).
-        // ARCHITECTURE.md §4.5 R3: the write side is taken by the mark fence
-        // (M7) and backup consistency point (M9); acquiring the read lock here
-        // ensures that when either of those takes the write side all in-flight
-        // commits finish before the fence proceeds.
-        let _gate = self
-            .gc_commit_gate
-            .read()
-            .map_err(|_| std::io::Error::other("gc_commit_gate poisoned"))?;
 
         // Compute the SnapshotRef from the byte-identical container.
         let snap_ref = Manifest::snapshot_ref(container);
@@ -400,8 +455,19 @@ impl SnapshotStore {
         let shard_dir = self.manifests_dir.join(shard);
         let spm_path = shard_dir.join(format!("{}.spm", hex));
 
-        // Idempotent: if the file exists (content-addressed), return early.
+        // Idempotent: if the file exists (content-addressed), return early —
+        // but registration is still mandatory: a blind-retry re-put of a
+        // manifest the running GC cycle has doomed must either protect it
+        // (registration drained before the sweep's finalize) or fail so the
+        // client re-puts the collected pages.  Silently acking would
+        // resurrect a dangling ref (review finding A3).
         if spm_path.exists() {
+            self.register_live_ref(&gate, &snap_ref)
+                .map_err(|e| match e {
+                    StoreError::MissingPage(h) => PutError::MissingPages(vec![h]),
+                    StoreError::NotFound => PutError::UnknownParent(snap_ref.clone()),
+                    other => PutError::Io(std::io::Error::other(other.to_string())),
+                })?;
             return Ok(snap_ref);
         }
 
@@ -443,6 +509,18 @@ impl SnapshotStore {
             manifest.guest_ram_bytes,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Register the freshly published ref while still under the gate.
+        // Outside a GC epoch this is a cheap existence check; during one it
+        // joins late_roots (protecting the manifest and, for a delta, the
+        // parent chain whose pages may live in packs the sweep is eyeing)
+        // and validates the full closure.
+        self.register_live_ref(&gate, &snap_ref)
+            .map_err(|e| match e {
+                StoreError::MissingPage(h) => PutError::MissingPages(vec![h]),
+                StoreError::NotFound => PutError::UnknownParent(snap_ref.clone()),
+                other => PutError::Io(std::io::Error::other(other.to_string())),
+            })?;
 
         Ok(snap_ref)
     }
@@ -549,8 +627,11 @@ impl SnapshotStore {
     ///
     /// Used by the server layer to validate `snapshot_ref` before calling
     /// `MetaDb::create_node` (API.md §1.4 NOT_FOUND rule).  Manifests are
-    /// immutable-once-present (content-addressed write-once), so a `true`
-    /// return here is a permanent guarantee — no TOCTOU concern.
+    /// content-addressed write-once, but since M7 they are no longer
+    /// immutable-once-present: GC's manifest sweep may unlink refs that are
+    /// not protected roots.  A `true` return is therefore only durable for
+    /// refs registered via `register_live_ref` under the commit gate
+    /// (see .agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md §1).
     pub fn has_manifest(&self, r: &SnapshotRef) -> bool {
         let hex = ref_to_hex(r);
         let shard = &hex[..2];
@@ -593,6 +674,206 @@ impl SnapshotStore {
         Ok(refs)
     }
 
+    // ── GC epoch / commit gate (M7) ──────────────────────────────────────────
+
+    /// Acquire the commit gate (read side).  Held by every commit and
+    /// every live-ref registration across its validate→publish window.
+    pub fn commit_gate(&self) -> CommitGate<'_> {
+        CommitGate(self.gc_commit_gate.read())
+    }
+
+    /// Acquire the sweep gate (write side).  Held by GC finalize instants:
+    /// index repoint/remove batches and manifest-unlink batches.  Blocks
+    /// until in-flight commits (read holders) finish; blocks new ones.
+    pub fn sweep_gate(&self) -> SweepGate<'_> {
+        SweepGate(self.gc_commit_gate.write())
+    }
+
+    /// Register `r` as live and validate its full dependency closure.
+    ///
+    /// MUST be called with the commit gate held (the `_gate` token proves
+    /// it).  Semantics:
+    ///
+    /// - **No epoch active:** no sweep can start while the gate is held
+    ///   (the fence takes the write side), so a simple existence check is
+    ///   stable through the caller's critical section.  O(1).
+    /// - **Epoch active:** append `r` to the epoch's late-roots FIRST
+    ///   (no TOCTOU: the sweep drains late roots under the write lock
+    ///   before any irreversible step, so a ref registered before a drain
+    ///   is protected, and one registered after observes the
+    ///   post-finalize state below and fails cleanly), then walk the full
+    ///   manifest chain verifying every chain manifest decodes and every
+    ///   referenced page hash is present.  Any miss → error, and the
+    ///   caller must fail its operation (CreateNode → NOT_FOUND,
+    ///   Pin → FAILED_PRECONDITION, put_snapshot → MissingPages).
+    pub fn register_live_ref(
+        &self,
+        _gate: &CommitGate<'_>,
+        r: &SnapshotRef,
+    ) -> Result<(), StoreError> {
+        let epoch_active = {
+            let mut ep = self.gc_epoch.lock().unwrap();
+            match ep.as_mut() {
+                Some(state) => {
+                    state.late_roots.push(r.clone());
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if !epoch_active {
+            return if self.has_manifest(r) {
+                Ok(())
+            } else {
+                Err(StoreError::NotFound)
+            };
+        }
+
+        self.validate_closure(r)
+    }
+
+    /// Walk `r`'s manifest chain; verify every manifest decodes and every
+    /// page hash named anywhere in the chain is present in the pagestore.
+    fn validate_closure(&self, r: &SnapshotRef) -> Result<(), StoreError> {
+        const MAX_CHAIN: usize = 4096;
+        let mut cursor = r.clone();
+        let mut depth = 0usize;
+        loop {
+            if depth >= MAX_CHAIN {
+                return Err(StoreError::ChainDepthExceeded);
+            }
+            let bytes = self.read_manifest_bytes(&cursor)?;
+            let m = Manifest::decode(&bytes)?;
+            let hashes: Vec<PageHash> = m.entries.iter().map(|e| e.page_hash).collect();
+            let present = self.pages.contains_batch(&hashes)?;
+            if let Some(pos) = present.iter().position(|ok| !ok) {
+                return Err(StoreError::MissingPage(hashes[pos]));
+            }
+            if m.delta {
+                cursor = m.parent.expect("delta must have parent");
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Begin a GC epoch (the mark fence, R3).
+    ///
+    /// Takes the gate write lock for the fence instant; inside it,
+    /// records `fence_pack`, installs the epoch state, and runs the
+    /// caller's `snapshot_roots` closure (the meta root-set read — passed
+    /// in so this crate stays meta-free).  Commits hold the read side
+    /// across validate→publish, so no manifest can publish between the
+    /// root snapshot and the fence record.
+    pub fn begin_gc_epoch<R, E>(
+        &self,
+        snapshot_roots: impl FnOnce() -> Result<R, E>,
+    ) -> Result<(GcFence, R), GcEpochError<E>> {
+        let _fence = self.gc_commit_gate.write();
+
+        let fence_pack = self.pages.active_pack_id();
+        {
+            let mut ep = self.gc_epoch.lock().unwrap();
+            if ep.is_some() {
+                return Err(GcEpochError::AlreadyRunning);
+            }
+            *ep = Some(GcEpochState {
+                late_roots: Vec::new(),
+            });
+        }
+
+        match snapshot_roots() {
+            Ok(roots) => Ok((GcFence { fence_pack }, roots)),
+            Err(e) => {
+                self.end_gc_epoch();
+                Err(GcEpochError::Roots(e))
+            }
+        }
+    }
+
+    /// End the GC epoch.  Idempotent; must run on every exit path of a
+    /// cycle (the orchestrator wraps it in a drop guard).
+    pub fn end_gc_epoch(&self) {
+        let mut ep = self.gc_epoch.lock().unwrap();
+        *ep = None;
+    }
+
+    /// Drain the refs registered since the last drain.  MUST be called
+    /// under the sweep gate (write side) — the token proves it — so the
+    /// emptiness check is race-free against registrations, which hold the
+    /// read side.
+    pub fn drain_late_roots(&self, _gate: &SweepGate<'_>) -> Vec<SnapshotRef> {
+        let mut ep = self.gc_epoch.lock().unwrap();
+        match ep.as_mut() {
+            Some(state) => std::mem::take(&mut state.late_roots),
+            None => Vec::new(),
+        }
+    }
+
+    // ── delete_manifest ──────────────────────────────────────────────────────
+
+    /// Delete a stored manifest (M7 GC manifest sweep).
+    ///
+    /// Steps: read `guest_ram_bytes` from the header (for the counter
+    /// decrement), unlink the `.spm`, fsync the shard directory, drop the
+    /// flatten-cache entry, decrement `manifests_total` /
+    /// `logical_page_bytes`.  Idempotent: returns `Ok(false)` if the file
+    /// is already absent.
+    ///
+    /// GC-only: callers must hold the sweep's ordering obligations
+    /// (a doomed ref is unlinked only under the gc_commit_gate write lock
+    /// after the late-roots drain — 02-gc-engine.md §6).
+    pub fn delete_manifest(&self, r: &SnapshotRef) -> Result<bool, StoreError> {
+        let hex = ref_to_hex(r);
+        let shard = &hex[..2];
+        let shard_dir = self.manifests_dir.join(shard);
+        let path = shard_dir.join(format!("{}.spm", hex));
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        // Counter input before the unlink; a corrupt header still deletes
+        // (recovery owns corrupt files) but decrements only manifests_total.
+        let grb = read_guest_ram_bytes(&path).unwrap_or(0);
+
+        fail_point!("gc-manifest-unlink");
+        fs::remove_file(&path)?;
+        {
+            let dir_file = File::open(&shard_dir)?;
+            dir_file.sync_all()?;
+        }
+
+        {
+            let mut cache = self.flatten_cache.lock().unwrap();
+            cache.remove(r);
+        }
+
+        self.manifests_total
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut lb = self
+            .logical_page_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Saturating decrement via CAS loop (fetch_sub would wrap on a
+        // counter that under-counted a corrupt header at open()).
+        loop {
+            let next = lb.saturating_sub(grb);
+            match self.logical_page_bytes.compare_exchange_weak(
+                lb,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => lb = cur,
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Maintained counters for metrics / Stats.
     ///
     /// Returns `(manifests_total, logical_page_bytes)`.
@@ -617,7 +898,7 @@ impl SnapshotStore {
     /// the expected ref and the footer stored in the file.  This catches:
     /// - payload corruption (body bytes changed → re-hash diverges from `r`)
     /// - footer corruption (last 32 bytes changed → stored footer ≠ `r`)
-    fn read_manifest_bytes(&self, r: &SnapshotRef) -> Result<Vec<u8>, StoreError> {
+    pub(crate) fn read_manifest_bytes(&self, r: &SnapshotRef) -> Result<Vec<u8>, StoreError> {
         let hex = ref_to_hex(r);
         let shard = &hex[..2];
         let path = self.manifests_dir.join(shard).join(format!("{}.spm", hex));
@@ -1391,6 +1672,58 @@ mod tests {
         assert_eq!(lb, grb, "logical_page_bytes == guest_ram_bytes");
     }
 
+    // ── Test 13: delete_manifest (M7 GC sweep primitive) ──────────────────────
+
+    #[test]
+    fn delete_manifest_removes_and_decrements() {
+        #[cfg(feature = "failpoints")]
+        let _fp_guard = fp_read_guard();
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+
+        let guest = SyntheticGuest::new(13, small_profile(8));
+        let grb = 8 * PAGE_SIZE as u64;
+        ingest_guest(&store, &guest);
+        let pairs: Vec<(u64, &[u8; PAGE_SIZE])> = guest.pages().collect();
+        let c = build_full_container(grb, &pairs, empty_blob());
+        let r = store.put_snapshot(&c).unwrap();
+
+        // Warm the flatten cache so remove() has something to drop.
+        let _ = store
+            .resolve_pages(&r, None, true)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let (cnt_before, lb_before) = store.manifest_count_and_logical_bytes();
+        assert_eq!(cnt_before, 1);
+        assert_eq!(lb_before, grb);
+
+        assert!(
+            store.delete_manifest(&r).unwrap(),
+            "first delete returns true"
+        );
+        assert!(!store.has_manifest(&r));
+        assert!(matches!(store.get_snapshot(&r), Err(StoreError::NotFound)));
+
+        let (cnt_after, lb_after) = store.manifest_count_and_logical_bytes();
+        assert_eq!(cnt_after, 0);
+        assert_eq!(lb_after, 0);
+
+        // Idempotent.
+        assert!(
+            !store.delete_manifest(&r).unwrap(),
+            "second delete returns false"
+        );
+
+        // Counters re-derive consistently after reopen.
+        drop(store);
+        let store2 = SnapshotStore::open(dir.path()).unwrap();
+        let (cnt2, lb2) = store2.manifest_count_and_logical_bytes();
+        assert_eq!(cnt2, 0);
+        assert_eq!(lb2, 0);
+    }
+
     // ── Failpoint smoke test (WI5) ────────────────────────────────────────────
     //
     // Serialization note: failpoints in the `fail` 0.5 crate are process-global.
@@ -1416,7 +1749,7 @@ mod tests {
     /// All tests that call `put_snapshot` should call this when the
     /// `failpoints` feature is active.
     #[cfg(feature = "failpoints")]
-    fn fp_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    pub(crate) fn fp_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
         FP_SERIALIZE
             .get_or_init(|| std::sync::RwLock::new(()))
             .read()

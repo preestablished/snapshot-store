@@ -1,4 +1,4 @@
-use crate::types::{CreateNodeParams, NodeUpdate, QueryFilter, QueryOrder};
+use crate::types::{CreateNodeParams, GcStateRow, NodeUpdate, QueryFilter, QueryOrder};
 use crate::{MetaDb, MetaError};
 use snapstore_types::{ExperimentId, LogId, NodeId, NodeStatus, SnapshotRef};
 use std::sync::Arc;
@@ -1127,4 +1127,321 @@ fn stats_per_experiment() {
     assert_eq!(s.exp_nodes_expanded, 1);
     assert_eq!(s.exp_nodes_goal, 1);
     assert_eq!(s.exp_max_depth, 2);
+}
+
+// ---------------------------------------------------------------------------
+// M7 GC: gc_root_refs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gc_root_refs_includes_pins_and_all_statuses_and_dedups() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-gc-roots");
+    create_root(&db, &e, NodeStatus::Frontier); // snap(0xAA)
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    create_child(&db, &e, NodeId(2), NodeId::ROOT, 0x02);
+
+    // Prune node 2 — its snapshot_ref must still be a conservative root
+    // (PRUNED-but-unreaped).
+    db.prune_subtree(e.clone(), NodeId(2), false).unwrap();
+
+    // Pin a ref that duplicates node 1's snapshot_ref (dedup check) and one
+    // that is not referenced by any node at all.
+    db.pin(snap(0x01), None).unwrap();
+    let standalone_pin = snap(0xEE);
+    db.pin(standalone_pin.clone(), None).unwrap();
+
+    let roots = db.gc_root_refs().unwrap();
+    let root_bytes: std::collections::HashSet<[u8; 32]> = roots.iter().map(|r| r.0).collect();
+
+    assert_eq!(
+        roots.len(),
+        root_bytes.len(),
+        "gc_root_refs must be deduped"
+    );
+    assert!(root_bytes.contains(&snap(0xAA).0)); // root, Frontier
+    assert!(root_bytes.contains(&snap(0x01).0)); // node 1, Frontier + duplicate pin
+    assert!(root_bytes.contains(&snap(0x02).0)); // node 2, PRUNED — still a root
+    assert!(root_bytes.contains(&standalone_pin.0)); // pin with no node
+    assert_eq!(root_bytes.len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// M7 GC: list_tombstones
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_tombstones_respects_horizon() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-tombstone-horizon");
+    create_root(&db, &e, NodeStatus::Frontier);
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    create_child(&db, &e, NodeId(2), NodeId::ROOT, 0x02);
+
+    db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+    let after_first = db.list_tombstones(u64::MAX).unwrap();
+    assert_eq!(after_first.len(), 1);
+    let first_created_at = after_first[0].created_at;
+
+    db.prune_subtree(e.clone(), NodeId(2), false).unwrap();
+
+    // Horizon at exactly the first tombstone's created_at excludes the second.
+    let horizon_first_only = db.list_tombstones(first_created_at).unwrap();
+    assert_eq!(horizon_first_only.len(), 1);
+    assert_eq!(horizon_first_only[0].node_id, NodeId(1));
+
+    let horizon_all = db.list_tombstones(u64::MAX).unwrap();
+    assert_eq!(horizon_all.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// M7 GC: gc_state / set_gc_state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gc_state_defaults_are_zero() {
+    let (db, _dir) = open_tmp();
+    let s = db.gc_state().unwrap();
+    assert_eq!(s, GcStateRow::default());
+}
+
+#[test]
+fn set_gc_state_round_trips() {
+    let (db, _dir) = open_tmp();
+    let s = GcStateRow {
+        cycles_total: 7,
+        last_fence_counter: 42,
+        last_finished_at: 1_000,
+        last_freed_bytes: 65_536,
+    };
+    db.set_gc_state(s).unwrap();
+    let got = db.gc_state().unwrap();
+    assert_eq!(got, s);
+}
+
+// ---------------------------------------------------------------------------
+// M7 GC: reap_tombstone
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reap_deletes_subtree_and_tombstone_returns_count() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-basic");
+    create_root(&db, &e, NodeStatus::Frontier);
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    create_child(&db, &e, NodeId(2), NodeId(1), 0x02);
+    create_child(&db, &e, NodeId(3), NodeId(1), 0x03);
+
+    let pruned = db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+    assert_eq!(pruned, 3); // 1, 2, 3
+
+    let reaped = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(reaped, 3);
+
+    // Subtree rows gone.
+    assert!(db.get_node(&e, NodeId(1)).unwrap().is_none());
+    assert!(db.get_node(&e, NodeId(2)).unwrap().is_none());
+    assert!(db.get_node(&e, NodeId(3)).unwrap().is_none());
+    // Root untouched.
+    assert!(db.get_node(&e, NodeId::ROOT).unwrap().is_some());
+    // Tombstone row gone.
+    assert!(db.list_tombstones(u64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn reap_deletes_multi_level_subtree_single_statement() {
+    // Exercises the FK-ordering question directly: the subtree DELETE is one
+    // statement over multiple parent/child levels, relying on SQLite
+    // checking non-deferred FK constraints only once the whole statement
+    // completes (see reap_tombstone_impl's doc comment in actor.rs).
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-deep");
+    create_root(&db, &e, NodeStatus::Frontier);
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    create_child(&db, &e, NodeId(2), NodeId(1), 0x02);
+    create_child(&db, &e, NodeId(3), NodeId(2), 0x03);
+    create_child(&db, &e, NodeId(4), NodeId(3), 0x04);
+
+    let pruned = db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+    assert_eq!(pruned, 4); // 1,2,3,4 — a 4-level-deep chain
+
+    let reaped = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(reaped, 4);
+    for id in [1u64, 2, 3, 4] {
+        assert!(db.get_node(&e, NodeId(id)).unwrap().is_none(), "node {id}");
+    }
+}
+
+#[test]
+fn reap_is_idempotent() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-idem");
+    create_root(&db, &e, NodeStatus::Frontier);
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+
+    let first = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(first, 1);
+    let second = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(
+        second, 0,
+        "second reap of already-reaped subtree must be a no-op"
+    );
+}
+
+#[test]
+fn reap_aborts_on_non_pruned_descendant() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-abort");
+    create_root(&db, &e, NodeStatus::Frontier);
+    create_child(&db, &e, NodeId(1), NodeId::ROOT, 0x01);
+    create_child(&db, &e, NodeId(2), NodeId(1), 0x02);
+    db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+
+    // Simulate a prune/reap bug: flip a descendant back to a live status
+    // via the public update_nodes API (no PRUNED->live transition guard
+    // exists at that layer, so this reaches reap's defense-in-depth check).
+    db.update_nodes(
+        e.clone(),
+        vec![NodeUpdate {
+            node_id: NodeId(2),
+            status: Some(NodeStatus::Frontier),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    let res = db.reap_tombstone(&e, NodeId(1));
+    assert!(
+        matches!(res, Err(MetaError::InvalidArgument(_))),
+        "got {res:?}"
+    );
+
+    // Nothing was deleted — the whole reap transaction rolled back.
+    assert!(db.get_node(&e, NodeId(1)).unwrap().is_some());
+    assert!(db.get_node(&e, NodeId(2)).unwrap().is_some());
+    assert_eq!(db.list_tombstones(u64::MAX).unwrap().len(), 1);
+}
+
+#[test]
+fn reap_preserves_input_log_referenced_by_surviving_node() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-shared-log");
+    let (log_id, container) = make_log_container(b"shared payload");
+
+    // Root keeps a reference to the log and survives.
+    db.create_node(CreateNodeParams {
+        experiment_id: e.clone(),
+        node_id: NodeId::ROOT,
+        parent_node_id: None,
+        snapshot_ref: snap(0xAA),
+        input_log_id: Some(log_id),
+        inline_log_container: Some(container.clone()),
+        status: NodeStatus::Frontier,
+        score: None,
+        icount: 0,
+        virtual_ns: 0,
+        attrs: None,
+    })
+    .unwrap();
+
+    // Child references the same log_id and will be pruned + reaped.
+    db.create_node(CreateNodeParams {
+        experiment_id: e.clone(),
+        node_id: NodeId(1),
+        parent_node_id: Some(NodeId::ROOT),
+        snapshot_ref: snap(0x01),
+        input_log_id: Some(log_id),
+        inline_log_container: None, // already present from root's insert
+        status: NodeStatus::Frontier,
+        score: None,
+        icount: 0,
+        virtual_ns: 0,
+        attrs: None,
+    })
+    .unwrap();
+
+    db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+    let reaped = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(reaped, 1);
+
+    // The log is still referenced by root — must survive.
+    assert!(db.get_input_log(&log_id).unwrap().is_some());
+}
+
+#[test]
+fn reap_deletes_orphaned_input_log() {
+    let (db, _dir) = open_tmp();
+    let e = exp("exp-reap-orphan-log");
+    let (log_id, container) = make_log_container(b"orphan payload");
+
+    create_root(&db, &e, NodeStatus::Frontier);
+    db.create_node(CreateNodeParams {
+        experiment_id: e.clone(),
+        node_id: NodeId(1),
+        parent_node_id: Some(NodeId::ROOT),
+        snapshot_ref: snap(0x01),
+        input_log_id: Some(log_id),
+        inline_log_container: Some(container),
+        status: NodeStatus::Frontier,
+        score: None,
+        icount: 0,
+        virtual_ns: 0,
+        attrs: None,
+    })
+    .unwrap();
+
+    assert!(db.get_input_log(&log_id).unwrap().is_some());
+
+    db.prune_subtree(e.clone(), NodeId(1), false).unwrap();
+    let reaped = db.reap_tombstone(&e, NodeId(1)).unwrap();
+    assert_eq!(reaped, 1);
+
+    // No surviving node references log_id anymore — it must be gone.
+    assert!(db.get_input_log(&log_id).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Migration stepping (schema_version 1 -> 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn migration_steps_existing_v1_db_to_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta/tree.db");
+
+    // Open fresh — first-open path already lands at v2.
+    {
+        let db = MetaDb::open(&path).unwrap();
+        drop(db);
+    }
+
+    // Roll the on-disk DB back to a v1 fixture: schema_version=1, gc_state
+    // table dropped, its _migrations row removed.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "UPDATE meta SET schema_version=1 WHERE id=1; \
+             DELETE FROM _migrations WHERE id=2; \
+             DROP TABLE gc_state;",
+        )
+        .unwrap();
+    }
+
+    // Reopen — the version-stepping loop must apply 002_gc_state.sql and
+    // land back at schema_version=2 with gc_state readable.
+    let db = MetaDb::open(&path).unwrap();
+    let s = db.gc_state().unwrap();
+    assert_eq!(s, GcStateRow::default());
+}
+
+#[test]
+fn migration_first_open_lands_at_v2_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta/tree.db");
+    let db = MetaDb::open(&path).unwrap();
+    // gc_state must exist and be readable immediately — no manual stepping
+    // needed for a brand-new store.
+    let s = db.gc_state().unwrap();
+    assert_eq!(s, GcStateRow::default());
 }

@@ -35,7 +35,10 @@ mod tests;
 
 pub use error::MetaError;
 pub use pool::PathResult;
-pub use types::{CreateNodeParams, NodeRow, NodeUpdate, PinRow, QueryFilter, QueryOrder, StatsRow};
+pub use types::{
+    CreateNodeParams, GcStateRow, NodeRow, NodeUpdate, PinRow, QueryFilter, QueryOrder, StatsRow,
+    TombstoneRow,
+};
 
 use actor::{ActorCmd, WriterActor};
 use pool::ReadPool;
@@ -335,6 +338,45 @@ impl MetaDb {
         rx.recv().map_err(|_| MetaError::ActorDead)?
     }
 
+    /// Reap one tombstoned subtree: recursive CTE from `(experiment_id,
+    /// node_id)` over PRUNED rows, delete those node rows, delete
+    /// `input_logs` no longer referenced by any node, delete the tombstone
+    /// row. One transaction. Returns the number of node rows deleted.
+    ///
+    /// Idempotent: returns `Ok(0)` if the root row is already missing
+    /// (already reaped — safe under crash-retry). Aborts with
+    /// `MetaError::InvalidArgument` if any subtree row is not `PRUNED`
+    /// (defense in depth — never deletes live rows).
+    pub fn reap_tombstone(
+        &self,
+        experiment_id: &ExperimentId,
+        node_id: NodeId,
+    ) -> Result<u64, MetaError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.0
+            .sender
+            .send(ActorCmd::ReapTombstone {
+                experiment_id: experiment_id.clone(),
+                node_id,
+                reply: tx,
+            })
+            .map_err(|_| MetaError::ActorDead)?;
+        rx.recv().map_err(|_| MetaError::ActorDead)?
+    }
+
+    /// Overwrite the persisted GC cycle state (singleton `gc_state` row).
+    pub fn set_gc_state(&self, s: GcStateRow) -> Result<(), MetaError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.0
+            .sender
+            .send(ActorCmd::SetGcState {
+                state: s,
+                reply: tx,
+            })
+            .map_err(|_| MetaError::ActorDead)?;
+        rx.recv().map_err(|_| MetaError::ActorDead)?
+    }
+
     // -----------------------------------------------------------------------
     // Read operations (use the read pool directly)
     // -----------------------------------------------------------------------
@@ -398,6 +440,26 @@ impl MetaDb {
     /// List all pinned snapshot refs.
     pub fn list_pins(&self) -> Result<Vec<PinRow>, MetaError> {
         self.0.read_pool.with(pool::list_pins)
+    }
+
+    /// All distinct snapshot_refs that are GC roots: every `nodes.snapshot_ref`
+    /// (ALL statuses — PRUNED-but-unreaped rows are conservatively live) plus
+    /// every `pins.snapshot_ref`. Single read statement = point-in-time root
+    /// set (WAL snapshot isolation).
+    pub fn gc_root_refs(&self) -> Result<Vec<SnapshotRef>, MetaError> {
+        self.0.read_pool.with(pool::gc_root_refs)
+    }
+
+    /// Tombstoned subtree roots with `created_at <= horizon` (logical counter).
+    pub fn list_tombstones(&self, horizon: u64) -> Result<Vec<TombstoneRow>, MetaError> {
+        self.0
+            .read_pool
+            .with(|conn| pool::list_tombstones(conn, horizon))
+    }
+
+    /// Persisted GC cycle state.
+    pub fn gc_state(&self) -> Result<GcStateRow, MetaError> {
+        self.0.read_pool.with(pool::gc_state)
     }
 
     /// Return aggregate statistics.

@@ -197,7 +197,7 @@ async fn corrupt_cross_check_surfaces_mismatch() {
     let client = channel_client(&server).await;
 
     let pages: Vec<(u64, Vec<u8>)> = (0..4)
-        .map(|i| (i as u64, rand_page(0xBAD_C0DE, i)))
+        .map(|i| (i, rand_page(0xBAD_C0DE, i)))
         .collect();
 
     let result = client.put_pages(pages).await;

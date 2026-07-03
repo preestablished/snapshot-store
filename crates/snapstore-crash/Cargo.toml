@@ -17,6 +17,7 @@ failpoints = [
     "fail/failpoints",
     "snapstore-store/failpoints",
     "snapstore-pagestore/failpoints",
+    "snapstore-meta/failpoints",
 ]
 
 [dependencies]

@@ -186,6 +186,13 @@ impl PackWriter {
         self.pack_id
     }
 
+    /// Number of records appended so far (including buffered, not-yet-flushed
+    /// ones). Used by `PageStore::rotate_active` to skip rotation when the
+    /// active pack is empty, avoiding pack-id churn.
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
     /// Expose the underlying file for lock-free pread on the active pack.
     ///
     /// The caller must hold the `active` lock and must have called `flush_buf()`

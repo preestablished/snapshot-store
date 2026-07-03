@@ -56,6 +56,58 @@ impl ShardedIndex {
         guard.entry(hash).or_insert(loc);
     }
 
+    /// Repoint `hash` to `new_loc` iff its current location's pack matches
+    /// `expected_pack`. Returns true if repointed. Used by compaction: only
+    /// entries still pointing at the pack being compacted are moved (a
+    /// concurrent re-ingest may already have written a fresh copy elsewhere —
+    /// content-addressed, either copy is valid, keep the newer).
+    pub fn repoint_if_in_pack(
+        &self,
+        hash: &PageHash,
+        expected_pack: PackId,
+        new_loc: PageLoc,
+    ) -> bool {
+        let shard = shard_for(hash);
+        let mut guard = self.shards[shard].write();
+        match guard.get(hash) {
+            Some(loc) if loc.pack == expected_pack => {
+                guard.insert(*hash, new_loc);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove `hash` iff its current location's pack matches `expected_pack`.
+    /// Returns true if removed. Used by sweep for dropped (garbage) records.
+    pub fn remove_if_in_pack(&self, hash: &PageHash, expected_pack: PackId) -> bool {
+        let shard = shard_for(hash);
+        let mut guard = self.shards[shard].write();
+        match guard.get(hash) {
+            Some(loc) if loc.pack == expected_pack => {
+                guard.remove(hash);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// All (hash, loc) entries currently pointing into `pack`.
+    /// O(index) full-shard scan — same cost class as `write_sidecar`,
+    /// acceptable: GC-only, off the hot path.
+    pub fn entries_for_pack(&self, pack: PackId) -> Vec<(PageHash, PageLoc)> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read();
+            for (&hash, &loc) in guard.iter() {
+                if loc.pack == pack {
+                    out.push((hash, loc));
+                }
+            }
+        }
+        out
+    }
+
     /// Batch insert many entries.
     pub fn insert_batch(&self, entries: impl IntoIterator<Item = (PageHash, PageLoc)>) {
         // Group by shard to minimise lock acquisitions.
@@ -129,55 +181,8 @@ impl ShardedIndex {
 
     /// Write a sidecar `.idx` file for the given pack's entries.
     pub fn write_sidecar(&self, path: &Path, pack_id: PackId) -> Result<(), IndexError> {
-        // Collect all entries belonging to this pack.
-        let mut entries: Vec<(PageHash, PageLoc)> = Vec::new();
-        for shard in self.shards.iter() {
-            let guard = shard.read();
-            for (&hash, &loc) in guard.iter() {
-                if loc.pack == pack_id {
-                    entries.push((hash, loc));
-                }
-            }
-        }
-
-        // Sort by hash (lexicographic on the 32 bytes).
-        entries.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
-
-        // Encode.
-        const ENTRY_SIZE: usize = 44;
-        let entry_count = entries.len() as u32;
-        let mut buf = Vec::with_capacity(4 + entries.len() * ENTRY_SIZE + 4);
-
-        buf.write_all(&entry_count.to_le_bytes()).unwrap();
-        for (hash, loc) in &entries {
-            buf.write_all(hash.as_bytes()).unwrap();
-            buf.write_all(&loc.pack.0.to_le_bytes()).unwrap();
-            buf.write_all(&loc.offset.to_le_bytes()).unwrap();
-        }
-
-        // CRC over all preceding bytes.
-        let crc = crc32fast::hash(&buf);
-        buf.write_all(&crc.to_le_bytes()).unwrap();
-
-        // Atomic write: write to a temp file then rename.
-        let tmp_path = path.with_extension("idx.tmp");
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            file.write_all(&buf)?;
-            file.flush()?;
-            // Failpoint: after sidecar bytes written, before its fsync.
-            fail_point!("sidecar-write");
-            // Failpoint: immediately before sidecar fsync.
-            fail_point!("sidecar-fsync");
-            file.sync_data()?;
-        }
-        std::fs::rename(&tmp_path, path)?;
-
-        Ok(())
+        let entries = self.entries_for_pack(pack_id);
+        write_sidecar_entries(path, &entries)
     }
 
     /// Total number of entries across all shards.
@@ -201,6 +206,61 @@ impl Default for ShardedIndex {
 #[inline]
 fn shard_for(hash: &PageHash) -> usize {
     hash.as_bytes()[0] as usize
+}
+
+/// Write a sidecar `.idx` file for an explicit set of (hash, loc) entries.
+///
+/// Used both by `ShardedIndex::write_sidecar` (which selects entries by
+/// scanning the index for a given pack) and by GC pack publication
+/// (`GcPackWriter::seal_and_publish` in `ingest.rs`), which has no index
+/// entries to scan yet — at publish time the index still points every
+/// compacted hash at the OLD pack, so scanning the index for the NEW pack's
+/// entries would silently produce a CRC-valid EMPTY sidecar. Callers that
+/// already have the record list in hand (e.g. a pack writer's own append
+/// log) must pass it here directly.
+pub fn write_sidecar_entries(
+    path: &Path,
+    entries: &[(PageHash, PageLoc)],
+) -> Result<(), IndexError> {
+    // Sort by hash (lexicographic on the 32 bytes) for deterministic output.
+    let mut entries: Vec<(PageHash, PageLoc)> = entries.to_vec();
+    entries.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+
+    // Encode.
+    const ENTRY_SIZE: usize = 44;
+    let entry_count = entries.len() as u32;
+    let mut buf = Vec::with_capacity(4 + entries.len() * ENTRY_SIZE + 4);
+
+    buf.write_all(&entry_count.to_le_bytes()).unwrap();
+    for (hash, loc) in &entries {
+        buf.write_all(hash.as_bytes()).unwrap();
+        buf.write_all(&loc.pack.0.to_le_bytes()).unwrap();
+        buf.write_all(&loc.offset.to_le_bytes()).unwrap();
+    }
+
+    // CRC over all preceding bytes.
+    let crc = crc32fast::hash(&buf);
+    buf.write_all(&crc.to_le_bytes()).unwrap();
+
+    // Atomic write: write to a temp file then rename.
+    let tmp_path = path.with_extension("idx.tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(&buf)?;
+        file.flush()?;
+        // Failpoint: after sidecar bytes written, before its fsync.
+        fail_point!("sidecar-write");
+        // Failpoint: immediately before sidecar fsync.
+        fail_point!("sidecar-fsync");
+        file.sync_data()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+
+    Ok(())
 }
 
 // ── rebuild_from_pack ─────────────────────────────────────────────────────────
@@ -472,5 +532,143 @@ mod tests {
             assert_eq!(loc.pack, pack_id);
             assert_eq!(loc.offset, *expected_off);
         }
+    }
+
+    // ── Test 6: repoint_if_in_pack respects the expected_pack guard ──────────
+    #[test]
+    fn repoint_guard() {
+        let idx = ShardedIndex::new();
+        let h = make_hash(1);
+        let loc_a = make_loc(0, 10);
+        idx.insert(h, loc_a);
+
+        // Guard mismatch: expected_pack doesn't match current location's pack.
+        let loc_b = make_loc(9, 999);
+        assert!(!idx.repoint_if_in_pack(&h, PackId(1), loc_b));
+        assert_eq!(
+            idx.get(&h),
+            Some(loc_a),
+            "mismatched guard must not repoint"
+        );
+
+        // Guard match: repoint succeeds.
+        assert!(idx.repoint_if_in_pack(&h, PackId(0), loc_b));
+        assert_eq!(idx.get(&h), Some(loc_b), "matching guard must repoint");
+
+        // Now the pack changed to 9; repointing against the stale pack (0) fails.
+        let loc_c = make_loc(2, 5);
+        assert!(!idx.repoint_if_in_pack(&h, PackId(0), loc_c));
+        assert_eq!(idx.get(&h), Some(loc_b));
+
+        // Missing hash: no-op, returns false.
+        let missing = make_hash(200);
+        assert!(!idx.repoint_if_in_pack(&missing, PackId(0), loc_c));
+        assert_eq!(idx.get(&missing), None);
+    }
+
+    // ── Test 7: remove_if_in_pack respects the expected_pack guard ───────────
+    #[test]
+    fn remove_guard() {
+        let idx = ShardedIndex::new();
+        let h = make_hash(2);
+        let loc = make_loc(3, 40);
+        idx.insert(h, loc);
+
+        // Guard mismatch: must not remove.
+        assert!(!idx.remove_if_in_pack(&h, PackId(4)));
+        assert_eq!(idx.get(&h), Some(loc), "mismatched guard must not remove");
+
+        // Guard match: removes.
+        assert!(idx.remove_if_in_pack(&h, PackId(3)));
+        assert_eq!(idx.get(&h), None, "matching guard must remove");
+
+        // Already gone: no-op, returns false.
+        assert!(!idx.remove_if_in_pack(&h, PackId(3)));
+
+        // Missing hash entirely: no-op, returns false.
+        let missing = make_hash(201);
+        assert!(!idx.remove_if_in_pack(&missing, PackId(3)));
+    }
+
+    // ── Test 8: entries_for_pack filters correctly ────────────────────────────
+    #[test]
+    fn entries_for_pack_filters() {
+        let idx = ShardedIndex::new();
+        for i in 0u8..10 {
+            idx.insert(make_hash(i), make_loc(0, i as u64));
+        }
+        for i in 10u8..15 {
+            idx.insert(make_hash(i), make_loc(1, i as u64));
+        }
+
+        let pack0 = idx.entries_for_pack(PackId(0));
+        assert_eq!(pack0.len(), 10);
+        for (h, loc) in &pack0 {
+            assert_eq!(loc.pack, PackId(0));
+            assert!(idx.get(h).is_some());
+        }
+
+        let pack1 = idx.entries_for_pack(PackId(1));
+        assert_eq!(pack1.len(), 5);
+
+        let pack_empty = idx.entries_for_pack(PackId(99));
+        assert!(pack_empty.is_empty());
+    }
+
+    // ── Test 9: concurrent insert-vs-repoint of the same hash never loses it ──
+    //
+    // One thread repeatedly repoints an existing entry between pack A and pack
+    // B (guarded, so it only "wins" while the entry is still at the pack it
+    // expects); another thread races to insert the SAME hash concurrently
+    // (a no-op under first-writer-wins, since the entry already exists). The
+    // entry must remain present and valid (pointing at pack A or pack B) at
+    // the end — never vanish, and get() must never observe a torn/partial
+    // location.
+    #[test]
+    fn concurrent_insert_vs_repoint_never_loses_entry() {
+        let idx = Arc::new(ShardedIndex::new());
+        let h = make_hash(7);
+        let loc_a = make_loc(0, 111);
+        let loc_b = make_loc(1, 222);
+        idx.insert(h, loc_a);
+
+        let iterations = 2000usize;
+
+        let idx_repoint = Arc::clone(&idx);
+        let repoint_handle = std::thread::spawn(move || {
+            let mut current_pack = PackId(0);
+            let mut other_pack = PackId(1);
+            let mut other_loc = loc_b;
+            let mut current_loc = loc_a;
+            for _ in 0..iterations {
+                if idx_repoint.repoint_if_in_pack(&h, current_pack, other_loc) {
+                    std::mem::swap(&mut current_pack, &mut other_pack);
+                    std::mem::swap(&mut current_loc, &mut other_loc);
+                }
+            }
+        });
+
+        let idx_insert = Arc::clone(&idx);
+        let insert_handle = std::thread::spawn(move || {
+            for _ in 0..iterations {
+                // Racing insert of the same hash: first-writer-wins means this
+                // is a no-op whenever the entry already exists (it always
+                // does here), but it must never clobber a concurrent repoint.
+                idx_insert.insert(h, loc_a);
+            }
+        });
+
+        repoint_handle.join().unwrap();
+        insert_handle.join().unwrap();
+
+        // The entry must still be present and pointing at one of the two
+        // known-valid locations — never missing, never garbage.
+        let final_loc = idx.get(&h).expect("entry must never be lost");
+        assert!(
+            final_loc == loc_a || final_loc == loc_b,
+            "final location must be one of the valid locations, got {:?}",
+            final_loc
+        );
+        assert_eq!(idx.len(), 1, "no duplicate/ghost entries");
     }
 }

@@ -13,6 +13,10 @@ failpoints = [
     "fail/failpoints",
     "snapstore-pagestore/failpoints",
 ]
+# Test-only GC instrumentation: interleaving callbacks and deliberately
+# broken (sabotaged) cycles for the M7 property suite's negative proofs.
+# NEVER enabled in release builds.
+gc-test-hooks = []
 
 [dependencies]
 snapstore-types = { path = "../snapstore-types" }
@@ -20,6 +24,7 @@ snapstore-manifest = { path = "../snapstore-manifest" }
 snapstore-pagestore = { path = "../snapstore-pagestore" }
 blake3 = "1"
 bytes = "1"
+parking_lot = "0.12"
 thiserror = "2"
 fail = { version = "0.5", optional = true }
 
