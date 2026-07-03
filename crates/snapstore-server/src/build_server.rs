@@ -102,12 +102,19 @@ pub async fn run(
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
+    // Shared across TCP + UDS + the watermark auto-trigger task so all three
+    // contend on the same R4 latch (one GcRunner per store, not per
+    // listener) — see gc::GcRunner doc comment.
+    let gc_runner = Arc::new(crate::gc::GcRunner::new());
+
     // ── TCP transport ─────────────────────────────────────────────────────────
     let tcp_shutdown = shutdown_tx.subscribe();
     let svc_tcp = SnapshotStoreServer {
         store: Arc::clone(&store),
         meta: Arc::clone(&meta),
         metrics: Arc::clone(&metrics),
+        gc: Arc::clone(&gc_runner),
+        gc_config: config.gc.clone(),
     };
     // Use the primary health_svc for the TCP side.
     let tcp_handle = tokio::spawn(async move {
@@ -138,6 +145,8 @@ pub async fn run(
         store: Arc::clone(&store),
         meta: Arc::clone(&meta),
         metrics: Arc::clone(&metrics),
+        gc: Arc::clone(&gc_runner),
+        gc_config: config.gc.clone(),
     };
     let (_, health_svc_uds) = tonic_health::server::health_reporter();
     let uds_handle = tokio::spawn(async move {
@@ -189,6 +198,29 @@ pub async fn run(
     if config.page_channel_path.is_some() {
         tracing::warn!(
             "page_channel_path is set but this build is not Linux; page channel ignored"
+        );
+    }
+
+    // ── GC watermark auto-trigger (basic; polish is M9) ───────────────────────
+    // .agents/plans/phase3-m7-gc-exit-gate/03-server-wiring.md §5. `nix` is a
+    // Linux-only dependency (see Cargo.toml), so this task only exists on
+    // Linux; on other targets `gc.auto = true` is silently a no-op.
+    #[cfg(target_os = "linux")]
+    if config.gc.auto {
+        spawn_gc_auto_trigger(
+            config.data_root.clone(),
+            config.gc.clone(),
+            Arc::clone(&store),
+            Arc::clone(&meta),
+            Arc::clone(&gc_runner),
+            Arc::clone(&metrics),
+            shutdown_tx.subscribe(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    if config.gc.auto {
+        tracing::warn!(
+            "gc.auto is set but this build is not Linux (statvfs unavailable); auto-trigger disabled"
         );
     }
 
@@ -265,10 +297,13 @@ pub async fn serve_for_tests_with_metrics(
         )
         .await;
 
+    let gc_runner = Arc::new(crate::gc::GcRunner::new());
     let svc_impl = SnapshotStoreServer {
         store: Arc::clone(&store),
-        meta,
+        meta: Arc::clone(&meta),
         metrics: Arc::clone(&metrics),
+        gc: Arc::clone(&gc_runner),
+        gc_config: config.gc.clone(),
     };
 
     // Remove stale socket.
@@ -287,6 +322,19 @@ pub async fn serve_for_tests_with_metrics(
 
     let (bcast_tx, uds_rx) = tokio::sync::broadcast::channel::<()>(1);
     let http_rx = bcast_tx.subscribe();
+
+    #[cfg(target_os = "linux")]
+    if config.gc.auto {
+        spawn_gc_auto_trigger(
+            config.data_root.clone(),
+            config.gc.clone(),
+            Arc::clone(&store),
+            Arc::clone(&meta),
+            Arc::clone(&gc_runner),
+            Arc::clone(&metrics),
+            bcast_tx.subscribe(),
+        );
+    }
 
     tokio::spawn(async move {
         let _ = shutdown_rx.await;
@@ -441,4 +489,104 @@ async fn http_handler(
             .body("not found\n".to_owned())
             .unwrap()),
     }
+}
+
+// ── GC watermark auto-trigger (Linux only) ────────────────────────────────────
+
+/// Spawn the watermark auto-trigger task: every `gc.check_interval_secs`,
+/// `statvfs(data_root)`; when used% >= `gc.trigger_disk_pct`, run a cycle
+/// through the shared `GcRunner` (skipping silently on `AlreadyRunning`).
+/// Subscribes to the internal shutdown **broadcast** channel to exit
+/// cleanly (03-server-wiring.md §5 — do not consume the handle's oneshot).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_gc_auto_trigger(
+    data_root: PathBuf,
+    gc_cfg: crate::config::GcConfig,
+    store: Arc<snapstore_store::SnapshotStore>,
+    meta: Arc<snapstore_meta::MetaDb>,
+    runner: Arc<crate::gc::GcRunner>,
+    metrics: Arc<Metrics>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            gc_cfg.check_interval_secs.max(1),
+        ));
+        // The first tick fires immediately; skip it so we don't run a cycle
+        // the instant the server starts.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.recv() => {
+                    break;
+                }
+            }
+
+            let used_pct = match nix::sys::statvfs::statvfs(data_root.as_path()) {
+                Ok(s) => {
+                    let block_size: u64 = s.block_size();
+                    let total: u64 = s.blocks() * block_size;
+                    let free: u64 = s.blocks_available() * block_size;
+                    if total == 0 {
+                        0
+                    } else {
+                        (((total - free) as u128 * 100) / total as u128) as u8
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, path = %data_root.display(), "gc auto-trigger: statvfs failed");
+                    continue;
+                }
+            };
+
+            if used_pct < gc_cfg.trigger_disk_pct {
+                continue;
+            }
+
+            tracing::info!(
+                used_pct,
+                threshold = gc_cfg.trigger_disk_pct,
+                "gc auto-trigger: disk watermark reached, running cycle"
+            );
+
+            let opts = crate::gc::GcOpts {
+                compact_threshold: gc_cfg.compact_threshold,
+                rotate_active_first: false,
+                tombstone_grace_cycles: gc_cfg.tombstone_grace_cycles,
+            };
+            let store2 = Arc::clone(&store);
+            let meta2 = Arc::clone(&meta);
+            let runner2 = Arc::clone(&runner);
+            let metrics2 = Arc::clone(&metrics);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::gc::run_and_record(
+                    &runner2,
+                    &store2,
+                    &meta2,
+                    &opts,
+                    &snapstore_store::gc::GcHooks::none(),
+                    &metrics2,
+                )
+            })
+            .await;
+
+            match result {
+                Ok(Ok(report)) => {
+                    tracing::info!(?report, "gc auto-trigger: cycle finished");
+                }
+                Ok(Err(crate::gc::GcError::AlreadyRunning)) => {
+                    tracing::info!("gc auto-trigger: cycle skipped, already running");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(err = %e, "gc auto-trigger: cycle failed");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "gc auto-trigger: task panicked");
+                }
+            }
+        }
+        tracing::debug!("gc auto-trigger task exited");
+    });
 }

@@ -70,6 +70,7 @@ async fn start_server_with_pc(
                 None
             },
         },
+        gc: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests(config).await.expect("serve_for_tests");

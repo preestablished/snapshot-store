@@ -462,6 +462,7 @@ async fn run_e2e(steps: usize) {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests_with_metrics(config, Arc::clone(&metrics), registry)

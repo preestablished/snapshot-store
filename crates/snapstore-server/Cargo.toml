@@ -40,6 +40,7 @@ bytes         = "1"
 hyper         = { version = "1", features = ["http1", "server"] }
 memmap2       = "0.9"
 futures-core  = "0.3"
+parking_lot   = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["socket", "uio", "fs", "mman"] }

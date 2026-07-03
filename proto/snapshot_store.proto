@@ -413,9 +413,18 @@ message StoreStats {
   uint64 pins_total = 8;
   uint64 tombstones_total = 9;
   uint64 logical_counter = 10;
-  // Zero until M7; post-GC live-vs-stored exactness is M7's problem.
+  // Durable (survives restart): total completed GC cycles, from gc_state.
   uint64 gc_runs_total = 11;
+  // Process-lifetime: the snapstore_gc_pages_reclaimed_total Prometheus
+  // counter value. Resets on restart (gc_state has no durable pages
+  // counter; see service.rs Stats handler for the accounting decision).
   uint64 gc_pages_reclaimed_total = 12;
+  // Process-lifetime: the snapstore_gc_bytes_reclaimed_total Prometheus
+  // counter value. Resets on restart (same reasoning as field 12).
+  uint64 gc_bytes_reclaimed_total = 13;
+  // Durable: meta's logical counter as of the last completed GC cycle
+  // (gc_state.last_finished_at). 0 = no cycle has ever completed.
+  uint64 gc_last_finished_logical_counter = 14;
 }
 
 message StatsResponse {
@@ -424,6 +433,23 @@ message StatsResponse {
   optional ExperimentStats experiment = 2;
 }
 
-message TriggerGcRequest {}
+message TriggerGcRequest {
+  // threshold 0.9 + rotate active pack first.
+  bool compact_aggressively = 1;
+  // true: fire-and-forget (poll Stats); false (default): run to completion.
+  bool detach = 2;
+}
 
-message TriggerGcResponse {}
+message TriggerGcResponse {
+  // false only when already_running.
+  bool started = 1;
+  // R4 latch was held.
+  bool already_running = 2;
+  // Populated only when detach = false:
+  uint64 nodes_reaped = 3;
+  uint64 manifests_deleted = 4;
+  uint64 pages_reclaimed = 5;
+  uint64 bytes_reclaimed = 6;
+  uint64 packs_compacted = 7;
+  uint64 duration_ms = 8;
+}

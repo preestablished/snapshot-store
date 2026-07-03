@@ -1773,6 +1773,7 @@ dependencies = [
  "hyper-util",
  "memmap2",
  "nix",
+ "parking_lot",
  "prometheus",
  "prost",
  "prost-types",

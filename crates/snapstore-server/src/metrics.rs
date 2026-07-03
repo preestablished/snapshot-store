@@ -41,6 +41,24 @@ pub struct Metrics {
     /// [`crate::config::PageChannelConfig::corrupt_cross_check_for_test`]).
     /// Under normal operation this must never advance.
     pub page_channel_crosscheck_mismatch: IntCounter,
+
+    // ── GC (M7) ──────────────────────────────────────────────────────────────
+    /// `snapstore_gc_cycles_total` — completed GC cycles (RPC + auto-trigger).
+    pub gc_cycles_total: IntCounter,
+    /// `snapstore_gc_pages_reclaimed_total`.
+    pub gc_pages_reclaimed_total: IntCounter,
+    /// `snapstore_gc_bytes_reclaimed_total`.
+    pub gc_bytes_reclaimed_total: IntCounter,
+    /// `snapstore_gc_manifests_deleted_total`.
+    pub gc_manifests_deleted_total: IntCounter,
+    /// `snapstore_gc_nodes_reaped_total`.
+    pub gc_nodes_reaped_total: IntCounter,
+    /// `snapstore_gc_packs_compacted_total`.
+    pub gc_packs_compacted_total: IntCounter,
+    /// `snapstore_gc_running` — 1 while a cycle is in flight, else 0.
+    pub gc_running: IntGauge,
+    /// `snapstore_gc_cycle_seconds` — wall-clock duration of a GC cycle.
+    pub gc_cycle_seconds: Histogram,
 }
 
 impl Metrics {
@@ -134,6 +152,65 @@ impl Metrics {
         )
         .expect("metrics registration");
 
+        let gc_cycles_total = register_int_counter_with_registry!(
+            "snapstore_gc_cycles_total",
+            "Total completed GC cycles",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_pages_reclaimed_total = register_int_counter_with_registry!(
+            "snapstore_gc_pages_reclaimed_total",
+            "Total pages reclaimed by GC (process lifetime)",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_bytes_reclaimed_total = register_int_counter_with_registry!(
+            "snapstore_gc_bytes_reclaimed_total",
+            "Total bytes reclaimed by GC (process lifetime)",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_manifests_deleted_total = register_int_counter_with_registry!(
+            "snapstore_gc_manifests_deleted_total",
+            "Total manifests deleted by GC's manifest sweep",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_nodes_reaped_total = register_int_counter_with_registry!(
+            "snapstore_gc_nodes_reaped_total",
+            "Total node rows reaped from tombstoned subtrees",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_packs_compacted_total = register_int_counter_with_registry!(
+            "snapstore_gc_packs_compacted_total",
+            "Total packs rewritten (compacted) by GC",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_running = register_int_gauge_with_registry!(
+            "snapstore_gc_running",
+            "1 while a GC cycle is in flight, else 0",
+            registry
+        )
+        .expect("metrics registration");
+
+        let gc_cycle_seconds = register_histogram_with_registry!(
+            "snapstore_gc_cycle_seconds",
+            "Wall-clock duration of a GC cycle",
+            vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+            registry
+        )
+        .expect("metrics registration");
+
+        gc_running.set(0);
+
         // Pre-initialise label combinations so they appear in /metrics even when 0.
         let _ = pages_ingested.with_label_values(&["new"]);
         let _ = pages_ingested.with_label_values(&["dup"]);
@@ -157,6 +234,29 @@ impl Metrics {
             page_channel_batches,
             page_channel_clients,
             page_channel_crosscheck_mismatch,
+            gc_cycles_total,
+            gc_pages_reclaimed_total,
+            gc_bytes_reclaimed_total,
+            gc_manifests_deleted_total,
+            gc_nodes_reaped_total,
+            gc_packs_compacted_total,
+            gc_running,
+            gc_cycle_seconds,
         }
+    }
+
+    /// Update GC metrics after one cycle completes (called by both the
+    /// TriggerGc RPC handler and the auto-trigger task, so the two paths
+    /// stay consistent).
+    pub fn record_gc_cycle(&self, report: &crate::gc::GcReport) {
+        self.gc_cycles_total.inc();
+        self.gc_pages_reclaimed_total.inc_by(report.pages_reclaimed);
+        self.gc_bytes_reclaimed_total.inc_by(report.bytes_reclaimed);
+        self.gc_manifests_deleted_total
+            .inc_by(report.manifests_deleted);
+        self.gc_nodes_reaped_total.inc_by(report.nodes_reaped);
+        self.gc_packs_compacted_total.inc_by(report.packs_compacted);
+        self.gc_cycle_seconds
+            .observe(report.duration_ms as f64 / 1000.0);
     }
 }

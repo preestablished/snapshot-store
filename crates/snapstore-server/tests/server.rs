@@ -82,6 +82,7 @@ async fn start_server() -> (ServerHandle, SnapshotStoreClient<Channel>, TempDir)
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests(config).await.expect("serve_for_tests");
@@ -785,13 +786,143 @@ async fn pin_unpin_prune_stats() {
     assert_eq!(exp.nodes_total, 2);
 }
 
-// ── (i) TriggerGc → UNIMPLEMENTED ────────────────────────────────────────────
+// ── (i) TriggerGc ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn trigger_gc_unimplemented() {
+async fn trigger_gc_empty_store() {
     let (_handle, mut client, _dir) = start_server().await;
-    let err = client.trigger_gc(TriggerGcRequest {}).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+    let resp = client
+        .trigger_gc(TriggerGcRequest {
+            compact_aggressively: false,
+            detach: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.started);
+    assert!(!resp.already_running);
+    assert_eq!(resp.nodes_reaped, 0);
+    assert_eq!(resp.manifests_deleted, 0);
+    assert_eq!(resp.pages_reclaimed, 0);
+    assert_eq!(resp.bytes_reclaimed, 0);
+    assert_eq!(resp.packs_compacted, 0);
+
+    let stats = client
+        .stats(StatsRequest {
+            experiment_id: "".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stats.store.unwrap().gc_runs_total, 1);
+}
+
+async fn put_a_snapshot_seeded(client: &mut SnapshotStoreClient<Channel>, seed: u64) -> Vec<u8> {
+    let pages = rand_pages(4, seed);
+    let page_pairs: Vec<(u64, &[u8; PAGE_SIZE])> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as u64, p))
+        .collect();
+    let container = build_full_container(4 * PAGE_SIZE as u64, &page_pairs, empty_blob());
+
+    let stream = tokio_stream::iter(vec![PutPagesRequest {
+        pages: pages.iter().map(|p| p.to_vec()).collect(),
+    }]);
+    client.put_pages(stream).await.unwrap();
+
+    let resp = client
+        .put_snapshot(PutSnapshotRequest { container })
+        .await
+        .unwrap()
+        .into_inner();
+    resp.snapshot_ref
+}
+
+#[tokio::test]
+async fn trigger_gc_reclaims_pruned_manifest() {
+    let (_handle, mut client, _dir) = start_server().await;
+
+    // A rooted snapshot (node points at it) and an orphan one (never
+    // attached to any node/pin) — the orphan is garbage from the first
+    // cycle. Distinct seeds so the two snapshots content-address to
+    // different refs.
+    let rooted = put_a_snapshot_seeded(&mut client, 111).await;
+    let orphan = put_a_snapshot_seeded(&mut client, 222).await;
+    assert_ne!(rooted, orphan);
+
+    client
+        .create_node(CreateNodeRequest {
+            experiment_id: "exp-gc".to_string(),
+            node_id: 0,
+            parent_node_id: None,
+            snapshot_ref: rooted.clone(),
+            input_log_id: vec![],
+            inline_input_log: vec![],
+            status: 1,
+            score: None,
+            icount: 0,
+            virtual_ns: 0,
+            attrs: vec![],
+        })
+        .await
+        .unwrap();
+
+    let resp = client
+        .trigger_gc(TriggerGcRequest {
+            compact_aggressively: true,
+            detach: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.started);
+    assert!(!resp.already_running);
+    assert_eq!(resp.manifests_deleted, 1, "the orphan manifest is swept");
+
+    // The rooted snapshot must still resolve.
+    client
+        .get_snapshot(GetSnapshotRequest {
+            snapshot_ref: rooted,
+        })
+        .await
+        .expect("rooted snapshot must survive GC");
+
+    // The orphan is gone.
+    let err = client
+        .get_snapshot(GetSnapshotRequest {
+            snapshot_ref: orphan,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let stats = client
+        .stats(StatsRequest {
+            experiment_id: "".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stats.store.unwrap().gc_runs_total >= 1);
+}
+
+#[tokio::test]
+async fn pin_unknown_ref_failed_precondition() {
+    let (_handle, mut client, _dir) = start_server().await;
+
+    let err = client
+        .pin(PinRequest {
+            snapshot_ref: vec![0xCD; 32],
+            note: "".to_string(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
 // ── (j) Health: SERVING after serve_for_tests returns ────────────────────────
@@ -833,6 +964,7 @@ async fn store_version_mismatch_refused() {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let result = serve_for_tests(config).await;

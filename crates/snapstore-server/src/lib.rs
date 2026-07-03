@@ -14,6 +14,7 @@ pub mod snapstore_proto {
 pub mod build_server;
 pub mod config;
 pub mod errors;
+pub mod gc;
 pub mod metrics;
 pub mod service;
 pub mod startup;

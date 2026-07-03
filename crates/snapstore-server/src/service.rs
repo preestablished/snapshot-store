@@ -25,6 +25,7 @@ use snapstore_store::SnapshotStore;
 use snapstore_types::{ExperimentId, LogId, NodeId, NodeStatus, SnapshotRef, PAGE_SIZE};
 
 use crate::errors::{meta_error_to_status, put_error_to_status};
+use crate::gc::{self, GcOpts, GcRunner};
 use crate::metrics::Metrics;
 use crate::snapstore_proto::snapshot_store_server::SnapshotStore as SnapshotStoreService;
 use crate::snapstore_proto::*;
@@ -108,6 +109,14 @@ pub struct SnapshotStoreServer {
     pub store: Arc<SnapshotStore>,
     pub meta: Arc<MetaDb>,
     pub metrics: Arc<Metrics>,
+    /// M7 GC cycle-scope latch + orchestrator entry point. One per server
+    /// instance (not a process-wide static) — see `gc::GcRunner` doc
+    /// comment for why. Also used by the watermark auto-trigger task
+    /// (`build_server.rs`), which shares this `Arc` so the RPC and the
+    /// auto-trigger contend on the same latch.
+    pub gc: Arc<GcRunner>,
+    /// `[gc]` config, needed by the TriggerGc handler to build `GcOpts`.
+    pub gc_config: crate::config::GcConfig,
 }
 
 // ── tonic impl ────────────────────────────────────────────────────────────────
@@ -492,24 +501,6 @@ impl SnapshotStoreService for SnapshotStoreServer {
             Some(r.inline_input_log)
         };
 
-        // BEFORE dispatching to the meta actor: verify snapshot_ref resolves to
-        // a stored manifest.  Manifests are immutable-once-present (content-
-        // addressed write-once), so a true return is a permanent guarantee —
-        // there is no TOCTOU race here.
-        {
-            let store = Arc::clone(&self.store);
-            let snap_ref_check = snap_ref.clone();
-            let has_it = tokio::task::spawn_blocking(move || store.has_manifest(&snap_ref_check))
-                .await
-                .map_err(|e| Status::new(Code::Internal, format!("has_manifest panicked: {e}")))?;
-            if !has_it {
-                return Err(Status::new(
-                    Code::NotFound,
-                    "snapshot_ref not found: PutSnapshot must precede CreateNode",
-                ));
-            }
-        }
-
         let parent_node_id = r.parent_node_id.map(NodeId);
         let node_id = NodeId(r.node_id);
         let status = proto_status_to_types(r.status);
@@ -518,7 +509,7 @@ impl SnapshotStoreService for SnapshotStoreServer {
             experiment_id: exp_id,
             node_id,
             parent_node_id,
-            snapshot_ref: snap_ref,
+            snapshot_ref: snap_ref.clone(),
             input_log_id,
             inline_log_container: inline_log,
             status,
@@ -532,12 +523,29 @@ impl SnapshotStoreService for SnapshotStoreServer {
             },
         };
 
+        // Since M7, manifests are no longer immutable-once-present: GC's
+        // manifest sweep can unlink a ref that never became a live root.
+        // Validate + register `snapshot_ref` as a live root, holding the
+        // commit gate (read side) across register -> meta.create_node so a
+        // concurrent GC sweep can never finalize between the two (Race B,
+        // .agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md §1). Failure
+        // (chain broken / pages already collected / never existed) -> NOT_FOUND.
+        let store = Arc::clone(&self.store);
         let meta = Arc::clone(&self.meta);
         let start = Instant::now();
-        let row = tokio::task::spawn_blocking(move || meta.create_node(params))
-            .await
-            .map_err(|e| Status::new(Code::Internal, format!("create_node panicked: {e}")))?
-            .map_err(meta_error_to_status)?;
+        #[allow(clippy::result_large_err)]
+        let row = tokio::task::spawn_blocking(move || {
+            let gate = store.commit_gate();
+            store.register_live_ref(&gate, &snap_ref).map_err(|e| {
+                Status::new(
+                    Code::NotFound,
+                    format!("snapshot_ref not found: PutSnapshot must precede CreateNode ({e})"),
+                )
+            })?;
+            meta.create_node(params).map_err(meta_error_to_status)
+        })
+        .await
+        .map_err(|e| Status::new(Code::Internal, format!("create_node panicked: {e}")))??;
         self.metrics
             .meta_txn_seconds
             .observe(start.elapsed().as_secs_f64());
@@ -867,6 +875,14 @@ impl SnapshotStoreService for SnapshotStoreServer {
 
     // ── Pin ───────────────────────────────────────────────────────────────────
 
+    /// Since M7: pinning an unknown or GC-swept `snapshot_ref` is rejected
+    /// (FAILED_PRECONDITION). Previously this handler performed no manifest
+    /// validation at all, so a garbage pin could be created (fsck
+    /// `DanglingPin`); `register_live_ref`, held under the commit gate
+    /// across the validate -> `meta.pin` write, closes that hole the same
+    /// way CreateNode's Race B protection does. See
+    /// .agents/plans/phase3-m7-gc-exit-gate/02-gc-engine.md §1 and
+    /// 03-server-wiring.md §7.
     async fn pin(&self, request: Request<PinRequest>) -> Result<Response<PinResponse>, Status> {
         let r = request.into_inner();
         let ref_bytes = validate_hash32(&r.snapshot_ref, "snapshot_ref")?;
@@ -877,6 +893,7 @@ impl SnapshotStoreService for SnapshotStoreServer {
             Some(r.note)
         };
         let meta = Arc::clone(&self.meta);
+        let store = Arc::clone(&self.store);
 
         let list_before = {
             let meta2 = Arc::clone(&self.meta);
@@ -889,10 +906,22 @@ impl SnapshotStoreService for SnapshotStoreServer {
         let snap_ref_check = snap_ref.clone();
         let already = list_before.iter().any(|p| p.snapshot_ref == snap_ref_check);
 
-        tokio::task::spawn_blocking(move || meta.pin(snap_ref, note))
-            .await
-            .map_err(|e| Status::new(Code::Internal, format!("pin panicked: {e}")))?
-            .map_err(meta_error_to_status)?;
+        #[allow(clippy::result_large_err)]
+        let pin_result = tokio::task::spawn_blocking(move || {
+            let gate = store.commit_gate();
+            store.register_live_ref(&gate, &snap_ref).map_err(|e| {
+                Status::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "snapshot_ref does not resolve to a stored manifest (or its pages were collected): {e}"
+                    ),
+                )
+            })?;
+            meta.pin(snap_ref, note).map_err(meta_error_to_status)
+        })
+        .await
+        .map_err(|e| Status::new(Code::Internal, format!("pin panicked: {e}")))?;
+        pin_result?;
 
         Ok(Response::new(PinResponse {
             newly_pinned: !already,
@@ -941,6 +970,20 @@ impl SnapshotStoreService for SnapshotStoreServer {
             .map_err(|e| Status::new(Code::Internal, format!("stats (meta) panicked: {e}")))?
             .map_err(meta_error_to_status)?;
 
+        // gc_state is durable (survives restart) but has no running pages/
+        // bytes-reclaimed counters — only cumulative freed bytes as of the
+        // last cycle. Reporting decision (M7, see 03-server-wiring.md §2):
+        // gc_runs_total (11) and gc_last_finished_logical_counter (14) come
+        // from the durable gc_state row; gc_pages_reclaimed_total (12) and
+        // gc_bytes_reclaimed_total (13) come from the process-lifetime
+        // Prometheus counters (they reset on restart — documented on the
+        // proto fields).
+        let meta_gc = Arc::clone(&self.meta);
+        let gc_state = tokio::task::spawn_blocking(move || meta_gc.gc_state())
+            .await
+            .map_err(|e| Status::new(Code::Internal, format!("stats (gc_state) panicked: {e}")))?
+            .map_err(meta_error_to_status)?;
+
         let (manifests_total, logical_page_bytes) =
             tokio::task::spawn_blocking(move || store.manifest_count_and_logical_bytes())
                 .await
@@ -953,10 +996,12 @@ impl SnapshotStoreService for SnapshotStoreServer {
             .await
             .map_err(|e| Status::new(Code::Internal, format!("stats (pages) panicked: {e}")))?;
 
-        let physical_page_bytes = unique_pages * PAGE_SIZE as u64;
-        // physical_page_bytes approximation: unique_pages × 4096.
-        // The per-record header overhead (37 bytes) is excluded for simplicity;
-        // exact byte accounting is M7's responsibility.
+        // physical_page_bytes = unique_pages × 4133: 4096-byte payload plus
+        // the 37-byte per-record pack header (pack.rs). Pack-file header/
+        // footer overhead is excluded by design (not worth a maintained
+        // counter for a handful of bytes per pack; M7 decision, see
+        // .agents/plans/phase3-m7-gc-exit-gate/03-server-wiring.md §2).
+        let physical_page_bytes = unique_pages * 4133;
         let dedup_ratio = if physical_page_bytes == 0 {
             0.0
         } else {
@@ -1020,8 +1065,10 @@ impl SnapshotStoreService for SnapshotStoreServer {
                 pins_total: meta_stats.pins_count,
                 tombstones_total: meta_stats.tombstones_count,
                 logical_counter: meta_stats.logical_counter,
-                gc_runs_total: 0,            // zero until M7
-                gc_pages_reclaimed_total: 0, // zero until M7
+                gc_runs_total: gc_state.cycles_total,
+                gc_pages_reclaimed_total: self.metrics.gc_pages_reclaimed_total.get(),
+                gc_bytes_reclaimed_total: self.metrics.gc_bytes_reclaimed_total.get(),
+                gc_last_finished_logical_counter: gc_state.last_finished_at,
             }),
             experiment: experiment_stats,
         }))
@@ -1029,10 +1076,116 @@ impl SnapshotStoreService for SnapshotStoreServer {
 
     // ── TriggerGc ─────────────────────────────────────────────────────────────
 
+    /// D2: synchronous by default (`detach = false`) — runs a full cycle
+    /// and returns its counts; `detach = true` fires the cycle on a
+    /// background task and returns immediately with `started = true`.
+    /// `already_running` (R4 latch held) is reported in the response, not
+    /// as a gRPC error — the caller polls Stats either way.
     async fn trigger_gc(
         &self,
-        _request: Request<TriggerGcRequest>,
+        request: Request<TriggerGcRequest>,
     ) -> Result<Response<TriggerGcResponse>, Status> {
-        Err(Status::new(Code::Unimplemented, "GC lands at M7"))
+        let r = request.into_inner();
+        let opts = if r.compact_aggressively {
+            GcOpts {
+                compact_threshold: 0.9,
+                rotate_active_first: true,
+                tombstone_grace_cycles: self.gc_config.tombstone_grace_cycles,
+            }
+        } else {
+            GcOpts {
+                compact_threshold: self.gc_config.compact_threshold,
+                rotate_active_first: false,
+                tombstone_grace_cycles: self.gc_config.tombstone_grace_cycles,
+            }
+        };
+
+        if r.detach {
+            let store = Arc::clone(&self.store);
+            let meta = Arc::clone(&self.meta);
+            let runner = Arc::clone(&self.gc);
+            let metrics = Arc::clone(&self.metrics);
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    gc::run_and_record(
+                        &runner,
+                        &store,
+                        &meta,
+                        &opts,
+                        &snapstore_store::gc::GcHooks::none(),
+                        &metrics,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(report)) => {
+                        tracing::info!(?report, "detached GC cycle finished");
+                    }
+                    Ok(Err(gc::GcError::AlreadyRunning)) => {
+                        tracing::info!("detached GC cycle skipped: already running");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(err = %e, "detached GC cycle failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "detached GC task panicked");
+                    }
+                }
+            });
+            return Ok(Response::new(TriggerGcResponse {
+                started: true,
+                already_running: false,
+                nodes_reaped: 0,
+                manifests_deleted: 0,
+                pages_reclaimed: 0,
+                bytes_reclaimed: 0,
+                packs_compacted: 0,
+                duration_ms: 0,
+            }));
+        }
+
+        let store = Arc::clone(&self.store);
+        let meta = Arc::clone(&self.meta);
+        let runner = Arc::clone(&self.gc);
+        let metrics = Arc::clone(&self.metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            gc::run_and_record(
+                &runner,
+                &store,
+                &meta,
+                &opts,
+                &snapstore_store::gc::GcHooks::none(),
+                &metrics,
+            )
+        })
+        .await
+        .map_err(|e| Status::new(Code::Internal, format!("gc task panicked: {e}")))?;
+
+        match result {
+            Ok(report) => Ok(Response::new(TriggerGcResponse {
+                started: true,
+                already_running: false,
+                nodes_reaped: report.nodes_reaped,
+                manifests_deleted: report.manifests_deleted,
+                pages_reclaimed: report.pages_reclaimed,
+                bytes_reclaimed: report.bytes_reclaimed,
+                packs_compacted: report.packs_compacted,
+                duration_ms: report.duration_ms,
+            })),
+            Err(gc::GcError::AlreadyRunning) => Ok(Response::new(TriggerGcResponse {
+                started: false,
+                already_running: true,
+                nodes_reaped: 0,
+                manifests_deleted: 0,
+                pages_reclaimed: 0,
+                bytes_reclaimed: 0,
+                packs_compacted: 0,
+                duration_ms: 0,
+            })),
+            Err(gc::GcError::Store(e)) => {
+                Err(Status::new(Code::Internal, format!("GC store error: {e}")))
+            }
+            Err(gc::GcError::Meta(e)) => Err(meta_error_to_status(e)),
+        }
     }
 }

@@ -64,6 +64,7 @@ fn start_server(rt: &tokio::runtime::Runtime) -> (TempDir, PathBuf) {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let uds_path = rt.block_on(async {

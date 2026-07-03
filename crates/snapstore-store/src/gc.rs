@@ -100,6 +100,16 @@ impl GcHooks {
         }
     }
 
+    /// Orchestrator-facing: fire a `GcPoint` callback from outside this
+    /// module.  Every point except `BeforeMark` is fired internally by the
+    /// sweep methods below; `BeforeMark` is fired by the caller (the mark
+    /// walk itself is orchestrated in `snapstore-server/src/gc.rs`, not
+    /// here).  Always available (not feature-gated): `GcHooks::none()` has
+    /// no callback installed, so this is a no-op in production.
+    pub fn fire_point(&self, p: GcPoint) {
+        self.fire(p);
+    }
+
     fn is(&self, s: Sabotage) -> bool {
         self.sabotage == Some(s)
     }

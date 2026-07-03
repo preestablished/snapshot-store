@@ -15,7 +15,7 @@ use crate::{
         GetNodeRequest, GetPathRequest, GetSnapshotRequest, HasPagesRequest, NodeMeta, NodeUpdate,
         PathElement, PinRequest, PruneSubtreeRequest, PutInputLogRequest, PutMetadataRequest,
         PutPagesRequest, PutSnapshotRequest, QueryNodesRequest, ResolvePagesRequest, StatsResponse,
-        UnpinRequest, UpdateNodesRequest,
+        TriggerGcRequest, TriggerGcResponse, UnpinRequest, UpdateNodesRequest,
     },
     transport::Transport,
 };
@@ -777,14 +777,33 @@ impl SnapstoreClient {
         .await
     }
 
-    /// Trigger GC.  Returns `UNIMPLEMENTED` until M7.
-    pub async fn trigger_gc(&self) -> ClientResult<()> {
+    /// Trigger a GC cycle.
+    ///
+    /// `compact_aggressively`: threshold 0.9 + rotate the active pack first
+    /// (vs. the server's configured `[gc]` defaults).
+    /// `detach`: `false` (default) runs to completion and returns its
+    /// counts; `true` fires the cycle in the background and returns
+    /// immediately with `started = true`.
+    ///
+    /// Deliberately kept **outside** `with_retry`: a blind retry on a
+    /// dropped connection could double-run cycles back-to-back (a GC
+    /// trigger is not naturally idempotent the way a content-addressed
+    /// write is). The caller decides whether to retry.
+    pub async fn trigger_gc(
+        &self,
+        compact_aggressively: bool,
+        detach: bool,
+    ) -> ClientResult<TriggerGcResponse> {
         let mut inner = self.inner.clone();
-        inner
-            .trigger_gc(crate::snapstore_proto::TriggerGcRequest {})
+        let resp = inner
+            .trigger_gc(TriggerGcRequest {
+                compact_aggressively,
+                detach,
+            })
             .await
-            .map_err(decode_status)?;
-        Ok(())
+            .map_err(decode_status)?
+            .into_inner();
+        Ok(resp)
     }
 
     // ── composite helpers ─────────────────────────────────────────────────

@@ -71,8 +71,18 @@ enum Commands {
     /// Offline integrity check (no server required).
     Fsck(FsckArgs),
 
-    /// Trigger GC (unimplemented until M7).
-    Gc,
+    /// Trigger a GC cycle.
+    Gc(GcArgs),
+}
+
+#[derive(Args)]
+struct GcArgs {
+    /// Compact aggressively: threshold 0.9 + rotate the active pack first.
+    #[arg(long)]
+    aggressive: bool,
+    /// Fire-and-forget: return immediately, poll Stats for progress.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(Args)]
@@ -335,9 +345,9 @@ fn main() {
 
 fn run_command(cmd: Commands, transport: Transport, json: bool) -> Result<(), String> {
     match cmd {
-        Commands::Gc => {
-            eprintln!("unimplemented until M7");
-            process::exit(1);
+        Commands::Gc(args) => {
+            let client = connect(transport)?;
+            run_gc(&client, args)
         }
 
         Commands::Fsck(args) => {
@@ -424,6 +434,8 @@ fn run_stats(client: &SnapstoreClient, args: StatsArgs, json: bool) -> Result<()
                 "logical_counter": s.logical_counter,
                 "gc_runs_total": s.gc_runs_total,
                 "gc_pages_reclaimed_total": s.gc_pages_reclaimed_total,
+                "gc_bytes_reclaimed_total": s.gc_bytes_reclaimed_total,
+                "gc_last_finished_logical_counter": s.gc_last_finished_logical_counter,
             }),
             None => serde_json::json!(null),
         };
@@ -646,6 +658,37 @@ fn run_unpin(client: &SnapstoreClient, args: UnpinArgs) -> Result<(), String> {
         .unpin(snapshot_ref)
         .map_err(|e| format!("unpin: {e}"))?;
     println!("was_pinned: {was}");
+    Ok(())
+}
+
+// ── gc ─────────────────────────────────────────────────────────────────────────
+
+/// Exit 0 on success, 2 when the server reports `already_running`
+/// (script-friendly distinct code — the caller can retry later rather than
+/// treating it as a hard failure).
+fn run_gc(client: &SnapstoreClient, args: GcArgs) -> Result<(), String> {
+    let resp = client
+        .trigger_gc(args.aggressive, args.detach)
+        .map_err(|e| format!("trigger_gc: {e}"))?;
+
+    if resp.already_running {
+        eprintln!("gc: already running");
+        process::exit(2);
+    }
+
+    if args.detach {
+        println!("gc: started (detached)");
+    } else {
+        println!(
+            "gc: nodes_reaped={} manifests_deleted={} pages_reclaimed={} bytes_reclaimed={} packs_compacted={} duration_ms={}",
+            resp.nodes_reaped,
+            resp.manifests_deleted,
+            resp.pages_reclaimed,
+            resp.bytes_reclaimed,
+            resp.packs_compacted,
+            resp.duration_ms,
+        );
+    }
     Ok(())
 }
 

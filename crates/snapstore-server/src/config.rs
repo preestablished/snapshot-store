@@ -50,6 +50,60 @@ pub struct MetaConfig {
     pub input_log_max_bytes: Option<usize>,
 }
 
+/// M7 GC tuning (`[gc]` section).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcConfig {
+    /// Watermark auto-trigger. Default OFF: flipping it on for an already
+    /// deployed instance is an operator decision at upgrade time.
+    #[serde(default = "default_gc_auto")]
+    pub auto: bool,
+    /// Disk-used percentage at which the auto-trigger fires a cycle.
+    #[serde(default = "default_gc_trigger_disk_pct")]
+    pub trigger_disk_pct: u8,
+    /// Auto-trigger poll interval.
+    #[serde(default = "default_gc_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Pack liveness fraction below which a pack is compacted.
+    #[serde(default = "default_gc_compact_threshold")]
+    pub compact_threshold: f64,
+    /// Cycles a tombstoned subtree survives before its rows are reaped.
+    #[serde(default = "default_gc_tombstone_grace_cycles")]
+    pub tombstone_grace_cycles: u32,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            auto: default_gc_auto(),
+            trigger_disk_pct: default_gc_trigger_disk_pct(),
+            check_interval_secs: default_gc_check_interval_secs(),
+            compact_threshold: default_gc_compact_threshold(),
+            tombstone_grace_cycles: default_gc_tombstone_grace_cycles(),
+        }
+    }
+}
+
+fn default_gc_auto() -> bool {
+    false
+}
+
+fn default_gc_trigger_disk_pct() -> u8 {
+    80
+}
+
+fn default_gc_check_interval_secs() -> u64 {
+    60
+}
+
+fn default_gc_compact_threshold() -> f64 {
+    0.5
+}
+
+fn default_gc_tombstone_grace_cycles() -> u32 {
+    1
+}
+
 // ── Top-level config ─────────────────────────────────────────────────────────
 
 /// Parsed and resolved server configuration.
@@ -95,6 +149,10 @@ pub struct ServerConfig {
     /// absent).
     #[serde(default)]
     pub page_channel: PageChannelConfig,
+
+    /// M7 GC tuning. Absent section = all defaults (auto-trigger OFF).
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 fn default_grpc_tcp_addr() -> SocketAddr {

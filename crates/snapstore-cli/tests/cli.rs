@@ -42,6 +42,7 @@ async fn start_server() -> (
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests(cfg).await.expect("serve_for_tests");
@@ -255,11 +256,13 @@ async fn every_subcommand() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("pruned"), "prune should output count");
 
-    // ── gc — must exit nonzero ─────────────────────────────────────────────────
+    // ── gc — runs a real cycle now (M7) ────────────────────────────────────────
     let out = ctl_async(&endpoint, &["gc"]).await;
+    assert!(out.status.success(), "gc failed: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !out.status.success(),
-        "gc should exit nonzero (unimplemented)"
+        stdout.contains("nodes_reaped"),
+        "gc should print cycle counts: {stdout}"
     );
 
     // ── bench put-pages (small: 512 pages) ────────────────────────────────────

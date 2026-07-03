@@ -55,6 +55,7 @@ async fn m5_benchmarks() {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
     let uds_path = data_root.join("snapstore.sock");
     let _handle = serve_for_tests(config).await.expect("serve");

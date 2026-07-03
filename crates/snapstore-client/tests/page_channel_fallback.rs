@@ -93,6 +93,7 @@ async fn start_server(page_channel: bool, corrupt_cross_check: bool) -> TestServ
             ingest_queue_pages: None,
             corrupt_cross_check_for_test: corrupt_cross_check.then_some(true),
         },
+        gc: Default::default(),
     };
 
     let (handle, uds_path) = serve_for_tests_with_metrics(config, Arc::clone(&metrics), registry)
@@ -196,9 +197,7 @@ async fn corrupt_cross_check_surfaces_mismatch() {
     let server = start_server(true, true).await;
     let client = channel_client(&server).await;
 
-    let pages: Vec<(u64, Vec<u8>)> = (0..4)
-        .map(|i| (i, rand_page(0xBAD_C0DE, i)))
-        .collect();
+    let pages: Vec<(u64, Vec<u8>)> = (0..4).map(|i| (i, rand_page(0xBAD_C0DE, i))).collect();
 
     let result = client.put_pages(pages).await;
     assert!(result.is_err(), "must fail with batch_blake3 mismatch");

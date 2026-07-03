@@ -173,8 +173,15 @@ impl SnapstoreClient {
         self.rt.block_on(self.async_client.stats(experiment_id))
     }
 
-    pub fn trigger_gc(&self) -> ClientResult<()> {
-        self.rt.block_on(self.async_client.trigger_gc())
+    /// See `client::SnapstoreClient::trigger_gc`; kept outside retry for
+    /// the same reason.
+    pub fn trigger_gc(
+        &self,
+        compact_aggressively: bool,
+        detach: bool,
+    ) -> ClientResult<crate::snapstore_proto::TriggerGcResponse> {
+        self.rt
+            .block_on(self.async_client.trigger_gc(compact_aggressively, detach))
     }
 
     // ── composite ────────────────────────────────────────────────────────
