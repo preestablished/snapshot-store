@@ -24,3 +24,4 @@ target
 .dolt/
 *.db
 .beads-credential-key
+/data/
