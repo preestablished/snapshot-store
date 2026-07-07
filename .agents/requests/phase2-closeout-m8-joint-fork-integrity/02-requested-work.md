@@ -75,8 +75,12 @@
 
 - Round-1's scope (`28z`/`feb`/`nn4`) — predecessor for the gated lane.
 - `snapstore-8qx` / the `snapstore/v1` proto upstream — parked; the
-  control-plane round-2 request covers the receiving side when the
-  schema-authoring day comes.
+  control-plane round-2 request
+  (`phase4-snapstore-promotion-and-vdev-playbook/`) covers the
+  receiving side. Reciprocal handshake, mirrored here so both sides'
+  texts agree: whichever side is ready first (their playbook, or this
+  repo's authored schema) leaves the ready-signal in the other's
+  request dir.
 - M9 (`agz`) — Phase 8.
 - Hypervisor-side defects surfaced by the joint run — filed to them,
   linked here.
