@@ -10,7 +10,7 @@ use snapstore_manifest::DeviceBlob;
 use snapstore_store::build::{build_delta_container, build_full_container};
 use snapstore_store::SnapshotStore;
 use snapstore_types::PAGE_SIZE;
-use tempfile::TempDir;
+use tempfile::{Builder as TempBuilder, TempDir};
 
 fn empty_blob() -> DeviceBlob {
     DeviceBlob {
@@ -33,12 +33,22 @@ fn make_page(seed: u64) -> Box<[u8; PAGE_SIZE]> {
     p
 }
 
+fn bench_tempdir(prefix: &str) -> TempDir {
+    match std::env::var_os("SNAPSTORE_BENCH_ROOT") {
+        Some(root) => TempBuilder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .expect("create benchmark tempdir in SNAPSTORE_BENCH_ROOT"),
+        None => TempDir::new().unwrap(),
+    }
+}
+
 pub fn bench_put_snapshot(c: &mut Criterion) {
     const N_FULL: usize = 2048; // full manifest page count
     const N_DELTA: usize = 2048; // delta entries (all pages dirty)
     let grb = N_FULL as u64 * PAGE_SIZE as u64;
 
-    let dir = TempDir::new().unwrap();
+    let dir = bench_tempdir("snapstore-put-snapshot-");
     let store = SnapshotStore::open(dir.path()).unwrap();
 
     // Build FULL container pages.

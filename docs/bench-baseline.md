@@ -5,6 +5,12 @@ rows gate at spec values on any hardware; disk- and fsync-bound rows gate
 at the fio/G1-derived floor of this machine, with spec values re-validated
 on NVMe-class hardware before M8 sign-off.
 
+Phase 5 readiness note (2026-07-08): local preflight evidence on
+`infra-control` did **not** supersede that M8/NVMe deferral. The selected
+scratch root resolved to the existing SATA-backed root filesystem and no
+operator attestation identified it as the actual Phase 5 soak host. See
+`target/phase5-readiness-20260708T180021Z/evidence.json`.
+
 ## Machine identity (the Intel/SATA reference box)
 
 | | |
@@ -70,6 +76,44 @@ transport rows moves to the M8 entry items on NVMe-class hardware,
 alongside the fsync-bound rows**. M5 sign-off on this box carries the
 two rows as open hardware-bound risks, explicitly flagged to the program
 (beads follow-up filed), not silently passed.
+
+## Phase 5 Readiness Preflight - infra-control, 2026-07-08
+
+Evidence root: `target/phase5-readiness-20260708T180021Z/`
+
+| | |
+|---|---|
+| Host | `infra-control` |
+| Scratch root | `target/phase5-local-scratch` |
+| Mount | `/` on `/dev/mapper/ubuntu--vg--1-ubuntu--lv`, ext4 |
+| Disk class | SATA (`lsblk` transport), not NVMe-class |
+| Free space | 905 GiB reported by `df`; 971,442,429,952 bytes in `evidence.json` |
+| Fio baseline | Not run in this local preflight (`RUN_FIO=0`) |
+| Soak-host attestation | Unset (`actual_soak_host=UNSET`, `same_as_i5_sata_reference=UNSET`) |
+| rustc/kernel | Recorded under `hardware/rustc.txt` and `hardware/kernel.txt` |
+
+The Phase 5 local run fixed and verified the `page_channel_fallback`
+observability flake, and added evidence-grade harness support for the M5 and
+M7 rows, but it did not run the hardware-gated benchmark bars. The evidence
+qualification is therefore `qualified=false`: the selected mount is SATA and
+there is no proof this is the actual Phase 5 soak host.
+
+| Area | Target | Measured | Status | Evidence |
+|---|---:|---:|---|---|
+| `page_channel_fallback` | 50 consecutive green runs | 50 runs, 0 failures | **MET** | `flake/postfix-50x-summary.txt` |
+| PUT_BATCH warm sustained | ≥ 1.5 GB/s | not run | hardware blocked | `m5-transport/not-run.txt` |
+| GET_BATCH warm sustained | ≥ 2.5 GB/s | not run | hardware blocked | `m5-transport/not-run.txt` |
+| 16 clients × 8 MiB p99 / aggregate | < 40 ms / ≥ 1.2 GB/s | not run | hardware blocked | `m5-transport/not-run.txt` |
+| CreateNode / UpdateNodes p50 | < 1.5 ms / < 3 ms | not run | hardware blocked | `m5-transport/not-run.txt` |
+| M7 GC reclaiming cycle | < 60 s under 200 MB/s ingest, p99 < 2× idle | not run | hardware blocked | `m7-gc-benchmark/not-run.txt` |
+
+Harness changes landed for the eventual qualified run:
+`scripts/phase5-readiness-evidence.sh` records hardware evidence and assembles
+`evidence.json`; `page_channel_perf` now requires `SNAPSTORE_BENCH_ROOT` and
+can write `SNAPSTORE_M5_BENCH_JSON`; `gc_readiness_bench` is an ignored
+release test for the 100k-node GC bar and can write `SNAPSTORE_GC_BENCH_JSON`.
+Run those on a qualifying NVMe-class soak host before closing
+`snapstore-28z` or `snapstore-feb`.
 
 ## Gate S5 — crash suite (for the record)
 

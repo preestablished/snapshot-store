@@ -145,6 +145,20 @@ fn get_batches(metrics: &Metrics) -> f64 {
         .get()
 }
 
+async fn wait_for_get_batches_gt(metrics: &Metrics, before: f64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if get_batches(metrics) > before {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "GET_BATCH metric did not increment"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 fn assert_corrupt_contains(err: ClientError, expected: &str) {
     match err {
         ClientError::CorruptPayload(detail) => assert!(
@@ -275,10 +289,7 @@ async fn live_resolve_pages_uses_get_batch_and_matches_grpc() {
         .await
         .expect("channel resolve");
     assert_eq!(actual, expected);
-    assert!(
-        get_batches(&server.metrics) > before,
-        "GET_BATCH metric must increment"
-    );
+    wait_for_get_batches_gt(&server.metrics, before).await;
 }
 
 #[tokio::test]
@@ -351,7 +362,7 @@ async fn mode_b_resolve_pages_uses_get_batch_and_preserves_order() {
         actual.iter().map(|(idx, _, _)| *idx).collect::<Vec<_>>(),
         vec![1, 5]
     );
-    assert!(get_batches(&server.metrics) > before);
+    wait_for_get_batches_gt(&server.metrics, before).await;
 }
 
 #[tokio::test]
@@ -375,7 +386,7 @@ async fn duplicate_page_hashes_are_preserved_as_separate_entries() {
         .await
         .expect("channel duplicate resolve");
 
-    assert!(get_batches(&server.metrics) > before);
+    wait_for_get_batches_gt(&server.metrics, before).await;
     assert_eq!(resolved.len(), 3);
     assert_eq!(resolved[0].0, 0);
     assert_eq!(resolved[1].0, 1);
@@ -486,7 +497,7 @@ async fn blocking_client_inherits_get_batch_fast_path() {
     .expect("spawn_blocking");
 
     assert_eq!(actual, expected);
-    assert!(get_batches(&server.metrics) > before);
+    wait_for_get_batches_gt(&server.metrics, before).await;
 }
 
 #[tokio::test]
