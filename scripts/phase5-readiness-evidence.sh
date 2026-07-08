@@ -53,6 +53,18 @@ run_shell_capture() {
   return "$status"
 }
 
+run_fio_capture() {
+  local id="$1"
+  shift
+  local status_file="$EVIDENCE_ROOT/hardware/${id}.status"
+  local log_file="$EVIDENCE_ROOT/hardware/${id}.log"
+  set +e
+  "$@" >"$log_file" 2>&1
+  local status=$?
+  set -e
+  printf '%s\n' "$status" >"$status_file"
+}
+
 echo "== [1/5] hardware preflight"
 run_capture "$EVIDENCE_ROOT/hardware/hostname.txt" hostname --fqdn || hostname >"$EVIDENCE_ROOT/hardware/hostname.txt"
 {
@@ -99,18 +111,18 @@ EOF
 if [[ "$RUN_FIO" == "1" ]]; then
   if command -v fio >/dev/null 2>&1; then
     echo "== fio baselines"
-    fio --name=phase5-seqwrite --directory "$SNAPSTORE_BENCH_ROOT" --rw=write \
+    run_fio_capture fio-seqwrite fio --name=phase5-seqwrite --directory "$SNAPSTORE_BENCH_ROOT" --rw=write \
       --bs=1M --size="${PHASE5_FIO_SEQ_SIZE:-8G}" --iodepth=32 --numjobs=1 --direct=1 \
       --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
-      --output "$EVIDENCE_ROOT/hardware/fio-seqwrite.json" || true
-    fio --name=phase5-seqread --directory "$SNAPSTORE_BENCH_ROOT" --rw=read \
+      --output "$EVIDENCE_ROOT/hardware/fio-seqwrite.json"
+    run_fio_capture fio-seqread fio --name=phase5-seqread --directory "$SNAPSTORE_BENCH_ROOT" --rw=read \
       --bs=1M --size="${PHASE5_FIO_SEQ_SIZE:-8G}" --iodepth=32 --numjobs=1 --direct=1 \
       --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
-      --output "$EVIDENCE_ROOT/hardware/fio-seqread.json" || true
-    fio --name=phase5-randrw --directory "$SNAPSTORE_BENCH_ROOT" --rw=randrw \
+      --output "$EVIDENCE_ROOT/hardware/fio-seqread.json"
+    run_fio_capture fio-randrw fio --name=phase5-randrw --directory "$SNAPSTORE_BENCH_ROOT" --rw=randrw \
       --rwmixread=70 --bs=4k --size="${PHASE5_FIO_RAND_SIZE:-4G}" --iodepth=64 --numjobs=4 --direct=1 \
       --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
-      --output "$EVIDENCE_ROOT/hardware/fio-randrw.json" || true
+      --output "$EVIDENCE_ROOT/hardware/fio-randrw.json"
   else
     {
       echo "fio unavailable"

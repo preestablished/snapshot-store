@@ -65,6 +65,7 @@ struct BenchOutput {
     config: BenchConfig,
     population: PopulationJson,
     idle_commit: CommitSummary,
+    gc_commit: CommitSummary,
     grace_gc_run: GcRunJson,
     reclaiming_gc_run: ReclaimingGcRunJson,
     pass: PassJson,
@@ -128,6 +129,9 @@ struct ReclaimingGcRunJson {
     packs_deleted: u64,
     ingest_mbps: f64,
     commit_p99_ms: f64,
+    commit_samples: usize,
+    commit_successful_samples: usize,
+    commit_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +139,10 @@ struct PassJson {
     gc_under_60s: bool,
     reclaiming_cycle_reaped_nodes: bool,
     ingest_at_200_mbps: bool,
+    idle_commit_samples_present: bool,
+    reclaiming_commit_samples_present: bool,
+    idle_commit_errors_zero: bool,
+    gc_commit_errors_zero: bool,
     p99_under_2x_idle: bool,
 }
 
@@ -321,6 +329,89 @@ fn count_subtree_nodes(root: u64, total_nodes: u64) -> u64 {
     count
 }
 
+fn child_roots(root: u64, total_nodes: u64) -> Vec<u64> {
+    let first_child = root.saturating_mul(BRANCHING).saturating_add(1);
+    (first_child..first_child.saturating_add(BRANCHING))
+        .filter(|child| *child < total_nodes)
+        .collect()
+}
+
+fn is_ancestor(ancestor: u64, mut node: u64) -> bool {
+    while node > 0 {
+        node = (node - 1) / BRANCHING;
+        if node == ancestor {
+            return true;
+        }
+    }
+    false
+}
+
+fn assert_disjoint_subtrees(selected: &[(u64, u64)]) {
+    for (idx, (left_root, _)) in selected.iter().enumerate() {
+        for (right_root, _) in selected.iter().skip(idx + 1) {
+            assert!(
+                !is_ancestor(*left_root, *right_root) && !is_ancestor(*right_root, *left_root),
+                "selected prune roots {left_root} and {right_root} overlap"
+            );
+        }
+    }
+}
+
+fn target_pruned_nodes(total_nodes: u64, garbage_fraction: f64) -> u64 {
+    if !garbage_fraction.is_finite() || garbage_fraction <= 0.0 {
+        return 0;
+    }
+    ((total_nodes as f64 * garbage_fraction).round() as u64).min(total_nodes.saturating_sub(1))
+}
+
+fn select_pruned_subtrees(total_nodes: u64, target_nodes: u64) -> Vec<(u64, u64)> {
+    let target_nodes = target_nodes.min(total_nodes.saturating_sub(1));
+    let mut pruned_nodes = 0u64;
+    let mut selected = Vec::new();
+    let mut candidates: Vec<(u64, u64)> = child_roots(NodeId::ROOT.0, total_nodes)
+        .into_iter()
+        .map(|root| (root, count_subtree_nodes(root, total_nodes)))
+        .collect();
+
+    while pruned_nodes < target_nodes && !candidates.is_empty() {
+        let remaining = target_nodes - pruned_nodes;
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        if let Some(idx) = candidates
+            .iter()
+            .position(|(_, subtree_nodes)| *subtree_nodes <= remaining)
+        {
+            let candidate = candidates.remove(idx);
+            pruned_nodes += candidate.1;
+            selected.push(candidate);
+            continue;
+        }
+
+        let Some((idx, _)) = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (root, subtree_nodes))| (*subtree_nodes, *root))
+        else {
+            break;
+        };
+        let (root, subtree_nodes) = candidates.remove(idx);
+        let children = child_roots(root, total_nodes);
+        if children.is_empty() {
+            selected.push((root, subtree_nodes));
+            break;
+        }
+        candidates.extend(
+            children
+                .into_iter()
+                .map(|child| (child, count_subtree_nodes(child, total_nodes))),
+        );
+    }
+
+    assert_disjoint_subtrees(&selected);
+    selected.sort_by_key(|(root, _)| *root);
+    selected
+}
+
 fn populate_and_prune(
     store: &SnapshotStore,
     meta: &MetaDb,
@@ -348,17 +439,19 @@ fn populate_and_prune(
         }
     }
 
-    let target_pruned_nodes = (config.nodes as f64 * config.target_garbage_fraction).round() as u64;
+    let target_pruned_nodes = target_pruned_nodes(config.nodes, config.target_garbage_fraction);
     let mut pruned_nodes = 0u64;
     let mut pruned_subtrees = Vec::new();
-    for root in 1..=BRANCHING {
-        if pruned_nodes >= target_pruned_nodes {
-            break;
-        }
-        let subtree_nodes = count_subtree_nodes(root, config.nodes);
-        if subtree_nodes == 0 {
-            continue;
-        }
+    let selected_subtrees = select_pruned_subtrees(config.nodes, target_pruned_nodes);
+    assert_eq!(
+        selected_subtrees
+            .iter()
+            .map(|(_, subtree_nodes)| *subtree_nodes)
+            .sum::<u64>(),
+        target_pruned_nodes,
+        "pruned subtree selector should stay at the requested garbage target"
+    );
+    for (root, subtree_nodes) in selected_subtrees {
         let reaped = meta
             .prune_subtree(experiment_id.clone(), NodeId(root), false)
             .unwrap_or_else(|e| panic!("prune subtree {root}: {e}"));
@@ -448,8 +541,7 @@ fn spawn_committers(
         handles.push(std::thread::spawn(move || {
             let mut samples = Vec::new();
             loop {
-                let phase_code = phase.load(Ordering::SeqCst);
-                if phase_code == PHASE_STOP {
+                if phase.load(Ordering::SeqCst) == PHASE_STOP {
                     break;
                 }
                 let reserved = bytes_reserved
@@ -465,6 +557,10 @@ fn spawn_committers(
                     std::thread::sleep(remaining.min(Duration::from_millis(10)));
                 }
 
+                let commit_phase_code = phase.load(Ordering::SeqCst);
+                if commit_phase_code == PHASE_STOP {
+                    break;
+                }
                 let node_id = next_node.fetch_add(1, Ordering::SeqCst);
                 let commit_start = Instant::now();
                 let result = commit_snapshot(
@@ -489,7 +585,7 @@ fn spawn_committers(
                     Ok(()) => {
                         bytes_done.fetch_add(bytes_per_commit, Ordering::SeqCst);
                         samples.push(CommitSample {
-                            phase: phase_name(phase_code).to_string(),
+                            phase: phase_name(commit_phase_code).to_string(),
                             latency_ms,
                             bytes: bytes_per_commit,
                             ok: true,
@@ -497,7 +593,7 @@ fn spawn_committers(
                         });
                     }
                     Err(error) => samples.push(CommitSample {
-                        phase: phase_name(phase_code).to_string(),
+                        phase: phase_name(commit_phase_code).to_string(),
                         latency_ms,
                         bytes: bytes_per_commit,
                         ok: false,
@@ -585,6 +681,49 @@ fn reclaim_bytes(samples: &[CommitSample]) -> u64 {
         .sum()
 }
 
+fn reclaim_sample_count(samples: &[CommitSample]) -> usize {
+    samples
+        .iter()
+        .filter(|s| s.phase == "during_reclaiming_gc")
+        .count()
+}
+
+fn reclaim_error_count(samples: &[CommitSample]) -> u64 {
+    samples
+        .iter()
+        .filter(|s| !s.ok && s.phase == "during_reclaiming_gc")
+        .count() as u64
+}
+
+fn failed_pass_criteria(pass: &PassJson) -> Vec<&'static str> {
+    let mut failures = Vec::new();
+    if !pass.gc_under_60s {
+        failures.push("gc_under_60s");
+    }
+    if !pass.reclaiming_cycle_reaped_nodes {
+        failures.push("reclaiming_cycle_reaped_nodes");
+    }
+    if !pass.ingest_at_200_mbps {
+        failures.push("ingest_at_200_mbps");
+    }
+    if !pass.idle_commit_samples_present {
+        failures.push("idle_commit_samples_present");
+    }
+    if !pass.reclaiming_commit_samples_present {
+        failures.push("reclaiming_commit_samples_present");
+    }
+    if !pass.idle_commit_errors_zero {
+        failures.push("idle_commit_errors_zero");
+    }
+    if !pass.gc_commit_errors_zero {
+        failures.push("gc_commit_errors_zero");
+    }
+    if !pass.p99_under_2x_idle {
+        failures.push("p99_under_2x_idle");
+    }
+    failures
+}
+
 fn write_outputs(output: &BenchOutput, samples: &[CommitSample]) {
     let Ok(json_path) = std::env::var("SNAPSTORE_GC_BENCH_JSON") else {
         return;
@@ -609,6 +748,74 @@ fn write_outputs(output: &BenchOutput, samples: &[CommitSample]) {
     let bytes = serde_json::to_vec_pretty(output).expect("serialize GC benchmark JSON");
     std::fs::write(&json_path, bytes).expect("write SNAPSTORE_GC_BENCH_JSON");
     println!("wrote {}", json_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected_total(selected: &[(u64, u64)]) -> u64 {
+        selected
+            .iter()
+            .map(|(_, subtree_nodes)| *subtree_nodes)
+            .sum()
+    }
+
+    fn assert_no_overlap(selected: &[(u64, u64)]) {
+        for (idx, (left_root, _)) in selected.iter().enumerate() {
+            assert_ne!(*left_root, NodeId::ROOT.0);
+            for (right_root, _) in selected.iter().skip(idx + 1) {
+                assert!(
+                    !is_ancestor(*left_root, *right_root) && !is_ancestor(*right_root, *left_root),
+                    "selected roots {left_root} and {right_root} overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_prune_selection_stays_on_requested_target() {
+        let selected = select_pruned_subtrees(100_000, 50_000);
+
+        assert_eq!(selected_total(&selected), 50_000);
+        assert_eq!(selected.len(), 16);
+        assert_no_overlap(&selected);
+    }
+
+    #[test]
+    fn prune_selection_handles_zero_and_root_only_trees() {
+        assert!(select_pruned_subtrees(0, 10).is_empty());
+        assert!(select_pruned_subtrees(1, 10).is_empty());
+        assert!(select_pruned_subtrees(100, 0).is_empty());
+    }
+
+    #[test]
+    fn prune_selection_handles_tiny_trees() {
+        for nodes in [2, 8, 9] {
+            let target = target_pruned_nodes(nodes, 0.5);
+            let selected = select_pruned_subtrees(nodes, target);
+            assert_eq!(selected_total(&selected), target);
+            assert_no_overlap(&selected);
+        }
+    }
+
+    #[test]
+    fn prune_selection_can_match_leaf_sized_targets() {
+        let selected = select_pruned_subtrees(100_000, 1);
+
+        assert_eq!(selected_total(&selected), 1);
+        assert_eq!(selected.len(), 1);
+        assert_no_overlap(&selected);
+    }
+
+    #[test]
+    fn prune_selection_is_deterministic() {
+        let first = select_pruned_subtrees(10_000, 4_321);
+        let second = select_pruned_subtrees(10_000, 4_321);
+
+        assert_eq!(first, second);
+        assert_no_overlap(&first);
+    }
 }
 
 #[test]
@@ -664,12 +871,19 @@ fn gc_readiness_benchmark() {
         run_gc_cycle(&store, &meta, &opts, &GcHooks::none()).expect("reclaiming GC cycle");
     let reclaim_wall = reclaim_start.elapsed();
     let (gc_commit_duration, gc_commit_bytes, gc_samples) = commit_run.stop_and_join();
-    let _gc_commit_summary = summarize_commits(gc_commit_duration, gc_commit_bytes, &gc_samples);
+    let gc_commit_summary = summarize_commits(gc_commit_duration, gc_commit_bytes, &gc_samples);
 
     let reclaim_latencies = reclaim_samples(&gc_samples);
+    let reclaim_successful_samples = reclaim_latencies.len();
+    let reclaim_sample_count = reclaim_sample_count(&gc_samples);
+    let reclaim_error_count = reclaim_error_count(&gc_samples);
     let reclaim_ingest_mbps =
         reclaim_bytes(&gc_samples) as f64 / reclaim_wall.as_secs_f64().max(0.001) / 1_000_000.0;
     let reclaim_p99 = percentile_or_zero(&reclaim_latencies, 0.99);
+    let idle_samples_present = idle_summary.samples > 0;
+    let reclaiming_samples_present = reclaim_successful_samples > 0;
+    let idle_errors_zero = idle_summary.errors == 0;
+    let gc_errors_zero = gc_commit_summary.errors == 0;
 
     let reclaiming_gc_run = ReclaimingGcRunJson {
         duration_ms: reclaim.duration_ms,
@@ -680,12 +894,23 @@ fn gc_readiness_benchmark() {
         packs_deleted: reclaim.packs_deleted,
         ingest_mbps: reclaim_ingest_mbps,
         commit_p99_ms: reclaim_p99,
+        commit_samples: reclaim_sample_count,
+        commit_successful_samples: reclaim_successful_samples,
+        commit_errors: reclaim_error_count,
     };
     let pass = PassJson {
         gc_under_60s: reclaim.duration_ms < 60_000,
         reclaiming_cycle_reaped_nodes: reclaim.nodes_reaped > 0,
         ingest_at_200_mbps: reclaim_ingest_mbps >= config.ingest_target_mbps,
-        p99_under_2x_idle: idle_summary.p99_ms > 0.0 && reclaim_p99 < 2.0 * idle_summary.p99_ms,
+        idle_commit_samples_present: idle_samples_present,
+        reclaiming_commit_samples_present: reclaiming_samples_present,
+        idle_commit_errors_zero: idle_errors_zero,
+        gc_commit_errors_zero: gc_errors_zero,
+        p99_under_2x_idle: idle_summary.p99_ms > 0.0
+            && reclaiming_samples_present
+            && idle_errors_zero
+            && gc_errors_zero
+            && reclaim_p99 < 2.0 * idle_summary.p99_ms,
     };
 
     let json_path = std::env::var("SNAPSTORE_GC_BENCH_JSON").ok();
@@ -698,6 +923,7 @@ fn gc_readiness_benchmark() {
         config,
         population,
         idle_commit: idle_summary,
+        gc_commit: gc_commit_summary,
         grace_gc_run: gc_run_json(&grace),
         reclaiming_gc_run,
         pass,
@@ -715,5 +941,11 @@ fn gc_readiness_benchmark() {
         output.reclaiming_gc_run.ingest_mbps,
         output.reclaiming_gc_run.commit_p99_ms,
         output.idle_commit.p99_ms
+    );
+    let failures = failed_pass_criteria(&output.pass);
+    assert!(
+        failures.is_empty(),
+        "Phase 5 GC readiness failed pass criteria: {}",
+        failures.join(", ")
     );
 }

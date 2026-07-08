@@ -25,6 +25,27 @@ PSEUDO_FSTYPES = {
     "tmpfs",
 }
 
+FIO_ARTIFACTS = [
+    {
+        "id": "fio_seqwrite",
+        "path": "hardware/fio-seqwrite.json",
+        "status_path": "hardware/fio-seqwrite.status",
+        "required_io": ("write",),
+    },
+    {
+        "id": "fio_seqread",
+        "path": "hardware/fio-seqread.json",
+        "status_path": "hardware/fio-seqread.status",
+        "required_io": ("read",),
+    },
+    {
+        "id": "fio_randrw",
+        "path": "hardware/fio-randrw.json",
+        "status_path": "hardware/fio-randrw.status",
+        "required_io": ("read", "write"),
+    },
+]
+
 
 def read(path, default=""):
     try:
@@ -42,6 +63,116 @@ def load_json(path):
         return json.loads(Path(path).read_text())
     except Exception:
         return None
+
+
+def parse_status(path):
+    try:
+        return int(Path(path).read_text().strip())
+    except Exception:
+        return None
+
+
+def fio_section_bytes(section):
+    if not isinstance(section, dict):
+        return 0
+    try:
+        return int(section.get("io_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def evaluate_fio_artifact(root, spec):
+    path = root / spec["path"]
+    status_path = root / spec["status_path"]
+    present = path.exists()
+    status_present = status_path.exists()
+    command_status = parse_status(status_path)
+    data = load_json(path) if present else None
+    parseable = data is not None
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    job_count = len(jobs) if isinstance(jobs, list) else 0
+    job_errors = []
+    missing_job_error = False
+    read_bytes = 0
+    write_bytes = 0
+
+    if isinstance(jobs, list):
+        for job in jobs:
+            if not isinstance(job, dict):
+                missing_job_error = True
+                continue
+            if "error" not in job:
+                missing_job_error = True
+            else:
+                try:
+                    job_errors.append(int(job["error"]))
+                except (TypeError, ValueError):
+                    missing_job_error = True
+            read_bytes += fio_section_bytes(job.get("read"))
+            write_bytes += fio_section_bytes(job.get("write"))
+
+    reasons = []
+    if not present:
+        reasons.append("missing fio JSON")
+    elif not parseable:
+        reasons.append("malformed fio JSON")
+    if not status_present:
+        reasons.append("missing fio exit status")
+    elif command_status is None:
+        reasons.append("invalid fio exit status")
+    elif command_status != 0:
+        reasons.append(f"fio exited {command_status}")
+    if parseable and job_count == 0:
+        reasons.append("fio JSON contains no jobs")
+    if missing_job_error:
+        reasons.append("fio job missing numeric error")
+    if any(error != 0 for error in job_errors):
+        reasons.append("fio job error is nonzero")
+    if parseable and job_count > 0:
+        if "read" in spec["required_io"] and read_bytes <= 0:
+            reasons.append("fio read bytes are zero")
+        if "write" in spec["required_io"] and write_bytes <= 0:
+            reasons.append("fio write bytes are zero")
+
+    return {
+        "id": spec["id"],
+        "path": spec["path"],
+        "status_path": spec["status_path"],
+        "present": present,
+        "parseable": parseable,
+        "command_status": command_status,
+        "jobs": job_count,
+        "job_errors": job_errors,
+        "read_bytes": read_bytes,
+        "write_bytes": write_bytes,
+        "ok": not reasons,
+        "reasons": reasons,
+    }
+
+
+def evaluate_fio_artifacts(root):
+    skipped = read(root / "hardware" / "fio-skipped.txt")
+    unavailable = read(root / "hardware" / "fio-unavailable.txt")
+    artifacts = [evaluate_fio_artifact(root, spec) for spec in FIO_ARTIFACTS]
+    failure_reasons = []
+    if skipped:
+        failure_reasons.append("fio skipped")
+    if unavailable:
+        failure_reasons.append("fio unavailable")
+    for artifact in artifacts:
+        failure_reasons.extend(
+            f"{artifact['path']}: {reason}" for reason in artifact["reasons"]
+        )
+    return {
+        "ok": not failure_reasons,
+        "skipped": bool(skipped),
+        "unavailable": bool(unavailable),
+        "skip_path": "hardware/fio-skipped.txt" if skipped else "",
+        "unavailable_path": "hardware/fio-unavailable.txt" if unavailable else "",
+        "required_artifacts": [spec["path"] for spec in FIO_ARTIFACTS],
+        "artifacts": artifacts,
+        "failure_reasons": failure_reasons,
+    }
 
 
 def sha256(path):
@@ -251,18 +382,45 @@ def assemble_evidence(root, bench_root):
     lsblk = load_json(root / "hardware" / "lsblk.json") or {}
     disk_info = resolve_disk_info(mount_json, lsblk)
     disk_class = disk_info["disk_class"]
+    fio_qualification = evaluate_fio_artifacts(root)
     qualified = (
         disk_class == "nvme"
         and free_bytes >= 70 * 1024**3
         and att.get("actual_soak_host") == "true"
+        and fio_qualification["ok"]
     )
-    qualification_reason = (
-        "qualified"
-        if qualified
-        else "requires benchmark mount backed only by NVMe, >=70 GiB free, and actual_soak_host=true attestation"
-    )
+    qualification_failures = []
+    if disk_class != "nvme":
+        qualification_failures.append("benchmark mount is not backed only by NVMe")
+    if free_bytes < 70 * 1024**3:
+        qualification_failures.append("benchmark mount has <70 GiB free")
+    if att.get("actual_soak_host") != "true":
+        qualification_failures.append("actual_soak_host attestation is not true")
+    qualification_failures.extend(fio_qualification["failure_reasons"])
+    qualification_reason = "qualified" if qualified else "; ".join(qualification_failures)
 
     bars = []
+    for artifact in fio_qualification["artifacts"]:
+        measured = None
+        if artifact["present"] or artifact["command_status"] is not None:
+            measured = {
+                "command_status": artifact["command_status"],
+                "jobs": artifact["jobs"],
+                "job_errors": artifact["job_errors"],
+                "read_bytes": artifact["read_bytes"],
+                "write_bytes": artifact["write_bytes"],
+            }
+        bars.append(
+            bar(
+                f"{artifact['id']}_valid",
+                "valid successful fio baseline",
+                measured,
+                "",
+                artifact["ok"],
+                artifact["path"],
+                "; ".join(artifact["reasons"]),
+            )
+        )
     bars.append(
         bar(
             "page_channel_fallback_50x",
@@ -339,6 +497,17 @@ def assemble_evidence(root, bench_root):
     if m7:
         reclaim = m7.get("reclaiming_gc_run", {})
         idle = m7.get("idle_commit", {})
+        gc_commit = m7.get("gc_commit", {})
+        idle_errors = idle.get("errors")
+        gc_errors = gc_commit.get("errors", reclaim.get("commit_errors"))
+        reclaim_successful_samples = reclaim.get("commit_successful_samples")
+        p99_vs_idle_ok = bool(
+            idle.get("p99_ms", 0) > 0
+            and idle_errors == 0
+            and gc_errors == 0
+            and reclaim_successful_samples
+            and reclaim.get("commit_p99_ms", 1e18) < 2 * idle.get("p99_ms", 0)
+        )
         bars.extend(
             [
                 bar(
@@ -367,13 +536,35 @@ def assemble_evidence(root, bench_root):
                     "m7-gc-benchmark/results.json",
                 ),
                 bar(
+                    "m7_idle_commit_errors",
+                    "0",
+                    idle_errors,
+                    "errors",
+                    idle_errors == 0,
+                    "m7-gc-benchmark/results.json",
+                ),
+                bar(
+                    "m7_gc_commit_errors",
+                    "0",
+                    gc_errors,
+                    "errors",
+                    gc_errors == 0,
+                    "m7-gc-benchmark/results.json",
+                ),
+                bar(
+                    "m7_gc_reclaiming_commit_samples",
+                    "> 0",
+                    reclaim_successful_samples,
+                    "samples",
+                    bool(reclaim_successful_samples and reclaim_successful_samples > 0),
+                    "m7-gc-benchmark/results.json",
+                ),
+                bar(
                     "m7_gc_commit_p99_vs_idle",
                     "< 2x idle",
                     reclaim.get("commit_p99_ms"),
                     "ms",
-                    idle.get("p99_ms", 0) > 0
-                    and reclaim.get("commit_p99_ms", 1e18)
-                    < 2 * idle.get("p99_ms", 0),
+                    p99_vs_idle_ok,
                     "m7-gc-benchmark/results.json",
                 ),
             ]
@@ -383,6 +574,9 @@ def assemble_evidence(root, bench_root):
             "m7_gc_reclaiming_duration",
             "m7_gc_nodes_reaped",
             "m7_gc_ingest_during_gc",
+            "m7_idle_commit_errors",
+            "m7_gc_commit_errors",
+            "m7_gc_reclaiming_commit_samples",
             "m7_gc_commit_p99_vs_idle",
         ]:
             bars.append(bar(name, "", None, "", False, "m7-gc-benchmark/not-run.txt"))
@@ -420,6 +614,7 @@ def assemble_evidence(root, bench_root):
             "reason": qualification_reason,
             "disk_class": disk_class,
             "disk_resolution": disk_info,
+            "fio_qualification": fio_qualification,
             "cpu_governor": read(root / "hardware" / "cpu-governor.txt"),
             "thermal_or_throttle_notes": read(root / "hardware" / "thermal.txt"),
         },

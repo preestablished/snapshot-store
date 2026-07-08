@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import sys
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from phase5_readiness_evidence import resolve_disk_info
+from phase5_readiness_evidence import evaluate_fio_artifacts, resolve_disk_info
 
 
 def mount(source, majmin, fstype="ext4"):
@@ -159,6 +161,117 @@ class ResolveDiskInfoTest(unittest.TestCase):
             ),
         )
         self.assertEqual(info["disk_class"], "nvme,sata")
+
+
+class FioQualificationTest(unittest.TestCase):
+    def write_fio(self, root, name, *, error=0, read_bytes=0, write_bytes=0):
+        hardware = root / "hardware"
+        hardware.mkdir(parents=True, exist_ok=True)
+        (hardware / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "error": error,
+                            "read": {"io_bytes": read_bytes},
+                            "write": {"io_bytes": write_bytes},
+                        }
+                    ]
+                }
+            )
+        )
+        (hardware / f"{name}.status").write_text("0\n")
+
+    def write_valid_fio_set(self, root):
+        self.write_fio(root, "fio-seqwrite", write_bytes=1024)
+        self.write_fio(root, "fio-seqread", read_bytes=1024)
+        self.write_fio(root, "fio-randrw", read_bytes=1024, write_bytes=1024)
+
+    def assert_fio_failure(self, qualification, expected):
+        self.assertTrue(
+            any(expected in reason for reason in qualification["failure_reasons"]),
+            qualification["failure_reasons"],
+        )
+
+    def test_all_required_fio_artifacts_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertTrue(qualification["ok"])
+            self.assertEqual(qualification["failure_reasons"], [])
+
+    def test_missing_fio_artifact_does_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_fio(root, "fio-seqwrite", write_bytes=1024)
+            self.write_fio(root, "fio-seqread", read_bytes=1024)
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assert_fio_failure(qualification, "fio-randrw.json: missing fio JSON")
+
+    def test_malformed_fio_json_does_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+            (root / "hardware" / "fio-seqread.json").write_text("{")
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assert_fio_failure(qualification, "fio-seqread.json: malformed fio JSON")
+
+    def test_empty_fio_jobs_do_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+            (root / "hardware" / "fio-seqread.json").write_text(json.dumps({"jobs": []}))
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assert_fio_failure(
+                qualification, "fio-seqread.json: fio JSON contains no jobs"
+            )
+
+    def test_nonzero_fio_job_error_does_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+            self.write_fio(root, "fio-randrw", error=5, read_bytes=1024, write_bytes=1024)
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assert_fio_failure(
+                qualification, "fio-randrw.json: fio job error is nonzero"
+            )
+
+    def test_nonzero_fio_command_status_does_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+            (root / "hardware" / "fio-seqwrite.status").write_text("7\n")
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assert_fio_failure(qualification, "fio-seqwrite.json: fio exited 7")
+
+    def test_skipped_or_unavailable_fio_does_not_qualify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_valid_fio_set(root)
+            (root / "hardware" / "fio-skipped.txt").write_text("RUN_FIO=0\n")
+
+            qualification = evaluate_fio_artifacts(root)
+
+            self.assertFalse(qualification["ok"])
+            self.assertIn("fio skipped", qualification["failure_reasons"])
 
 
 if __name__ == "__main__":
