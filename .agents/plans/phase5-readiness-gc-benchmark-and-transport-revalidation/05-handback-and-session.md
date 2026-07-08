@@ -59,7 +59,10 @@ do not fabricate benchmark pass/fail rows.
 ## `docs/bench-baseline.md`
 
 Add one new section with the qualified host and date. Do not edit the old
-2026-06-10 SATA results except to link forward to the new revalidation section.
+2026-06-10 SATA numbers, but do add a short forward pointer near the old M5
+analysis/hardware rule. It should say whether the Phase 5 revalidation on
+`<host/date>` supersedes the M8 deferral, blocks on hardware, or confirms a
+conditional risk; otherwise the old "moves to M8" language remains misleading.
 
 Required contents:
 
@@ -73,6 +76,14 @@ Required contents:
 | Phase 5 soak posture | final risk paragraph |
 
 ## Bead Updates
+
+Claim each implementation bead before starting its work:
+
+```bash
+bd update snapstore-nn4 --claim
+bd update snapstore-28z --claim
+bd update snapstore-feb --claim
+```
 
 Use close reasons with measured numbers:
 
@@ -127,5 +138,7 @@ git status --short --branch
 ```
 
 `bd dolt push` is currently tracked by `snapstore-pov` and may fail with
-`no common ancestor`. Record the failure if it persists, but still complete the
-normal `git push` unless a real git conflict blocks it.
+`no common ancestor`. If it persists, paste the exact failure into
+`04-resolution.md` and update `snapstore-pov` notes if the tooling allows it.
+The final handoff must distinguish "git pushed" from "bead Dolt sync blocked";
+still complete the normal `git push` unless a real git conflict blocks it.

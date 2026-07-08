@@ -26,6 +26,7 @@ Add env vars:
 | `SNAPSTORE_GC_GARBAGE_FRACTION` | Target garbage fraction after pruning | `0.50` |
 | `SNAPSTORE_GC_INGEST_MBPS` | Concurrent ingest rate | `200` |
 | `SNAPSTORE_GC_SEED` | Deterministic generator seed | fixed recorded seed |
+| `SNAPSTORE_GC_MODE` | Counted GC mode | `trigger_gc_aggressive` |
 
 Use `tempfile::Builder::tempdir_in(SNAPSTORE_BENCH_ROOT)`. The test should
 print enough progress that a long lab run does not look hung.
@@ -33,7 +34,9 @@ print enough progress that a long lab run does not look hung.
 ## Data Model
 
 Use in-process APIs so the benchmark measures the GC/manifest/page/meta paths
-without gRPC noise:
+without gRPC noise. Split API usage by phase:
+
+Population, before any GC is running:
 
 | Operation | API |
 |---|---|
@@ -43,6 +46,14 @@ without gRPC noise:
 | Create node rows | `MetaDb::create_node` (`crates/snapstore-meta/src/lib.rs:190`) |
 | Prune subtrees | `MetaDb::prune_subtree` (`crates/snapstore-meta/src/lib.rs:322`) |
 | Run GC | `snapstore_server::gc::run_gc_cycle` (`crates/snapstore-server/src/gc.rs:170`) |
+
+Concurrent commits during GC:
+
+| Operation | Rule |
+|---|---|
+| Commit manifest | `SnapshotStore::put_snapshot(...)` is safe; it holds the commit gate and registers the live ref |
+| Attach committed ref to meta | Prefer the server/gRPC CreateNode path, or exactly mirror the server sequence: hold `store.commit_gate()`, call `store.register_live_ref(...)`, then `meta.create_node(...)` |
+| Avoid | Direct `MetaDb::create_node` during GC without the gate/register step; it can create a node for a ref the manifest sweep is allowed to delete |
 
 Recommended population shape:
 
@@ -57,12 +68,14 @@ Recommended population shape:
    page bytes are garbage. Prefer pruning subtree roots whose page ownership is
    easy to account for. Record selected subtree roots and predicted garbage
    bytes in the JSON.
-5. Run one preparatory GC cycle if needed to establish the tombstone grace
-   horizon, then repopulate/prune for the counted run. The counted run must be
-   the one with ~30 GB physical and ~50% garbage. If grace-cycle behavior
-   requires two cycles to reclaim, record both and use the reclaiming cycle for
-   the `<60s` bar only when that matches production config; otherwise state the
-   config used.
+5. With production `tombstone_grace_cycles = 1`, use this exact sequence:
+   populate -> prune -> uncounted grace/fence GC cycle -> counted reclaiming GC
+   cycle. Do not repopulate or reprune between the grace cycle and the counted
+   cycle. Record both durations and reports. The `<60s` bar applies only to the
+   counted cycle that has `nodes_reaped > 0` and reclaimed bytes near the
+   predicted garbage. If a different tombstone grace is used, mark it as a
+   benchmark-specific deviation in JSON, `docs/bench-baseline.md`, and the
+   resolution.
 
 For deterministic page generation, reuse the style from
 `snapstore-testgen::SyntheticGuest` but generate per node/page from `(seed,
@@ -85,39 +98,53 @@ MB/s, and error count. This idle p99 is the denominator for the `2x` bar.
 
 ## Concurrent GC Run
 
-Run the same committer workload while invoking:
+The counted mode is `TriggerGc { compact_aggressively: true }` semantics, run
+in-process to avoid gRPC noise:
 
 ```rust
 run_gc_cycle(
     &store,
     &meta,
     &GcOpts {
-        compact_threshold: 0.5,
+        compact_threshold: 0.9,
         rotate_active_first: true,
-        tombstone_grace_cycles: <production default unless documented>,
+        tombstone_grace_cycles: 1,
     },
     &GcHooks::none(),
 )
 ```
 
-Use production defaults unless a benchmark-specific option is required to make
-the BM condition meaningful. Any deviation must appear in `results.json`,
-`docs/bench-baseline.md`, and the request resolution.
+This matches the RPC's aggressive path in `TriggerGc` and avoids the
+`compact_threshold = 0.5` edge where exactly 50% live packs can be skipped
+because sweep compacts only when `liveness < compact_threshold`. If the agent
+also wants to record default-GC behavior (`compact_threshold = 0.5`,
+`rotate_active_first = false`), do it as an informational row; it does not
+replace the aggressive counted bar.
 
 The committer should be rate-limited, not best-effort. A token-bucket loop is
 good enough: allow `SNAPSTORE_GC_INGEST_MBPS * elapsed` bytes, sleep when ahead,
 and record actual achieved throughput. If actual throughput is below 200 MB/s,
 the GC benchmark did not pass even if GC itself finished quickly.
 
+Run GC and committer loops on blocking execution contexts: either plain
+`std::thread` workers or `tokio::task::spawn_blocking`. Do not run synchronous
+`run_gc_cycle` or `put_snapshot` loops on core Tokio runtime threads. Use a
+barrier so commit-latency sampling starts before the counted reclaiming cycle
+enters GC and continues until it completes; label samples as `before_gc`,
+`during_grace_gc`, `during_reclaiming_gc`, or `after_gc`.
+
 Measure:
 
 | Metric | Bar |
 |---|---:|
-| `gc_duration_ms` | `< 60000` |
+| `gc_mode` | `trigger_gc_aggressive` with exact `GcOpts` recorded |
+| `grace_cycle_duration_ms` | recorded, not the pass/fail cycle |
+| `reclaiming_gc_duration_ms` | `< 60000` |
+| `nodes_reaped` | `> 0` in the counted reclaiming cycle |
 | `gc_pages_reclaimed` / `gc_bytes_reclaimed` | close to predicted 50% garbage |
 | `ingest_during_gc_mbps` | `>= 200` |
 | `commit_idle_p99_ms` | recorded |
-| `commit_during_gc_p99_ms` | `< 2 * commit_idle_p99_ms` |
+| `commit_during_reclaiming_gc_p99_ms` | `< 2 * commit_idle_p99_ms` |
 | `commit_errors` | `0` unless explained by legal missing-page retry behavior |
 
 ## JSON Output
@@ -131,7 +158,13 @@ Suggested schema:
     "target_physical_gb": 30,
     "target_garbage_fraction": 0.5,
     "ingest_target_mbps": 200,
-    "seed": 20260708
+    "seed": 20260708,
+    "gc_mode": "trigger_gc_aggressive",
+    "gc_opts": {
+      "compact_threshold": 0.9,
+      "rotate_active_first": true,
+      "tombstone_grace_cycles": 1
+    }
   },
   "population": {
     "nodes_created": 100000,
@@ -146,8 +179,15 @@ Suggested schema:
     "p95_ms": 0.0,
     "p99_ms": 0.0
   },
-  "gc_run": {
+  "grace_gc_run": {
     "duration_ms": 0,
+    "nodes_reaped": 0,
+    "pages_reclaimed": 0,
+    "bytes_reclaimed": 0
+  },
+  "reclaiming_gc_run": {
+    "duration_ms": 0,
+    "nodes_reaped": 0,
     "pages_reclaimed": 0,
     "bytes_reclaimed": 0,
     "packs_compacted": 0,
@@ -157,6 +197,7 @@ Suggested schema:
   },
   "pass": {
     "gc_under_60s": false,
+    "reclaiming_cycle_reaped_nodes": false,
     "ingest_at_200_mbps": false,
     "p99_under_2x_idle": false
   }

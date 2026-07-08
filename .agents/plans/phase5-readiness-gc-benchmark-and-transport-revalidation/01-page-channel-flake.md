@@ -29,11 +29,15 @@ observability race even when the fast path worked.
 1. Reproduce before editing and capture the failure mode:
 
    ```bash
-   mkdir -p target/phase5-readiness-flake-repro
+   EVIDENCE_ROOT="${EVIDENCE_ROOT:-target/phase5-readiness-flake-repro}"
+   mkdir -p "$EVIDENCE_ROOT/flake/repro"
+   failures=0
    for i in $(seq 1 20); do
      cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1 --nocapture \
-       2>&1 | tee "target/phase5-readiness-flake-repro/run-${i}.log" || exit 1
+       >"$EVIDENCE_ROOT/flake/repro/run-${i}.log" 2>&1 || failures=$((failures + 1))
    done
+   printf 'runs=20\nfailures=%s\n' "$failures" | tee "$EVIDENCE_ROOT/flake/repro-summary.txt"
+   test "$failures" -eq 0
    ```
 
    If a failure is not a metric-delta assertion, stop and update this work item
@@ -73,13 +77,17 @@ observability race even when the fast path worked.
 Required commands:
 
 ```bash
+EVIDENCE_ROOT="${EVIDENCE_ROOT:-target/phase5-readiness-local}"
+mkdir -p "$EVIDENCE_ROOT/flake"
 cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1
 for i in $(seq 1 50); do
-  cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1 >/tmp/page-channel-fallback-${i}.log 2>&1 || {
-    cat /tmp/page-channel-fallback-${i}.log
+  cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1 >>"$EVIDENCE_ROOT/flake/postfix-50x.log" 2>&1 || {
+    tail -200 "$EVIDENCE_ROOT/flake/postfix-50x.log"
     exit 1
   }
 done
+printf 'runs=50\nfailures=0\ncommand=cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1\n' \
+  > "$EVIDENCE_ROOT/flake/postfix-50x-summary.txt"
 ```
 
 Also run the normal client crate tests:
@@ -88,13 +96,16 @@ Also run the normal client crate tests:
 cargo test -p snapstore-client
 ```
 
-Evidence to copy under `target/phase5-readiness-<UTC>/flake/`:
+Evidence under `target/phase5-readiness-<UTC>/flake/`:
 
 | File | Contents |
 |---|---|
 | `repro-summary.txt` | Pre-fix run count, failure count, first failing assertion |
 | `postfix-50x.log` | The 50-run loop output or a compact summary with command line |
 | `root-cause.txt` | One paragraph: test-harness metric race vs real transport race |
+
+Also copy `runs`, `failures`, command line, and root cause into
+`evidence.json` under the `flake` object.
 
 Close `snapstore-nn4` only after the 50-run loop is green and the close reason
 names the root cause.

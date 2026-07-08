@@ -84,8 +84,8 @@ unmeasured assumption.
 | GET_BATCH warm sustained | `>= 2.5 GB/s` | Attribute with profile evidence |
 | 16 clients x 8 MiB commits | p99 `< 40 ms`, aggregate `>= 1.2 GB/s` | Attribute disk/fsync vs CPU/memory vs code |
 | CreateNode / UpdateNodes p50 | `< 1.5 ms` / `< 3 ms` on qualifying hardware | Attribute SQLite/fsync/actor bottleneck |
-| M7 GC | 100k nodes, ~30 GB physical, ~50% garbage, full GC `< 60 s` under 200 MB/s ingest | State max sustainable ingest or bottleneck |
-| Commit latency during GC | p99 `< 2 x idle p99` | State soak risk and mitigation |
+| M7 GC | 100k nodes, ~30 GB physical, ~50% garbage, aggressive reclaiming GC cycle `< 60 s` under 200 MB/s ingest | State max sustainable ingest or bottleneck |
+| Commit latency during counted GC | p99 `< 2 x idle p99` during the reclaiming cycle | State soak risk and mitigation |
 
 ## Non-Goals
 

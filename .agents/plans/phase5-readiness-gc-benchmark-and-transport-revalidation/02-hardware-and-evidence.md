@@ -46,11 +46,14 @@ Under `hardware/`, record:
 | `kernel.txt` | `uname -a` |
 | `rustc.txt` | `rustc -Vv` |
 | `cpu.txt` | `lscpu` |
+| `cpu-governor.txt` | `cpupower frequency-info` if available, plus `/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor` |
+| `thermal.txt` | `sensors` if available, plus any CPU throttle lines from `dmesg` |
 | `memory.txt` | `free -h` and `/proc/meminfo` |
 | `mount.txt` | `findmnt -T "$SNAPSTORE_BENCH_ROOT"` |
 | `df.txt` | `df -h "$SNAPSTORE_BENCH_ROOT"` |
 | `lsblk.json` | `lsblk -J -o NAME,MODEL,SERIAL,TRAN,ROTA,TYPE,SIZE,MOUNTPOINT,FSTYPE` |
 | `dirty-vm.txt` | `sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs vm.dirty_bytes vm.dirty_background_bytes` |
+| `phase5-host-attestation.txt` | Operator statement: actual Phase 5 soak host or surrogate, and whether it is the i5-8400/SATA reference box |
 | `fio-*.json` | Sequential and random read/write baselines |
 
 Recommended fio commands:
@@ -85,30 +88,76 @@ A qualifying run must have:
 |---|---|
 | NVMe-class target | `lsblk` shows `TRAN=nvme`, or operator-provided proof that the selected mount is the intended Phase 5 NVMe device |
 | Free space | at least 70 GiB free at `SNAPSTORE_BENCH_ROOT`; 100 GiB preferred |
-| CPU headroom | enough idle cores to run server, committer workers, and GC; record `lscpu` and load average |
+| CPU headroom | enough idle cores to run server, committer workers, and GC; record `lscpu`, load average, CPU governor, and thermal/throttle state |
 | Disk baseline | fio sequential and random results recorded |
-| Host identity | hostname and whether this is the Phase 5 soak host |
+| Host identity | hostname, `phase5_soak_host`, `same_as_i5_sata_reference`, and whether this run is on the actual soak host or a surrogate |
 
 If no qualifying box is reachable, stop after WI2. Write
 `.agents/requests/phase5-readiness-gc-benchmark-and-transport-revalidation/04-resolution.md`
 with the preflight data, file a P1 bead for blocked benchmarks, flag Matt, and
 do not close `snapstore-feb` or `snapstore-28z` as passed.
 
+If the operator confirms that the Phase 5 soak host is the i5-8400/SATA
+reference box from `docs/bench-baseline.md`, stop after WI2 and file the
+hardware escalation. The existing M5 misses were attributed to CPU/memory-bus
+saturation as well as storage class, so an NVMe scratch mount on a surrogate is
+not equivalent to proving the actual soak host.
+
 ## `evidence.json`
 
-Assemble one JSON file with:
+Assemble one JSON file with a stable top-level shape:
 
-| Field | Contents |
-|---|---|
-| `request` | request directory path |
-| `git_rev` | `git rev-parse HEAD` |
-| `git_status_clean` | boolean plus raw status |
-| `host` | hostname, kernel, rustc |
-| `bench_root` | absolute `SNAPSTORE_BENCH_ROOT` and mount info |
-| `hardware_qualified` | boolean and reason |
-| `flake` | root cause and 50x status, if run |
-| `m5_transport` | measured rows and pass/fail, if run |
-| `m7_gc` | measured rows and pass/fail, if run |
-| `risk_statement` | final yes/no/conditional soak posture |
+```json
+{
+  "run_id": "phase5-readiness-<UTC>",
+  "request": ".agents/requests/phase5-readiness-gc-benchmark-and-transport-revalidation",
+  "started_at": "<UTC RFC3339>",
+  "finished_at": "<UTC RFC3339>",
+  "git": {
+    "rev": "<sha>",
+    "status_clean": false,
+    "status_short": "..."
+  },
+  "host": {
+    "hostname": "...",
+    "phase5_soak_host": "...",
+    "same_as_i5_sata_reference": false,
+    "actual_soak_host": true,
+    "operator_attestation": "hardware/phase5-host-attestation.txt",
+    "kernel": "...",
+    "rustc": "..."
+  },
+  "bench_root": {
+    "path": "...",
+    "mount": "hardware/mount.txt",
+    "free_bytes": 0
+  },
+  "hardware_qualification": {
+    "qualified": false,
+    "reason": "...",
+    "disk_class": "...",
+    "cpu_governor": "...",
+    "thermal_or_throttle_notes": "..."
+  },
+  "commands": [
+    {"id": "m5_transport", "argv": "...", "env": {}, "log": "m5-transport/page_channel_perf.log"}
+  ],
+  "artifacts": [
+    {"path": "hardware/fio-seqwrite.json", "sha256": "..."}
+  ],
+  "bar_results": [
+    {"id": "put_batch_warm_sustained", "target": ">= 1.5", "measured": 0.0, "unit": "GB/s", "status": "pass|fail|not_run", "attribution": "", "evidence_path": ""}
+  ],
+  "flake": {},
+  "m5_transport": {},
+  "m7_gc": {},
+  "risk_statement": ""
+}
+```
+
+The per-harness JSON files from WI3 and WI4 may contain richer raw data, but
+the top-level `bar_results[]` array is the acceptance table. Include exact
+commands and relevant env vars for every counted run. Include SHA-256 checksums
+for raw artifacts that support pass/fail claims.
 
 Keep raw command logs in `logs/`; keep parsed summaries in `evidence.json`.

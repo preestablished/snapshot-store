@@ -15,8 +15,9 @@ qualified by WI2.
 
 2. Add machine-readable output. Use an env var such as
    `SNAPSTORE_M5_BENCH_JSON=$EVIDENCE_ROOT/m5-transport/results.json`.
-   Add `serde_json = "1"` to `crates/snapstore-server/Cargo.toml` dev-deps if
-   needed.
+   Add `serde_json = "1"` to `crates/snapstore-server/Cargo.toml` dev-deps;
+   the crate currently has `serde` but not `serde_json`, and both this harness
+   and `gc_readiness_bench` need JSON output.
 
    Suggested schema:
 
@@ -39,7 +40,13 @@ qualified by WI2.
    ignored test or a second ignored test in the same file.
 
    Use `serve_for_tests` plus raw gRPC or the normal client against the same
-   `SNAPSTORE_BENCH_ROOT` store. Measure:
+   `SNAPSTORE_BENCH_ROOT` store. Pre-create the snapshot ref outside the timed
+   window. For the CreateNode row, build a valid 16 KiB input-log container with
+   `snapstore_client::helpers::build_input_log_container`, set `input_log_id`
+   to the container's log id, and time only the CreateNode RPC/transaction. The
+   server/meta path validates the inline container and only inserts it when the
+   id is absent, so invalid bytes or reused ids make the row meaningless.
+   Measure:
 
    | Row | Spec |
    |---|---:|
@@ -84,7 +91,10 @@ cargo bench -p snapstore-pagestore --bench read_path -- \
 ```
 
 If `read_path.rs` still uses `TempDir::new()`, add the same
-`SNAPSTORE_BENCH_ROOT` plumbing before counting the result.
+`SNAPSTORE_BENCH_ROOT` plumbing before counting the result. Apply the same rule
+to any supporting Criterion bench counted in the evidence, including
+`snapstore-pagestore/benches/ingest.rs` and
+`snapstore-store/benches/put_snapshot.rs`.
 
 ## Bottleneck Attribution
 
