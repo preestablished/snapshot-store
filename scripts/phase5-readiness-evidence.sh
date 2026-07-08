@@ -85,8 +85,9 @@ run_capture "$EVIDENCE_ROOT/hardware/cpu.txt" lscpu || true
   cat /proc/meminfo || true
 } >"$EVIDENCE_ROOT/hardware/memory.txt"
 run_capture "$EVIDENCE_ROOT/hardware/mount.txt" findmnt -T "$SNAPSTORE_BENCH_ROOT" || true
+run_capture "$EVIDENCE_ROOT/hardware/mount.json" findmnt -J -T "$SNAPSTORE_BENCH_ROOT" -o SOURCE,SOURCES,FSTYPE,MAJ:MIN,TARGET,FSROOT || true
 run_capture "$EVIDENCE_ROOT/hardware/df.txt" df -h "$SNAPSTORE_BENCH_ROOT" || true
-run_capture "$EVIDENCE_ROOT/hardware/lsblk.json" lsblk -J -o NAME,MODEL,SERIAL,TRAN,ROTA,TYPE,SIZE,MOUNTPOINT,FSTYPE || true
+run_capture "$EVIDENCE_ROOT/hardware/lsblk.json" lsblk -J -o NAME,KNAME,PATH,PKNAME,MAJ:MIN,MODEL,SERIAL,TRAN,ROTA,TYPE,SIZE,MOUNTPOINTS,MOUNTPOINT,FSTYPE || true
 run_capture "$EVIDENCE_ROOT/hardware/dirty-vm.txt" sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs vm.dirty_bytes vm.dirty_background_bytes || true
 cat >"$EVIDENCE_ROOT/hardware/phase5-host-attestation.txt" <<EOF
 phase5_soak_host=${PHASE5_SOAK_HOST:-UNSET}
@@ -188,154 +189,6 @@ else
 fi
 
 echo "== [5/5] assembling evidence.json"
-python3 - "$EVIDENCE_ROOT" "$SNAPSTORE_BENCH_ROOT" <<'PY'
-import hashlib, json, os, platform, shutil, subprocess, sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-bench_root = Path(sys.argv[2])
-
-def read(path, default=""):
-    try:
-        return Path(path).read_text(errors="replace").strip()
-    except FileNotFoundError:
-        return default
-
-def sh(*args):
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-def load_json(path):
-    try:
-        return json.loads(Path(path).read_text())
-    except Exception:
-        return None
-
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def artifact_list():
-    out = []
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name != "evidence.json":
-            out.append({"path": str(path.relative_to(root)), "sha256": sha256(path)})
-    return out
-
-def bar(id, target, measured, unit, ok, evidence_path, attribution=""):
-    if measured is None:
-        status = "not_run"
-    else:
-        status = "pass" if ok else "fail"
-    return {
-        "id": id,
-        "target": target,
-        "measured": measured,
-        "unit": unit,
-        "status": status,
-        "attribution": attribution,
-        "evidence_path": evidence_path,
-    }
-
-m5 = load_json(root / "m5-transport" / "results.json")
-m7 = load_json(root / "m7-gc-benchmark" / "results.json")
-flake_summary = read(root / "flake" / "postfix-50x-summary.txt")
-attestation = read(root / "hardware" / "phase5-host-attestation.txt")
-att = {}
-for line in attestation.splitlines():
-    if "=" in line:
-        k, v = line.split("=", 1)
-        att[k] = v
-
-stat = os.statvfs(bench_root)
-free_bytes = stat.f_bavail * stat.f_frsize
-lsblk = load_json(root / "hardware" / "lsblk.json") or {}
-transports = []
-for dev in lsblk.get("blockdevices", []):
-    tran = dev.get("tran")
-    if tran:
-        transports.append(tran)
-disk_class = "nvme" if "nvme" in transports else (",".join(sorted(set(transports))) or "unknown")
-qualified = disk_class == "nvme" and free_bytes >= 70 * 1024**3 and att.get("actual_soak_host") == "true"
-qualification_reason = "qualified" if qualified else "requires NVMe-class disk, >=70 GiB free, and actual_soak_host=true attestation"
-
-bars = []
-bars.append(bar("page_channel_fallback_50x", "50 green runs", 50 if "failures=0" in flake_summary else None, "runs", "failures=0" in flake_summary, "flake/postfix-50x-summary.txt"))
-if m5:
-    bars.extend([
-        bar("put_batch_warm_sustained", ">= 1.5", m5.get("put_batch_warm_sustained_gbps"), "GB/s", m5.get("put_batch_warm_sustained_gbps", 0) >= 1.5, "m5-transport/results.json"),
-        bar("get_batch_warm_sustained", ">= 2.5", m5.get("get_batch_warm_sustained_gbps"), "GB/s", m5.get("get_batch_warm_sustained_gbps", 0) >= 2.5, "m5-transport/results.json"),
-        bar("commit_16x8mib_p99", "< 40", m5.get("commit_16x8mib_p99_ms"), "ms", m5.get("commit_16x8mib_p99_ms", 1e9) < 40, "m5-transport/results.json"),
-        bar("commit_16x8mib_aggregate", ">= 1.2", m5.get("commit_16x8mib_aggregate_gbps"), "GB/s", m5.get("commit_16x8mib_aggregate_gbps", 0) >= 1.2, "m5-transport/results.json"),
-        bar("create_node_inline_log_p50", "< 1.5", m5.get("create_node_inline_log_p50_ms"), "ms", m5.get("create_node_inline_log_p50_ms", 1e9) < 1.5, "m5-transport/results.json"),
-        bar("update_nodes_256_p50", "< 3", m5.get("update_nodes_256_p50_ms"), "ms", m5.get("update_nodes_256_p50_ms", 1e9) < 3, "m5-transport/results.json"),
-    ])
-else:
-    for name in ["put_batch_warm_sustained", "get_batch_warm_sustained", "commit_16x8mib_p99", "commit_16x8mib_aggregate", "create_node_inline_log_p50", "update_nodes_256_p50"]:
-        bars.append(bar(name, "", None, "", False, "m5-transport/not-run.txt"))
-if m7:
-    reclaim = m7.get("reclaiming_gc_run", {})
-    idle = m7.get("idle_commit", {})
-    bars.extend([
-        bar("m7_gc_reclaiming_duration", "< 60000", reclaim.get("duration_ms"), "ms", reclaim.get("duration_ms", 1e18) < 60000, "m7-gc-benchmark/results.json"),
-        bar("m7_gc_nodes_reaped", "> 0", reclaim.get("nodes_reaped"), "nodes", reclaim.get("nodes_reaped", 0) > 0, "m7-gc-benchmark/results.json"),
-        bar("m7_gc_ingest_during_gc", ">= target", reclaim.get("ingest_mbps"), "MB/s", reclaim.get("ingest_mbps", 0) >= m7.get("config", {}).get("ingest_target_mbps", 200), "m7-gc-benchmark/results.json"),
-        bar("m7_gc_commit_p99_vs_idle", "< 2x idle", reclaim.get("commit_p99_ms"), "ms", idle.get("p99_ms", 0) > 0 and reclaim.get("commit_p99_ms", 1e18) < 2 * idle.get("p99_ms", 0), "m7-gc-benchmark/results.json"),
-    ])
-else:
-    for name in ["m7_gc_reclaiming_duration", "m7_gc_nodes_reaped", "m7_gc_ingest_during_gc", "m7_gc_commit_p99_vs_idle"]:
-        bars.append(bar(name, "", None, "", False, "m7-gc-benchmark/not-run.txt"))
-
-evidence = {
-    "run_id": root.name,
-    "request": ".agents/requests/phase5-readiness-gc-benchmark-and-transport-revalidation",
-    "started_at": os.environ.get("PHASE5_STARTED_AT", ""),
-    "finished_at": sh("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
-    "git": {
-        "rev": sh("git", "rev-parse", "HEAD"),
-        "status_clean": sh("git", "status", "--porcelain") == "",
-        "status_short": sh("git", "status", "--short", "--branch"),
-    },
-    "host": {
-        "hostname": read(root / "hardware" / "hostname.txt") or platform.node(),
-        "phase5_soak_host": att.get("phase5_soak_host", "UNSET"),
-        "same_as_i5_sata_reference": att.get("same_as_i5_sata_reference", "UNSET"),
-        "actual_soak_host": att.get("actual_soak_host", "UNSET"),
-        "operator_attestation": "hardware/phase5-host-attestation.txt",
-        "kernel": read(root / "hardware" / "kernel.txt"),
-        "rustc": read(root / "hardware" / "rustc.txt"),
-    },
-    "bench_root": {
-        "path": str(bench_root),
-        "mount": "hardware/mount.txt",
-        "free_bytes": free_bytes,
-    },
-    "hardware_qualification": {
-        "qualified": qualified,
-        "reason": qualification_reason,
-        "disk_class": disk_class,
-        "cpu_governor": read(root / "hardware" / "cpu-governor.txt"),
-        "thermal_or_throttle_notes": read(root / "hardware" / "thermal.txt"),
-    },
-    "commands": [
-        {"id": "flake_50x", "argv": "cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1", "env": {}, "log": "flake/postfix-50x.log"},
-        {"id": "m5_transport", "argv": "cargo test -p snapstore-server --test page_channel_perf --release -- --ignored --nocapture", "env": {"SNAPSTORE_BENCH_ROOT": str(bench_root)}, "log": "m5-transport/page_channel_perf.log"},
-        {"id": "m7_gc", "argv": "cargo test -p snapstore-server --test gc_readiness_bench --release -- --ignored --nocapture", "env": {"SNAPSTORE_BENCH_ROOT": str(bench_root)}, "log": "m7-gc-benchmark/gc_readiness_bench.log"},
-    ],
-    "artifacts": artifact_list(),
-    "bar_results": bars,
-    "flake": {
-        "summary": flake_summary,
-        "root_cause": read(root / "flake" / "root-cause.txt"),
-    },
-    "m5_transport": m5 or {},
-    "m7_gc": m7 or {},
-    "risk_statement": "",
-}
-(root / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-print(f"wrote {root / 'evidence.json'}")
-PY
+python3 scripts/phase5_readiness_evidence.py "$EVIDENCE_ROOT" "$SNAPSTORE_BENCH_ROOT"
 
 echo "== done: $EVIDENCE_ROOT"

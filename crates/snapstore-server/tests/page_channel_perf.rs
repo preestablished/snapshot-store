@@ -156,14 +156,30 @@ async fn put_snapshot_for_meta(
 
 fn input_log_container(sample: usize) -> (Vec<u8>, Vec<u8>) {
     let mut payload = vec![0u8; 16 * 1024 - 56];
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b = (sample as u8).wrapping_add(i as u8).wrapping_mul(31);
+    for (chunk_idx, chunk) in payload.chunks_mut(8).enumerate() {
+        let word = (sample as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left((chunk_idx % 64) as u32)
+            ^ (chunk_idx as u64).wrapping_mul(0xD6E8_FD50_9B54_AA2D);
+        let bytes = word.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
     let container = snapstore_client::helpers::build_input_log_container(1, &payload);
+    debug_assert_eq!(container.len(), 16 * 1024);
     let log_id = snapstore_client::helpers::log_id_of(&container)
         .to_bytes()
         .to_vec();
     (container, log_id)
+}
+
+#[test]
+fn input_log_container_uniqueness() {
+    let mut seen = std::collections::HashSet::new();
+    for sample in 0..(META_WARMUP_SAMPLES + META_COUNTED_SAMPLES) {
+        let (container, log_id) = input_log_container(sample);
+        assert_eq!(container.len(), 16 * 1024);
+        assert!(seen.insert(log_id), "duplicate log_id at sample {sample}");
+    }
 }
 
 async fn measure_meta_rows(uds_path: PathBuf, pc_path: PathBuf) -> (Vec<f64>, Vec<f64>) {
