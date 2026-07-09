@@ -132,10 +132,24 @@ child, calls `TakeSnapshot`, and requires the replay commit to match the
 original snapshot ref, state hash, input log id, counters, frame metadata, and
 Linux PVBLK proof metadata. Slot id is allowed to differ.
 
+The hypervisor harness now honors:
+
+- `M8_STORE_ROOT` for the actual snapstore data root
+- `M8_EVIDENCE_ROOT` for live run artifacts
+- `M8_STORE_ROOT_QUALIFIED=1` and `M8_STORE_ROOT_DISK_CLASS=<class>` for
+  evidence store-root metadata
+
+The M8 gate writes live `child-ref-table.jsonl` rows incrementally, writes
+`child-ref-table.csv` and `evidence.json` at finish, and computes
+`shared_page_ratio` from store-visible root/child manifest page hashes. The
+live `evidence.json` is intentionally marked partial until baseline-delta
+restore, live semantic-negative red-run, and latency bars are implemented.
+
 Hypervisor local validation passed:
 
 ```bash
 rustfmt --edition 2021 --check crates/dh-worker/tests/m7_fork_verify.rs
+rustfmt --edition 2021 --check crates/dh-worker/tests/common/mod.rs
 cargo test -p dh-worker --test m7_fork_verify replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift
 cargo test -p dh-worker --test m7_fork_verify --no-run
 git diff --check
@@ -147,8 +161,7 @@ git diff --check
   represented with real `bd dep` edges.
 - Wire baseline-resident delta restore and FULL-manifest cadence before any
   full M8 run.
-- Integrate live hypervisor evidence emission, resumability/shared-page
-  accounting, and semantic-negative red-run output around the new replay-commit
-  path.
+- Integrate live M8 resumability, semantic-negative red-run output, and latency
+  bars around the new replay-commit evidence path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
