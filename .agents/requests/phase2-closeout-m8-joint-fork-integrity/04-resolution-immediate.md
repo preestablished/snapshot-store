@@ -25,41 +25,40 @@ Replacement beads were created:
 | `snapshot-store-orm` | M8 joint fork-integrity closeout epic/replacement tracker | open |
 | `snapshot-store-m0u` | Qualified Phase 5 hardware rows predecessor | open |
 | `snapshot-store-gy9` | Replay-commit ref identity harness/evidence work | in progress |
-| `snapshot-store-8p9` | Baseline-resident restore and FULL-cadence smoke | open |
+| `snapshot-store-8p9` | Baseline-resident restore and FULL-cadence smoke | closed |
 | `snapshot-store-4ua` | 1000x joint fork ref-identity acceptance | open |
-| `snapshot-store-2dl` | Required M8 regression in both repos | open |
-| `snapshot-store-4fm` | Beads dependency-table repair for this graph | open |
+| `snapshot-store-2dl` | Required M8 regression in both repos | in progress |
+| `snapshot-store-4fm` | Beads dependency-table repair for this graph | closed |
 
 ## Dependency Edge Status
 
-The requested dependency graph cannot currently be tracker-enforced because
-`bd dep add` and `bd dep list` fail in embedded mode with:
+The requested dependency graph is now tracker-enforced. The embedded Dolt db was
+missing the `wisp_dependencies` compatibility table required by `bd dep`; it was
+recreated from the pre-rebootstrap backup schema, after which `bd dep add/list`
+worked again. `snapshot-store-4fm` is closed.
 
-```text
-Error 1146: table not found: wisp_dependencies
-```
-
-The attempted edge was:
-
-```bash
-bd dep add snapshot-store-8p9 snapshot-store-gy9
-```
-
-The same backend failure occurs for:
-
-```bash
-bd dep list snapshot-store-8p9
-```
-
-This tracker defect is filed as `snapshot-store-4fm`. The intended edges are
-recorded in `snapshot-store-orm` notes and in
-`.agents/plans/phase2-closeout-m8-joint-fork-integrity/01-tracker-and-entry.md`:
+Installed edges:
 
 - `snapshot-store-8p9` depends on `snapshot-store-gy9`
 - `snapshot-store-4ua` depends on `snapshot-store-m0u`
 - `snapshot-store-4ua` depends on `snapshot-store-8p9`
 - `snapshot-store-2dl` depends on `snapshot-store-8p9`
-- `snapshot-store-orm` depends on the child beads
+- `snapshot-store-orm` depends on `snapshot-store-gy9`,
+  `snapshot-store-m0u`, `snapshot-store-4ua`, `snapshot-store-2dl`, and
+  `snapshot-store-8p9`
+
+Graph validation:
+
+```bash
+bd dep list snapshot-store-8p9 snapshot-store-4ua snapshot-store-2dl snapshot-store-orm
+bd ready      # only snapshot-store-m0u is ready
+bd blocked    # snapshot-store-4ua and snapshot-store-orm are blocked as intended
+bd dep cycles # no dependency cycles
+```
+
+`bd preflight --check` is not useful in this checkout because its configured
+checks are Go defaults (`go test -short ./...`, `golangci-lint run ./...`) and
+fail before reaching project-specific Rust validation.
 
 ## `snapstore-pov` Status
 
@@ -211,8 +210,6 @@ git diff --check
 
 ## Remaining Immediate Work
 
-- Repair or migrate the beads dependency table so the intended graph can be
-  represented with real `bd dep` edges.
 - Confirm the new M8 workflow lanes in GitHub, record required-check status,
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
 - Integrate live M8 resumability, baseline-delta smoke aggregation,
