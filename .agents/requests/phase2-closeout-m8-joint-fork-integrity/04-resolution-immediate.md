@@ -173,6 +173,25 @@ The hypervisor worker now also supports the M8 baseline/FULL restore wiring:
 - A service smoke with `max_delta_chain=1` proves FULL -> DELTA -> FULL
   rollover and restores the DELTA snapshot with `baseline=FULL`.
 
+## CI Permanence Progress
+
+Bounded M8 ref-identity workflow lanes have been added in both repos:
+
+- `determinism-hypervisor` CI now runs `M8 bounded replay-commit ref identity`
+  in the self-hosted `kvm-intel` PR lane with `DH_M7_ACCEPT_JOBS=8`.
+- `determinism-hypervisor` `nightly-drift` now has `m8-ref-identity-100`,
+  defaulting to 100 children and uploading the M8 evidence root.
+- `snapshot-store` CI now has `m8-ref-identity-bounded`, a self-hosted
+  cross-repo job that checks out the current snapshot-store SHA as the sibling
+  dependency and runs the bounded M8 hypervisor test against it.
+
+The snapshot-store job is temporarily pinned to the sibling hypervisor branch
+`m8-snapshot-store-replay-commit`, overridable with repository variable
+`M8_HYPERVISOR_REF`, until that branch lands on the hypervisor default branch.
+Remaining external closeout for `snapshot-store-2dl`: observe green GitHub runs,
+record branch-protection/required-check status, and record phases-track sign-off
+for bounded required CI plus operator-run 1000x full acceptance.
+
 Hypervisor local validation passed:
 
 ```bash
@@ -181,6 +200,12 @@ cargo test -p dh-worker take_snapshot_rolls_full_manifest_and_restore_accepts_ba
 cargo test -p dh-worker --test restore_engine delta_chain_restore_materializes_the_full_state -- --nocapture
 cargo test -p dh-worker --test m7_fork_verify replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift
 cargo test -p dh-worker --no-run
+python3 - <<'PY'  # YAML parse check for touched workflows
+import yaml
+for path in [".github/workflows/ci.yaml", ".github/workflows/nightly-drift.yaml"]:
+    with open(path, "r", encoding="utf-8") as fh:
+        yaml.safe_load(fh)
+PY
 git diff --check
 ```
 
@@ -188,6 +213,8 @@ git diff --check
 
 - Repair or migrate the beads dependency table so the intended graph can be
   represented with real `bd dep` edges.
+- Confirm the new M8 workflow lanes in GitHub, record required-check status,
+  and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
 - Integrate live M8 resumability, baseline-delta smoke aggregation,
   semantic-negative aggregation into the full acceptance evidence, and latency
   bars around the new replay-commit evidence path.

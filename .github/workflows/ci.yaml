@@ -78,3 +78,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo run -p snapstore-crash --features failpoints -- run --cycles 25 --seed 42 --matrix-passes 1
         working-directory: repo
+
+  # M8 bounded cross-repo regression. This is the snapshot-store-side
+  # required check: the current snapshot-store commit is checked out as the
+  # exact sibling path dependency used by determinism-hypervisor, then the M8
+  # replay-commit ref-identity gate runs on the KVM runner.
+  m8-ref-identity-bounded:
+    # Public repo + self-hosted runner: never let fork PRs onto the box.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 90
+    env:
+      DH_M7_ACCEPT_JOBS: ${{ vars.M8_BOUNDED_JOBS || '100' }}
+      DH_M7_ACCEPT_SLOT_CORES: ${{ vars.M8_SLOT_CORES || '2-5' }}
+      DH_M7_ACCEPT_ALLOW_SKIP: "0"
+      M8_STORE_ROOT: ${{ runner.temp }}/m8-store-${{ github.run_id }}
+      M8_EVIDENCE_ROOT: ${{ runner.temp }}/m8-evidence-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: snapshot-store
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/determinism-hypervisor
+          path: determinism-hypervisor
+          # Branch pin keeps this cross-repo check runnable while the M8
+          # hypervisor support is still staged outside that repo's default
+          # branch. Set repository variable M8_HYPERVISOR_REF to override.
+          ref: ${{ vars.M8_HYPERVISOR_REF || 'm8-snapshot-store-replay-commit' }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw on runner"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing on kvm-intel runner"; exit 1; }
+      - name: bounded M8 replay-commit ref identity against this snapshot-store SHA
+        run: |
+          set -euo pipefail
+          echo "snapshot-store sha=$(git -C ../snapshot-store rev-parse HEAD)"
+          echo "determinism-hypervisor sha=$(git rev-parse HEAD)"
+          echo "M8 bounded ref-identity: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" true
+          rm -rf "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          mkdir -p "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
+            m8_accept_1000_seeded_forks_replay_commit_ref_identity \
+            -- --ignored --nocapture --test-threads=1
+        working-directory: determinism-hypervisor
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snapshot-store-m8-ref-identity-bounded-${{ github.run_id }}
+          path: ${{ env.M8_EVIDENCE_ROOT }}
+          if-no-files-found: ignore
