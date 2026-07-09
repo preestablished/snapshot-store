@@ -142,9 +142,10 @@ The hypervisor harness now honors:
 The M8 gate writes live `child-ref-table.jsonl` rows incrementally, writes
 `child-ref-table.csv` and `evidence.json` at finish, and computes
 `shared_page_ratio` from store-visible root/child manifest page hashes. The
-positive live `evidence.json` is intentionally marked partial until
-baseline-delta restore, semantic-negative aggregation into the full acceptance
-evidence, and latency bars are implemented.
+positive live `evidence.json` is intentionally marked partial until the
+baseline-delta smoke is aggregated into full acceptance evidence,
+semantic-negative aggregation is included in the full acceptance evidence, and
+latency bars are implemented.
 
 The hypervisor branch also adds a separate live nanokernel semantic-negative
 gate:
@@ -160,13 +161,26 @@ commits the replay with `TakeSnapshot`, requires the replay snapshot ref to
 differ from the original child ref, and writes `run_kind=semantic_negative`
 evidence under `${M8_EVIDENCE_ROOT:-target/m8-joint-fork-integrity-live}/semantic-negative`.
 
+The hypervisor worker now also supports the M8 baseline/FULL restore wiring:
+
+- `RestoreSnapshotRequest.baseline` is an opt-in ancestor ref. When present,
+  the worker materializes that baseline into the allocated slot, then overlays
+  `ResolvePages(snapshot, baseline_ref=baseline)` before applying child
+  device/vCPU state.
+- `TakeSnapshot` computes the parent chain depth and emits a FULL manifest
+  instead of another DELTA when the next delta would exceed
+  `max_delta_chain` (`64` by default).
+- A service smoke with `max_delta_chain=1` proves FULL -> DELTA -> FULL
+  rollover and restores the DELTA snapshot with `baseline=FULL`.
+
 Hypervisor local validation passed:
 
 ```bash
-rustfmt --edition 2021 --check crates/dh-worker/tests/m7_fork_verify.rs
-rustfmt --edition 2021 --check crates/dh-worker/tests/common/mod.rs
+rustfmt --edition 2021 --check crates/dh-worker/src/restore_engine.rs crates/dh-worker/src/service.rs crates/dh-worker/tests/restore_engine.rs crates/dh-worker/tests/m7_fork_verify.rs crates/dh-worker/tests/common/mod.rs crates/dh-worker/tests/m6_full_api_uds.rs crates/dh-worker/tests/linux_worker_api.rs crates/dh-worker/src/m9_handoff.rs crates/dh-worker/tests/m5_frame_scheduling.rs crates/dh-worker/tests/capture_engine_real_image.rs crates/dh-worker/tests/play_perf_smoke.rs crates/dh-worker/tests/frame_capture_stream.rs crates/dh-worker/tests/m4_transparency.rs
+cargo test -p dh-worker take_snapshot_rolls_full_manifest_and_restore_accepts_baseline_delta -- --nocapture
+cargo test -p dh-worker --test restore_engine delta_chain_restore_materializes_the_full_state -- --nocapture
 cargo test -p dh-worker --test m7_fork_verify replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift
-cargo test -p dh-worker --test m7_fork_verify --no-run
+cargo test -p dh-worker --no-run
 git diff --check
 ```
 
@@ -174,10 +188,8 @@ git diff --check
 
 - Repair or migrate the beads dependency table so the intended graph can be
   represented with real `bd dep` edges.
-- Wire baseline-resident delta restore and FULL-manifest cadence before any
-  full M8 run.
-- Integrate live M8 resumability, semantic-negative aggregation into the full
-  acceptance evidence, and latency bars around the new replay-commit evidence
-  path.
+- Integrate live M8 resumability, baseline-delta smoke aggregation,
+  semantic-negative aggregation into the full acceptance evidence, and latency
+  bars around the new replay-commit evidence path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
