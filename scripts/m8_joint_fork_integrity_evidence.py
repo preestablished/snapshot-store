@@ -10,6 +10,7 @@ RUN_KINDS = {"fake", "bounded_ci", "full_acceptance", "semantic_negative"}
 RESTORE_MODES = {"baseline_delta", "full"}
 MANIFEST_KINDS = {"FULL", "DELTA"}
 RESULTS = {"pass", "ref_mismatch", "state_mismatch", "replay_divergence", "error"}
+ROW_SOURCES = {"fresh", "resumed"}
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 
 REQUIRED_REPOS = [
@@ -157,6 +158,9 @@ def validate_child_row(row, index):
         errors.append(f"child[{index}].timing_ms: values must be non-negative numbers")
     if row.get("result") not in RESULTS:
         errors.append(f"child[{index}].result: invalid value")
+    row_source = row.get("row_source")
+    if row_source is not None and row_source not in ROW_SOURCES:
+        errors.append(f"child[{index}].row_source: invalid value")
     return errors
 
 
@@ -221,6 +225,31 @@ def validate_semantic_negative_rows(rows, errors):
         errors.append("semantic_negative: must include a committed replay_ref mismatch row")
 
 
+def validate_resume_metadata(evidence, rows, errors):
+    resume = evidence.get("resume")
+    if resume is None:
+        return
+    if not isinstance(resume, dict):
+        errors.append("resume: must be an object")
+        return
+    if not isinstance(resume.get("enabled"), bool):
+        errors.append("resume.enabled: must be boolean")
+    counts = {}
+    for field in ["resumed_child_count", "fresh_child_count"]:
+        value = resume.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(f"resume.{field}: must be a non-negative integer")
+        else:
+            counts[field] = value
+    if (
+        len(counts) == 2
+        and counts["resumed_child_count"] + counts["fresh_child_count"] != len(rows)
+    ):
+        errors.append("resume: resumed_child_count + fresh_child_count must equal child row count")
+    if resume.get("enabled") is False and counts.get("resumed_child_count", 0) != 0:
+        errors.append("resume.resumed_child_count: must be 0 when resume.enabled=false")
+
+
 def validate_evidence(root):
     root = Path(root)
     evidence_path = root / "evidence.json"
@@ -278,6 +307,7 @@ def validate_evidence(root):
                 errors.append(f"bars.{name}: must pass for {run_kind}")
 
     rows = load_child_rows(root, evidence, errors)
+    validate_resume_metadata(evidence, rows, errors)
     if run_kind == "semantic_negative":
         validate_semantic_negative_rows(rows, errors)
     else:

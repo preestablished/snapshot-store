@@ -87,6 +87,8 @@ The validator enforces the plan's schema requirements for:
 - replay-commit ref equality for positive runs
 - committed replay-ref mismatch for semantic-negative runs
 - contiguous child indices and at least one baseline-delta row in positive runs
+- optional `row_source` values (`fresh`/`resumed`) and optional top-level
+  resume counts when live evidence includes them
 
 CI now runs the evidence test suites:
 
@@ -135,16 +137,21 @@ The hypervisor harness now honors:
 
 - `M8_STORE_ROOT` for the actual snapstore data root
 - `M8_EVIDENCE_ROOT` for live run artifacts
+- `M8_EVIDENCE_RESUME=1` to resume a positive live run from an existing
+  `child-ref-table.jsonl`
 - `M8_STORE_ROOT_QUALIFIED=1` and `M8_STORE_ROOT_DISK_CLASS=<class>` for
   evidence store-root metadata
 
 The M8 gate writes live `child-ref-table.jsonl` rows incrementally, writes
 `child-ref-table.csv` and `evidence.json` at finish, and computes
 `shared_page_ratio` from store-visible root/child manifest page hashes. The
-positive live `evidence.json` is intentionally marked partial until the
-baseline-delta smoke is aggregated into full acceptance evidence,
-semantic-negative aggregation is included in the full acceptance evidence, and
-latency bars are implemented.
+positive live path can now resume only from a valid contiguous child-index
+prefix for the same seeded job universe; resumed rows are rewritten with
+`row_source=resumed`, fresh rows are emitted with `row_source=fresh`, and
+`evidence.json` includes resume counts. The positive live `evidence.json` is
+intentionally marked partial until the baseline-delta smoke is aggregated into
+full acceptance evidence, semantic-negative aggregation is included in the full
+acceptance evidence, and latency bars are implemented.
 
 The hypervisor branch also adds a separate live nanokernel semantic-negative
 gate:
@@ -198,6 +205,8 @@ rustfmt --edition 2021 --check crates/dh-worker/src/restore_engine.rs crates/dh-
 cargo test -p dh-worker take_snapshot_rolls_full_manifest_and_restore_accepts_baseline_delta -- --nocapture
 cargo test -p dh-worker --test restore_engine delta_chain_restore_materializes_the_full_state -- --nocapture
 cargo test -p dh-worker --test m7_fork_verify replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift
+cargo test -p dh-worker --test m7_fork_verify m8_resume
+cargo test -p dh-worker --test m7_fork_verify --no-run
 cargo test -p dh-worker --no-run
 python3 - <<'PY'  # YAML parse check for touched workflows
 import yaml
@@ -212,8 +221,8 @@ git diff --check
 
 - Confirm the new M8 workflow lanes in GitHub, record required-check status,
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
-- Integrate live M8 resumability, baseline-delta smoke aggregation,
-  semantic-negative aggregation into the full acceptance evidence, and latency
-  bars around the new replay-commit evidence path.
+- Integrate baseline-delta smoke aggregation, semantic-negative aggregation
+  into the full acceptance evidence, and latency bars around the new
+  replay-commit evidence path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.

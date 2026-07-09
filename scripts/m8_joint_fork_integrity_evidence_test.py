@@ -126,6 +126,34 @@ class M8EvidenceValidatorTest(unittest.TestCase):
         errors = self.validate_case(ev, [row(index=0), row(index=2)])
         self.assertTrue(any("unique and contiguous" in error for error in errors), errors)
 
+    def test_accepts_resume_metadata_and_row_sources(self):
+        ev = evidence(expected=2)
+        ev["resume"] = {
+            "enabled": True,
+            "resumed_child_count": 1,
+            "fresh_child_count": 1,
+        }
+        resumed = row(index=0)
+        resumed["row_source"] = "resumed"
+        fresh = row(index=1)
+        fresh["row_source"] = "fresh"
+        self.assertEqual([], self.validate_case(ev, [resumed, fresh]))
+
+    def test_rejects_invalid_row_source_or_resume_counts(self):
+        invalid_source = row()
+        invalid_source["row_source"] = "cached"
+        errors = self.validate_case(evidence(), [invalid_source])
+        self.assertTrue(any("row_source" in error for error in errors), errors)
+
+        ev = evidence(expected=2)
+        ev["resume"] = {
+            "enabled": True,
+            "resumed_child_count": 2,
+            "fresh_child_count": 1,
+        }
+        errors = self.validate_case(ev, [row(index=0), row(index=1)])
+        self.assertTrue(any("must equal child row count" in error for error in errors), errors)
+
     def test_full_acceptance_requires_1000_and_qualified_store_root(self):
         ev = evidence(run_kind="full_acceptance", expected=1)
         ev["store_root"]["qualified"] = False
