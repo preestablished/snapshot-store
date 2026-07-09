@@ -221,6 +221,19 @@ go run github.com/rhysd/actionlint/cmd/actionlint@latest \
   -ignore 'label "kvm-intel" is unknown' .github/workflows/nightly-drift.yaml
 ```
 
+Replacement snapshot-store run:
+<https://github.com/preestablished/snapshot-store/actions/runs/29057434996>.
+GitHub accepted the workflow and created jobs, proving the workflow-file
+failure is fixed. As of the latest poll, `crash-smoke` is green, the hosted
+`rust (ubuntu-latest)` job is still in progress with completed evidence,
+format, build, and failpoint steps green, and `m8-ref-identity-bounded` exists
+but is queued. Runner visibility check found
+`infra-control-kvm-intel` online for `determinism-hypervisor`, but no
+repo-level `kvm-intel` runner visible to `snapshot-store`; the org-level runner
+API requires `admin:org`. The likely next external action is to expose the
+`kvm-intel` runner to `snapshot-store` (or move it to an org runner group that
+includes this repo), then let/re-run the bounded M8 job.
+
 Hypervisor local validation passed:
 
 ```bash
@@ -245,6 +258,8 @@ git diff --check
 
 - Confirm the new M8 workflow lanes in GitHub, record required-check status,
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
+- Expose a self-hosted `kvm-intel` runner to `snapshot-store` or confirm the
+  intended runner group; the bounded M8 snapshot-store job is currently queued.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
 
