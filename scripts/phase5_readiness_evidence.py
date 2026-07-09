@@ -72,6 +72,31 @@ def parse_status(path):
         return None
 
 
+def parse_key_values(text):
+    values = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def parse_canonical_int(values, key):
+    value = values.get(key)
+    if value is None or not value.isdecimal():
+        return None
+    parsed = int(value)
+    return parsed if value == str(parsed) else None
+
+
+def meets_reclaim_target(actual, predicted):
+    if actual is None or predicted is None:
+        return False
+    if predicted == 0:
+        return actual == 0
+    return actual >= predicted or predicted - actual <= max(predicted // 100, 1)
+
+
 def fio_section_bytes(section):
     if not isinstance(section, dict):
         return 0
@@ -369,6 +394,13 @@ def assemble_evidence(root, bench_root):
     m5 = load_json(root / "m5-transport" / "results.json")
     m7 = load_json(root / "m7-gc-benchmark" / "results.json")
     flake_summary = read(root / "flake" / "postfix-50x-summary.txt")
+    flake_summary_values = parse_key_values(flake_summary)
+    flake_runs = parse_canonical_int(flake_summary_values, "runs")
+    flake_failures = parse_canonical_int(flake_summary_values, "failures")
+    flake_ok = flake_runs == 50 and flake_failures == 0
+    flake_status = parse_status(root / "flake" / "status")
+    m5_status = parse_status(root / "m5-transport" / "status")
+    m7_status = parse_status(root / "m7-gc-benchmark" / "status")
     attestation = read(root / "hardware" / "phase5-host-attestation.txt")
     att = {}
     for line in attestation.splitlines():
@@ -400,6 +432,36 @@ def assemble_evidence(root, bench_root):
     qualification_reason = "qualified" if qualified else "; ".join(qualification_failures)
 
     bars = []
+    bars.append(
+        bar(
+            "flake_50x_command_status",
+            "0",
+            flake_status,
+            "exit status",
+            flake_status == 0,
+            "flake/status",
+        )
+    )
+    bars.append(
+        bar(
+            "m5_transport_command_status",
+            "0",
+            m5_status,
+            "exit status",
+            m5_status == 0,
+            "m5-transport/status",
+        )
+    )
+    bars.append(
+        bar(
+            "m7_gc_command_status",
+            "0",
+            m7_status,
+            "exit status",
+            m7_status == 0,
+            "m7-gc-benchmark/status",
+        )
+    )
     for artifact in fio_qualification["artifacts"]:
         measured = None
         if artifact["present"] or artifact["command_status"] is not None:
@@ -425,10 +487,11 @@ def assemble_evidence(root, bench_root):
         bar(
             "page_channel_fallback_50x",
             "50 green runs",
-            50 if "failures=0" in flake_summary else None,
+            flake_runs,
             "runs",
-            "failures=0" in flake_summary,
+            flake_ok,
             "flake/postfix-50x-summary.txt",
+            "" if flake_failures == 0 else f"failures={flake_failures}",
         )
     )
     if m5:
@@ -495,9 +558,17 @@ def assemble_evidence(root, bench_root):
         ]:
             bars.append(bar(name, "", None, "", False, "m5-transport/not-run.txt"))
     if m7:
+        population = m7.get("population", {})
         reclaim = m7.get("reclaiming_gc_run", {})
         idle = m7.get("idle_commit", {})
         gc_commit = m7.get("gc_commit", {})
+        predicted_pruned_nodes = population.get("pruned_nodes")
+        predicted_garbage_pages = population.get(
+            "predicted_garbage_pages", reclaim.get("predicted_garbage_pages")
+        )
+        predicted_garbage_bytes = population.get(
+            "predicted_garbage_bytes", reclaim.get("predicted_garbage_bytes")
+        )
         idle_errors = idle.get("errors")
         gc_errors = gc_commit.get("errors", reclaim.get("commit_errors"))
         reclaim_successful_samples = reclaim.get("commit_successful_samples")
@@ -520,10 +591,31 @@ def assemble_evidence(root, bench_root):
                 ),
                 bar(
                     "m7_gc_nodes_reaped",
-                    "> 0",
+                    ">= pruned target",
                     reclaim.get("nodes_reaped"),
                     "nodes",
-                    reclaim.get("nodes_reaped", 0) > 0,
+                    predicted_pruned_nodes is not None
+                    and reclaim.get("nodes_reaped", 0) >= predicted_pruned_nodes,
+                    "m7-gc-benchmark/results.json",
+                ),
+                bar(
+                    "m7_gc_pages_reclaimed",
+                    ">= predicted garbage pages",
+                    reclaim.get("pages_reclaimed"),
+                    "pages",
+                    meets_reclaim_target(
+                        reclaim.get("pages_reclaimed"), predicted_garbage_pages
+                    ),
+                    "m7-gc-benchmark/results.json",
+                ),
+                bar(
+                    "m7_gc_bytes_reclaimed",
+                    ">= predicted garbage bytes",
+                    reclaim.get("bytes_reclaimed"),
+                    "bytes",
+                    meets_reclaim_target(
+                        reclaim.get("bytes_reclaimed"), predicted_garbage_bytes
+                    ),
                     "m7-gc-benchmark/results.json",
                 ),
                 bar(
@@ -573,6 +665,8 @@ def assemble_evidence(root, bench_root):
         for name in [
             "m7_gc_reclaiming_duration",
             "m7_gc_nodes_reaped",
+            "m7_gc_pages_reclaimed",
+            "m7_gc_bytes_reclaimed",
             "m7_gc_ingest_during_gc",
             "m7_idle_commit_errors",
             "m7_gc_commit_errors",
@@ -624,18 +718,21 @@ def assemble_evidence(root, bench_root):
                 "argv": "cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1",
                 "env": {},
                 "log": "flake/postfix-50x.log",
+                "status": "flake/status",
             },
             {
                 "id": "m5_transport",
                 "argv": "cargo test -p snapstore-server --test page_channel_perf --release -- --ignored --nocapture",
                 "env": {"SNAPSTORE_BENCH_ROOT": str(bench_root)},
                 "log": "m5-transport/page_channel_perf.log",
+                "status": "m5-transport/status",
             },
             {
                 "id": "m7_gc",
                 "argv": "cargo test -p snapstore-server --test gc_readiness_bench --release -- --ignored --nocapture",
                 "env": {"SNAPSTORE_BENCH_ROOT": str(bench_root)},
                 "log": "m7-gc-benchmark/gc_readiness_bench.log",
+                "status": "m7-gc-benchmark/status",
             },
         ],
         "artifacts": artifact_list(root),

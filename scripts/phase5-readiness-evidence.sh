@@ -22,6 +22,7 @@ RUN_M5="${RUN_M5:-0}"
 RUN_M7_GC="${RUN_M7_GC:-0}"
 RUN_FLAKE_50X="${RUN_FLAKE_50X:-0}"
 RUN_FIO="${RUN_FIO:-1}"
+OVERALL_STATUS=0
 
 mkdir -p \
   "$EVIDENCE_ROOT/hardware" \
@@ -63,6 +64,15 @@ run_fio_capture() {
   local status=$?
   set -e
   printf '%s\n' "$status" >"$status_file"
+}
+
+record_status() {
+  local status_file="$1"
+  local status="$2"
+  printf '%s\n' "$status" >"$status_file"
+  if [[ "$status" -ne 0 ]]; then
+    OVERALL_STATUS=1
+  fi
 }
 
 echo "== [1/5] hardware preflight"
@@ -108,20 +118,33 @@ same_as_i5_sata_reference=${PHASE5_SAME_AS_I5_SATA_REFERENCE:-UNSET}
 operator_attestation=${PHASE5_OPERATOR_ATTESTATION:-UNSET}
 EOF
 
+rm -f \
+  "$EVIDENCE_ROOT/hardware/fio-skipped.txt" \
+  "$EVIDENCE_ROOT/hardware/fio-unavailable.txt" \
+  "$EVIDENCE_ROOT/hardware/fio-seqwrite.json" \
+  "$EVIDENCE_ROOT/hardware/fio-seqwrite.status" \
+  "$EVIDENCE_ROOT/hardware/fio-seqwrite.log" \
+  "$EVIDENCE_ROOT/hardware/fio-seqread.json" \
+  "$EVIDENCE_ROOT/hardware/fio-seqread.status" \
+  "$EVIDENCE_ROOT/hardware/fio-seqread.log" \
+  "$EVIDENCE_ROOT/hardware/fio-randrw.json" \
+  "$EVIDENCE_ROOT/hardware/fio-randrw.status" \
+  "$EVIDENCE_ROOT/hardware/fio-randrw.log"
+
 if [[ "$RUN_FIO" == "1" ]]; then
   if command -v fio >/dev/null 2>&1; then
     echo "== fio baselines"
     run_fio_capture fio-seqwrite fio --name=phase5-seqwrite --directory "$SNAPSTORE_BENCH_ROOT" --rw=write \
       --bs=1M --size="${PHASE5_FIO_SEQ_SIZE:-8G}" --iodepth=32 --numjobs=1 --direct=1 \
-      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
+      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --unlink=1 --output-format=json \
       --output "$EVIDENCE_ROOT/hardware/fio-seqwrite.json"
     run_fio_capture fio-seqread fio --name=phase5-seqread --directory "$SNAPSTORE_BENCH_ROOT" --rw=read \
       --bs=1M --size="${PHASE5_FIO_SEQ_SIZE:-8G}" --iodepth=32 --numjobs=1 --direct=1 \
-      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
+      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --unlink=1 --output-format=json \
       --output "$EVIDENCE_ROOT/hardware/fio-seqread.json"
     run_fio_capture fio-randrw fio --name=phase5-randrw --directory "$SNAPSTORE_BENCH_ROOT" --rw=randrw \
       --rwmixread=70 --bs=4k --size="${PHASE5_FIO_RAND_SIZE:-4G}" --iodepth=64 --numjobs=4 --direct=1 \
-      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --output-format=json \
+      --runtime="${PHASE5_FIO_RUNTIME:-60}" --time_based --group_reporting --unlink=1 --output-format=json \
       --output "$EVIDENCE_ROOT/hardware/fio-randrw.json"
   else
     {
@@ -135,22 +158,45 @@ else
   echo "RUN_FIO=0" >"$EVIDENCE_ROOT/hardware/fio-skipped.txt"
 fi
 
+rm -f \
+  "$EVIDENCE_ROOT/flake/not-run.txt" \
+  "$EVIDENCE_ROOT/flake/status" \
+  "$EVIDENCE_ROOT/flake/postfix-50x-summary.txt"
+
 if [[ "$RUN_FLAKE_50X" == "1" ]]; then
   echo "== [2/5] page_channel_fallback 50x"
+  set +e
   cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1 \
     2>&1 | tee "$EVIDENCE_ROOT/flake/page_channel_fallback.log"
+  FLAKE_INITIAL_STATUS=${PIPESTATUS[0]}
   : >"$EVIDENCE_ROOT/flake/postfix-50x.log"
+  FLAKE_FAILURES=0
   for i in $(seq 1 50); do
     cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1 \
       >>"$EVIDENCE_ROOT/flake/postfix-50x.log" 2>&1
+    STATUS=$?
+    if [[ "$STATUS" -ne 0 ]]; then
+      FLAKE_FAILURES=$((FLAKE_FAILURES + 1))
+    fi
   done
-  printf 'runs=50\nfailures=0\ncommand=cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1\n' \
+  set -e
+  FLAKE_STATUS=0
+  if [[ "$FLAKE_INITIAL_STATUS" -ne 0 || "$FLAKE_FAILURES" -ne 0 ]]; then
+    FLAKE_STATUS=1
+  fi
+  record_status "$EVIDENCE_ROOT/flake/status" "$FLAKE_STATUS"
+  printf 'runs=50\nfailures=%s\ncommand=cargo test -p snapstore-client --test page_channel_fallback -- --test-threads=1\n' "$FLAKE_FAILURES" \
     >"$EVIDENCE_ROOT/flake/postfix-50x-summary.txt"
   echo "Root cause: test observability race. The client could receive GET_BATCH_DATA before the server-side GET_BATCH metric increment became visible; positive metric assertions now poll for the increment." \
     >"$EVIDENCE_ROOT/flake/root-cause.txt"
 else
   echo "RUN_FLAKE_50X=0" >"$EVIDENCE_ROOT/flake/not-run.txt"
 fi
+
+rm -f \
+  "$EVIDENCE_ROOT/m5-transport/not-run.txt" \
+  "$EVIDENCE_ROOT/m5-transport/status" \
+  "$EVIDENCE_ROOT/m5-transport/results.json"
 
 if [[ "$RUN_M5" == "1" ]]; then
   echo "== [3/5] M5 transport revalidation"
@@ -175,16 +221,21 @@ if [[ "$RUN_M5" == "1" ]]; then
     2>&1 | tee "$EVIDENCE_ROOT/m5-transport/page_channel_perf.log"
   M5_STATUS=${PIPESTATUS[0]}
   set -e
+  record_status "$EVIDENCE_ROOT/m5-transport/status" "$M5_STATUS"
   [[ -n "${PIDSTAT_PID:-}" ]] && kill "$PIDSTAT_PID" 2>/dev/null || true
   [[ -n "${IOSTAT_PID:-}" ]] && kill "$IOSTAT_PID" 2>/dev/null || true
   SNAPSTORE_BENCH_ROOT="$SNAPSTORE_BENCH_ROOT" \
   cargo bench -p snapstore-pagestore --bench read_path -- \
     --warm-up-time 2 --measurement-time 8 \
     2>&1 | tee "$EVIDENCE_ROOT/m5-transport/read_path.log" || true
-  [[ "$M5_STATUS" -eq 0 ]]
 else
   echo "RUN_M5=0" >"$EVIDENCE_ROOT/m5-transport/not-run.txt"
 fi
+
+rm -f \
+  "$EVIDENCE_ROOT/m7-gc-benchmark/not-run.txt" \
+  "$EVIDENCE_ROOT/m7-gc-benchmark/status" \
+  "$EVIDENCE_ROOT/m7-gc-benchmark/results.json"
 
 if [[ "$RUN_M7_GC" == "1" ]]; then
   echo "== [4/5] M7 GC readiness benchmark"
@@ -195,7 +246,7 @@ if [[ "$RUN_M7_GC" == "1" ]]; then
     2>&1 | tee "$EVIDENCE_ROOT/m7-gc-benchmark/gc_readiness_bench.log"
   M7_STATUS=${PIPESTATUS[0]}
   set -e
-  [[ "$M7_STATUS" -eq 0 ]]
+  record_status "$EVIDENCE_ROOT/m7-gc-benchmark/status" "$M7_STATUS"
 else
   echo "RUN_M7_GC=0" >"$EVIDENCE_ROOT/m7-gc-benchmark/not-run.txt"
 fi
@@ -204,3 +255,4 @@ echo "== [5/5] assembling evidence.json"
 python3 scripts/phase5_readiness_evidence.py "$EVIDENCE_ROOT" "$SNAPSTORE_BENCH_ROOT"
 
 echo "== done: $EVIDENCE_ROOT"
+exit "$OVERALL_STATUS"

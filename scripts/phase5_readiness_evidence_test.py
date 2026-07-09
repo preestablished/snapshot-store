@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from phase5_readiness_evidence import evaluate_fio_artifacts, resolve_disk_info
+from phase5_readiness_evidence import (
+    evaluate_fio_artifacts,
+    parse_canonical_int,
+    parse_key_values,
+    resolve_disk_info,
+)
 
 
 def mount(source, majmin, fstype="ext4"):
@@ -272,6 +277,21 @@ class FioQualificationTest(unittest.TestCase):
 
             self.assertFalse(qualification["ok"])
             self.assertIn("fio skipped", qualification["failure_reasons"])
+
+
+class SummaryParsingTest(unittest.TestCase):
+    def test_parse_canonical_summary_counts(self):
+        values = parse_key_values("runs=50\nfailures=0\n")
+
+        self.assertEqual(parse_canonical_int(values, "runs"), 50)
+        self.assertEqual(parse_canonical_int(values, "failures"), 0)
+
+    def test_rejects_missing_or_noncanonical_summary_counts(self):
+        values = parse_key_values("runs=1\nfailures=01\n")
+
+        self.assertEqual(parse_canonical_int(values, "runs"), 1)
+        self.assertIsNone(parse_canonical_int(values, "failures"))
+        self.assertIsNone(parse_canonical_int(values, "missing"))
 
 
 if __name__ == "__main__":

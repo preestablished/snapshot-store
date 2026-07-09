@@ -77,6 +77,8 @@ struct PopulationJson {
     nodes_created: u64,
     pages_per_node: u64,
     physical_page_bytes_before_gc: u64,
+    pruned_nodes: u64,
+    predicted_garbage_pages: u64,
     predicted_garbage_bytes: u64,
     pruned_subtrees: Vec<PrunedSubtreeJson>,
 }
@@ -92,6 +94,8 @@ struct PrunedSubtreeJson {
 #[derive(Clone, Debug, Serialize)]
 struct CommitSample {
     phase: String,
+    start_ms: f64,
+    end_ms: f64,
     latency_ms: f64,
     bytes: u64,
     ok: bool,
@@ -132,12 +136,19 @@ struct ReclaimingGcRunJson {
     commit_samples: usize,
     commit_successful_samples: usize,
     commit_errors: u64,
+    reclaim_window_start_ms: f64,
+    reclaim_window_end_ms: f64,
+    predicted_garbage_pages: u64,
+    predicted_garbage_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct PassJson {
     gc_under_60s: bool,
     reclaiming_cycle_reaped_nodes: bool,
+    reclaiming_cycle_reaped_target_nodes: bool,
+    reclaimed_predicted_pages: bool,
+    reclaimed_predicted_bytes: bool,
     ingest_at_200_mbps: bool,
     idle_commit_samples_present: bool,
     reclaiming_commit_samples_present: bool,
@@ -469,6 +480,8 @@ fn populate_and_prune(
         nodes_created: config.nodes,
         pages_per_node,
         physical_page_bytes_before_gc: config.nodes * pages_per_node * PAGE_SIZE as u64,
+        pruned_nodes,
+        predicted_garbage_pages: pruned_nodes * pages_per_node,
         predicted_garbage_bytes: pruned_nodes * pages_per_node * PAGE_SIZE as u64,
         pruned_subtrees,
     }
@@ -563,6 +576,7 @@ fn spawn_committers(
                 }
                 let node_id = next_node.fetch_add(1, Ordering::SeqCst);
                 let commit_start = Instant::now();
+                let commit_start_ms = commit_start.duration_since(run_start).as_secs_f64() * 1e3;
                 let result = commit_snapshot(
                     &store,
                     seed,
@@ -581,11 +595,14 @@ fn spawn_committers(
                     )
                 });
                 let latency_ms = commit_start.elapsed().as_secs_f64() * 1e3;
+                let commit_end_ms = run_start.elapsed().as_secs_f64() * 1e3;
                 match result {
                     Ok(()) => {
                         bytes_done.fetch_add(bytes_per_commit, Ordering::SeqCst);
                         samples.push(CommitSample {
                             phase: phase_name(commit_phase_code).to_string(),
+                            start_ms: commit_start_ms,
+                            end_ms: commit_end_ms,
                             latency_ms,
                             bytes: bytes_per_commit,
                             ok: true,
@@ -594,6 +611,8 @@ fn spawn_committers(
                     }
                     Err(error) => samples.push(CommitSample {
                         phase: phase_name(commit_phase_code).to_string(),
+                        start_ms: commit_start_ms,
+                        end_ms: commit_end_ms,
                         latency_ms,
                         bytes: bytes_per_commit,
                         ok: false,
@@ -663,36 +682,49 @@ fn gc_run_json(report: &GcReport) -> GcRunJson {
     }
 }
 
-fn reclaim_samples(samples: &[CommitSample]) -> Vec<f64> {
+fn in_reclaim_window(sample: &CommitSample, start: Duration, end: Duration) -> bool {
+    let start_ms = start.as_secs_f64() * 1e3;
+    let end_ms = end.as_secs_f64() * 1e3;
+    sample.phase == "during_reclaiming_gc" && sample.start_ms >= start_ms && sample.end_ms <= end_ms
+}
+
+fn reclaim_samples(samples: &[CommitSample], start: Duration, end: Duration) -> Vec<f64> {
     let mut latencies: Vec<f64> = samples
         .iter()
-        .filter(|s| s.ok && s.phase == "during_reclaiming_gc")
+        .filter(|s| s.ok && in_reclaim_window(s, start, end))
         .map(|s| s.latency_ms)
         .collect();
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     latencies
 }
 
-fn reclaim_bytes(samples: &[CommitSample]) -> u64 {
+fn reclaim_bytes(samples: &[CommitSample], start: Duration, end: Duration) -> u64 {
     samples
         .iter()
-        .filter(|s| s.ok && s.phase == "during_reclaiming_gc")
+        .filter(|s| s.ok && in_reclaim_window(s, start, end))
         .map(|s| s.bytes)
         .sum()
 }
 
-fn reclaim_sample_count(samples: &[CommitSample]) -> usize {
+fn reclaim_sample_count(samples: &[CommitSample], start: Duration, end: Duration) -> usize {
     samples
         .iter()
-        .filter(|s| s.phase == "during_reclaiming_gc")
+        .filter(|s| in_reclaim_window(s, start, end))
         .count()
 }
 
-fn reclaim_error_count(samples: &[CommitSample]) -> u64 {
+fn reclaim_error_count(samples: &[CommitSample], start: Duration, end: Duration) -> u64 {
     samples
         .iter()
-        .filter(|s| !s.ok && s.phase == "during_reclaiming_gc")
+        .filter(|s| !s.ok && in_reclaim_window(s, start, end))
         .count() as u64
+}
+
+fn meets_reclaim_target(actual: u64, predicted: u64) -> bool {
+    if predicted == 0 {
+        return actual == 0;
+    }
+    actual >= predicted || predicted.saturating_sub(actual) <= (predicted / 100).max(1)
 }
 
 fn failed_pass_criteria(pass: &PassJson) -> Vec<&'static str> {
@@ -702,6 +734,15 @@ fn failed_pass_criteria(pass: &PassJson) -> Vec<&'static str> {
     }
     if !pass.reclaiming_cycle_reaped_nodes {
         failures.push("reclaiming_cycle_reaped_nodes");
+    }
+    if !pass.reclaiming_cycle_reaped_target_nodes {
+        failures.push("reclaiming_cycle_reaped_target_nodes");
+    }
+    if !pass.reclaimed_predicted_pages {
+        failures.push("reclaimed_predicted_pages");
+    }
+    if !pass.reclaimed_predicted_bytes {
+        failures.push("reclaimed_predicted_bytes");
     }
     if !pass.ingest_at_200_mbps {
         failures.push("ingest_at_200_mbps");
@@ -732,11 +773,13 @@ fn write_outputs(output: &BenchOutput, samples: &[CommitSample]) {
     if let Some(parent) = json_path.parent() {
         std::fs::create_dir_all(parent).expect("create SNAPSTORE_GC_BENCH_JSON parent");
         let csv_path = parent.join("commit-latencies.csv");
-        let mut csv = String::from("phase,latency_ms,bytes,ok,error\n");
+        let mut csv = String::from("phase,start_ms,end_ms,latency_ms,bytes,ok,error\n");
         for sample in samples {
             csv.push_str(&format!(
-                "{},{:.6},{},{},{}\n",
+                "{},{:.6},{:.6},{:.6},{},{},{}\n",
                 sample.phase,
+                sample.start_ms,
+                sample.end_ms,
                 sample.latency_ms,
                 sample.bytes,
                 sample.ok,
@@ -770,6 +813,18 @@ mod tests {
                     "selected roots {left_root} and {right_root} overlap"
                 );
             }
+        }
+    }
+
+    fn sample(phase: &str, start_ms: f64, end_ms: f64, ok: bool) -> CommitSample {
+        CommitSample {
+            phase: phase.to_string(),
+            start_ms,
+            end_ms,
+            latency_ms: end_ms - start_ms,
+            bytes: 1024,
+            ok,
+            error: String::new(),
         }
     }
 
@@ -815,6 +870,30 @@ mod tests {
 
         assert_eq!(first, second);
         assert_no_overlap(&first);
+    }
+
+    #[test]
+    fn reclaim_metrics_only_count_samples_inside_window() {
+        let samples = vec![
+            sample("during_grace_gc", 90.0, 110.0, true),
+            sample("during_reclaiming_gc", 110.0, 140.0, true),
+            sample("during_reclaiming_gc", 150.0, 250.0, true),
+            sample("during_reclaiming_gc", 160.0, 170.0, false),
+        ];
+        let start = Duration::from_millis(100);
+        let end = Duration::from_millis(200);
+
+        assert_eq!(reclaim_bytes(&samples, start, end), 1024);
+        assert_eq!(reclaim_sample_count(&samples, start, end), 2);
+        assert_eq!(reclaim_error_count(&samples, start, end), 1);
+        assert_eq!(reclaim_samples(&samples, start, end), vec![30.0]);
+    }
+
+    #[test]
+    fn reclaim_target_allows_one_percent_shortfall() {
+        assert!(meets_reclaim_target(990, 1000));
+        assert!(meets_reclaim_target(1000, 1000));
+        assert!(!meets_reclaim_target(989, 1000));
     }
 }
 
@@ -866,24 +945,35 @@ fn gc_readiness_benchmark() {
     let opts = gc_opts(&config);
     let grace = run_gc_cycle(&store, &meta, &opts, &GcHooks::none()).expect("grace GC cycle");
     commit_run.phase.store(PHASE_RECLAIMING, Ordering::SeqCst);
+    let reclaim_window_start = commit_run.start.elapsed();
     let reclaim_start = Instant::now();
     let reclaim =
         run_gc_cycle(&store, &meta, &opts, &GcHooks::none()).expect("reclaiming GC cycle");
     let reclaim_wall = reclaim_start.elapsed();
+    let reclaim_window_end = commit_run.start.elapsed();
     let (gc_commit_duration, gc_commit_bytes, gc_samples) = commit_run.stop_and_join();
     let gc_commit_summary = summarize_commits(gc_commit_duration, gc_commit_bytes, &gc_samples);
 
-    let reclaim_latencies = reclaim_samples(&gc_samples);
+    let reclaim_latencies = reclaim_samples(&gc_samples, reclaim_window_start, reclaim_window_end);
     let reclaim_successful_samples = reclaim_latencies.len();
-    let reclaim_sample_count = reclaim_sample_count(&gc_samples);
-    let reclaim_error_count = reclaim_error_count(&gc_samples);
-    let reclaim_ingest_mbps =
-        reclaim_bytes(&gc_samples) as f64 / reclaim_wall.as_secs_f64().max(0.001) / 1_000_000.0;
+    let reclaim_sample_count =
+        reclaim_sample_count(&gc_samples, reclaim_window_start, reclaim_window_end);
+    let reclaim_error_count =
+        reclaim_error_count(&gc_samples, reclaim_window_start, reclaim_window_end);
+    let reclaim_ingest_mbps = reclaim_bytes(&gc_samples, reclaim_window_start, reclaim_window_end)
+        as f64
+        / reclaim_wall.as_secs_f64().max(0.001)
+        / 1_000_000.0;
     let reclaim_p99 = percentile_or_zero(&reclaim_latencies, 0.99);
     let idle_samples_present = idle_summary.samples > 0;
     let reclaiming_samples_present = reclaim_successful_samples > 0;
     let idle_errors_zero = idle_summary.errors == 0;
     let gc_errors_zero = gc_commit_summary.errors == 0;
+    let reaped_target_nodes = reclaim.nodes_reaped >= population.pruned_nodes;
+    let reclaimed_predicted_pages =
+        meets_reclaim_target(reclaim.pages_reclaimed, population.predicted_garbage_pages);
+    let reclaimed_predicted_bytes =
+        meets_reclaim_target(reclaim.bytes_reclaimed, population.predicted_garbage_bytes);
 
     let reclaiming_gc_run = ReclaimingGcRunJson {
         duration_ms: reclaim.duration_ms,
@@ -897,10 +987,17 @@ fn gc_readiness_benchmark() {
         commit_samples: reclaim_sample_count,
         commit_successful_samples: reclaim_successful_samples,
         commit_errors: reclaim_error_count,
+        reclaim_window_start_ms: reclaim_window_start.as_secs_f64() * 1e3,
+        reclaim_window_end_ms: reclaim_window_end.as_secs_f64() * 1e3,
+        predicted_garbage_pages: population.predicted_garbage_pages,
+        predicted_garbage_bytes: population.predicted_garbage_bytes,
     };
     let pass = PassJson {
         gc_under_60s: reclaim.duration_ms < 60_000,
         reclaiming_cycle_reaped_nodes: reclaim.nodes_reaped > 0,
+        reclaiming_cycle_reaped_target_nodes: reaped_target_nodes,
+        reclaimed_predicted_pages,
+        reclaimed_predicted_bytes,
         ingest_at_200_mbps: reclaim_ingest_mbps >= config.ingest_target_mbps,
         idle_commit_samples_present: idle_samples_present,
         reclaiming_commit_samples_present: reclaiming_samples_present,
