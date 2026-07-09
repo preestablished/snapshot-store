@@ -142,8 +142,23 @@ The hypervisor harness now honors:
 The M8 gate writes live `child-ref-table.jsonl` rows incrementally, writes
 `child-ref-table.csv` and `evidence.json` at finish, and computes
 `shared_page_ratio` from store-visible root/child manifest page hashes. The
-live `evidence.json` is intentionally marked partial until baseline-delta
-restore, live semantic-negative red-run, and latency bars are implemented.
+positive live `evidence.json` is intentionally marked partial until
+baseline-delta restore, semantic-negative aggregation into the full acceptance
+evidence, and latency bars are implemented.
+
+The hypervisor branch also adds a separate live nanokernel semantic-negative
+gate:
+
+```bash
+cargo test -p dh-worker --test m7_fork_verify \
+  m8_accept_semantic_negative_replay_commit_ref_mismatch \
+  -- --ignored --nocapture --test-threads=1
+```
+
+That gate mutates the first pad input after restoring the root snapshot,
+commits the replay with `TakeSnapshot`, requires the replay snapshot ref to
+differ from the original child ref, and writes `run_kind=semantic_negative`
+evidence under `${M8_EVIDENCE_ROOT:-target/m8-joint-fork-integrity-live}/semantic-negative`.
 
 Hypervisor local validation passed:
 
@@ -161,7 +176,8 @@ git diff --check
   represented with real `bd dep` edges.
 - Wire baseline-resident delta restore and FULL-manifest cadence before any
   full M8 run.
-- Integrate live M8 resumability, semantic-negative red-run output, and latency
-  bars around the new replay-commit evidence path.
+- Integrate live M8 resumability, semantic-negative aggregation into the full
+  acceptance evidence, and latency bars around the new replay-commit evidence
+  path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
