@@ -75,6 +75,8 @@ The snapshot-store side now has a host-runnable M8 evidence validator:
 
 - `scripts/m8_joint_fork_integrity_evidence.py`
 - `scripts/m8_joint_fork_integrity_evidence_test.py`
+- `scripts/m8_joint_fork_integrity_fake_harness.py`
+- `scripts/m8_joint_fork_integrity_fake_harness_test.py`
 
 The validator enforces the plan's schema requirements for:
 
@@ -87,17 +89,26 @@ The validator enforces the plan's schema requirements for:
 - committed replay-ref mismatch for semantic-negative runs
 - contiguous child indices and at least one baseline-delta row in positive runs
 
-CI now runs both evidence test suites:
+CI now runs the evidence test suites:
 
 - `python3 scripts/phase5_readiness_evidence_test.py`
 - `python3 scripts/m8_joint_fork_integrity_evidence_test.py`
+- `python3 scripts/m8_joint_fork_integrity_fake_harness_test.py`
 
 Local validation passed with:
 
 ```bash
 DD_TRACE_ENABLED=false DD_CIVISIBILITY_ENABLED=false python3 scripts/m8_joint_fork_integrity_evidence_test.py
+DD_TRACE_ENABLED=false DD_CIVISIBILITY_ENABLED=false python3 scripts/m8_joint_fork_integrity_fake_harness_test.py
 DD_TRACE_ENABLED=false DD_CIVISIBILITY_ENABLED=false python3 scripts/phase5_readiness_evidence_test.py
 ```
+
+The fake harness writes validator-valid `run_kind=fake` evidence with
+`evidence.json`, `child-ref-table.jsonl`, and `child-ref-table.csv`. Its tests
+cover FULL cadence rows, baseline-delta rows, shared-page aggregate accounting,
+resume from a partial child table, and a committed semantic-negative
+`ref_mismatch` row. This is host-only scaffolding; it is not live KVM/NVMe M8
+acceptance evidence.
 
 ## Hypervisor Replay-Commit Progress
 
@@ -136,8 +147,8 @@ git diff --check
   represented with real `bd dep` edges.
 - Wire baseline-resident delta restore and FULL-manifest cadence before any
   full M8 run.
-- Add the remaining M8 harness evidence emission, resumability/shared-page
-  accounting, and semantic-negative integration around the new replay-commit
+- Integrate live hypervisor evidence emission, resumability/shared-page
+  accounting, and semantic-negative red-run output around the new replay-commit
   path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
