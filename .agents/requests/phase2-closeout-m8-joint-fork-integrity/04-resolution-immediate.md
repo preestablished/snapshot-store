@@ -89,6 +89,8 @@ The validator enforces the plan's schema requirements for:
 - contiguous child indices and at least one baseline-delta row in positive runs
 - optional `row_source` values (`fresh`/`resumed`) and optional top-level
   resume counts when live evidence includes them
+- optional `latency_ms` summaries with typed p50/p95/p99/max stats when live
+  evidence includes them
 
 CI now runs the evidence test suites:
 
@@ -144,14 +146,18 @@ The hypervisor harness now honors:
 
 The M8 gate writes live `child-ref-table.jsonl` rows incrementally, writes
 `child-ref-table.csv` and `evidence.json` at finish, and computes
-`shared_page_ratio` from store-visible root/child manifest page hashes. The
-positive live path can now resume only from a valid contiguous child-index
-prefix for the same seeded job universe; resumed rows are rewritten with
-`row_source=resumed`, fresh rows are emitted with `row_source=fresh`, and
-`evidence.json` includes resume counts. The positive live `evidence.json` is
-intentionally marked partial until the baseline-delta smoke is aggregated into
-full acceptance evidence, semantic-negative aggregation is included in the full
-acceptance evidence, and latency bars are implemented.
+`shared_page_ratio` from store-visible root/child manifest page hashes. It now
+records row-level timing for fork, original run/commit, restore, replay, and
+replay commit, then writes `latency_ms` summaries for p50/p95/p99/max evidence.
+`m8_fork_commit_p99` turns green when every row has measured fork-to-original
+commit timing; `m8_restore_delta_p99` turns green only when baseline-delta
+restore timing is present. The positive live path can resume only from a valid
+contiguous child-index prefix for the same seeded job universe; resumed rows
+are rewritten with `row_source=resumed`, fresh rows are emitted with
+`row_source=fresh`, and `evidence.json` includes resume counts. The positive
+live `evidence.json` is intentionally marked partial until the baseline-delta
+smoke is aggregated into full acceptance evidence and semantic-negative
+aggregation is included in the full acceptance evidence.
 
 The hypervisor branch also adds a separate live nanokernel semantic-negative
 gate:
@@ -222,7 +228,6 @@ git diff --check
 - Confirm the new M8 workflow lanes in GitHub, record required-check status,
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
 - Integrate baseline-delta smoke aggregation, semantic-negative aggregation
-  into the full acceptance evidence, and latency bars around the new
-  replay-commit evidence path.
+  into the full acceptance evidence.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.

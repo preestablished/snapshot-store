@@ -12,6 +12,12 @@ MANIFEST_KINDS = {"FULL", "DELTA"}
 RESULTS = {"pass", "ref_mismatch", "state_mismatch", "replay_divergence", "error"}
 ROW_SOURCES = {"fresh", "resumed"}
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
+LATENCY_GROUPS = [
+    "fork_to_original_commit",
+    "restore_delta",
+    "restore_full",
+    "replay_restore_to_commit",
+]
 
 REQUIRED_REPOS = [
     "snapshot-store",
@@ -250,6 +256,45 @@ def validate_resume_metadata(evidence, rows, errors):
         errors.append("resume.resumed_child_count: must be 0 when resume.enabled=false")
 
 
+def validate_latency_stats(stats, field, errors):
+    if not isinstance(stats, dict):
+        errors.append(f"latency_ms.{field}: must be an object")
+        return
+    count = stats.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        errors.append(f"latency_ms.{field}.count: must be a non-negative integer")
+        count = None
+    values = [stats.get(key) for key in ["p50", "p95", "p99", "max"]]
+    if count == 0:
+        if any(value is not None for value in values):
+            errors.append(f"latency_ms.{field}: empty stats must use null percentiles")
+        return
+    if count is not None:
+        for key, value in zip(["p50", "p95", "p99", "max"], values):
+            if not is_number(value) or value < 0:
+                errors.append(f"latency_ms.{field}.{key}: must be a non-negative number")
+        if all(is_number(value) for value in values):
+            if not (values[0] <= values[1] <= values[2] <= values[3]):
+                errors.append(f"latency_ms.{field}: percentiles must be monotonic")
+
+
+def validate_latency_metadata(evidence, errors):
+    latency = evidence.get("latency_ms")
+    if latency is None:
+        return
+    if not isinstance(latency, dict):
+        errors.append("latency_ms: must be an object")
+        return
+    policy = latency.get("policy")
+    if policy is not None and (not isinstance(policy, str) or not policy):
+        errors.append("latency_ms.policy: must be a non-empty string")
+    for field in LATENCY_GROUPS:
+        if field not in latency:
+            errors.append(f"latency_ms.{field}: missing")
+            continue
+        validate_latency_stats(latency[field], field, errors)
+
+
 def validate_evidence(root):
     root = Path(root)
     evidence_path = root / "evidence.json"
@@ -308,6 +353,7 @@ def validate_evidence(root):
 
     rows = load_child_rows(root, evidence, errors)
     validate_resume_metadata(evidence, rows, errors)
+    validate_latency_metadata(evidence, errors)
     if run_kind == "semantic_negative":
         validate_semantic_negative_rows(rows, errors)
     else:

@@ -94,6 +94,40 @@ def evidence(run_kind="fake", expected=1, bar_overrides=None):
     }
 
 
+def latency():
+    return {
+        "policy": "telemetry",
+        "fork_to_original_commit": {
+            "count": 1,
+            "p50": 6.0,
+            "p95": 6.0,
+            "p99": 6.0,
+            "max": 6.0,
+        },
+        "restore_delta": {
+            "count": 1,
+            "p50": 4.0,
+            "p95": 4.0,
+            "p99": 4.0,
+            "max": 4.0,
+        },
+        "restore_full": {
+            "count": 0,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        },
+        "replay_restore_to_commit": {
+            "count": 1,
+            "p50": 15.0,
+            "p95": 15.0,
+            "p99": 15.0,
+            "max": 15.0,
+        },
+    }
+
+
 def write_case(root, ev, rows):
     root.mkdir(parents=True, exist_ok=True)
     (root / "evidence.json").write_text(json.dumps(ev))
@@ -153,6 +187,26 @@ class M8EvidenceValidatorTest(unittest.TestCase):
         }
         errors = self.validate_case(ev, [row(index=0), row(index=1)])
         self.assertTrue(any("must equal child row count" in error for error in errors), errors)
+
+    def test_accepts_latency_metadata(self):
+        ev = evidence()
+        ev["latency_ms"] = latency()
+        self.assertEqual([], self.validate_case(ev, [row()]))
+
+    def test_rejects_invalid_latency_metadata(self):
+        ev = evidence()
+        ev["latency_ms"] = latency()
+        ev["latency_ms"]["restore_delta"]["p95"] = 3.0
+        ev["latency_ms"]["restore_delta"]["p99"] = 2.0
+        errors = self.validate_case(ev, [row()])
+        self.assertTrue(any("percentiles must be monotonic" in error for error in errors), errors)
+
+        ev = evidence()
+        ev["latency_ms"] = latency()
+        ev["latency_ms"]["restore_full"]["count"] = 0
+        ev["latency_ms"]["restore_full"]["p50"] = 1.0
+        errors = self.validate_case(ev, [row()])
+        self.assertTrue(any("empty stats must use null" in error for error in errors), errors)
 
     def test_full_acceptance_requires_1000_and_qualified_store_root(self):
         ev = evidence(run_kind="full_acceptance", expected=1)
