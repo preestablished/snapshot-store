@@ -24,7 +24,17 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use snapstore_pagestore::{PageStore, StoreOptions};
 use snapstore_testgen::{GuestProfile, SyntheticGuest};
 use snapstore_types::PAGE_SIZE;
-use tempfile::TempDir;
+use tempfile::{Builder as TempBuilder, TempDir};
+
+fn bench_tempdir(prefix: &str) -> TempDir {
+    match std::env::var_os("SNAPSTORE_BENCH_ROOT") {
+        Some(root) => TempBuilder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .expect("create benchmark tempdir in SNAPSTORE_BENCH_ROOT"),
+        None => TempDir::new().unwrap(),
+    }
+}
 
 // ── Bench 1: ingest_fastpath_cold ────────────────────────────────────────────
 //
@@ -66,7 +76,7 @@ fn bench_ingest_fastpath_cold(c: &mut Criterion) {
     group.bench_function("ingest_fastpath_cold", |b| {
         b.iter_batched(
             // Setup: create a fresh temp dir (not counted in time)
-            || TempDir::new().unwrap(),
+            || bench_tempdir("snapstore-ingest-cold-"),
             // Routine: ingest all pages into the fresh store (this IS counted)
             |dir| {
                 let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
@@ -113,7 +123,7 @@ fn bench_ingest_fastpath_realistic(c: &mut Criterion) {
 
     group.bench_function("ingest_fastpath_realistic", |b| {
         b.iter_batched(
-            || TempDir::new().unwrap(),
+            || bench_tempdir("snapstore-ingest-realistic-"),
             |dir| {
                 let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
                 for chunk in all_pages.chunks(BATCH_SIZE) {
@@ -179,7 +189,7 @@ fn bench_ingest_fastpath_warm(c: &mut Criterion) {
         b.iter_batched(
             // Setup: create store and pre-ingest epoch 0 (not timed)
             || {
-                let dir = TempDir::new().unwrap();
+                let dir = bench_tempdir("snapstore-ingest-warm-");
                 let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
                 for chunk in epoch0_pages.chunks(BATCH_SIZE) {
                     let batch: Vec<&[u8; PAGE_SIZE]> = chunk.iter().map(|b| b.as_ref()).collect();
@@ -234,7 +244,7 @@ fn bench_ingest_plus_sync(c: &mut Criterion) {
 
     group.bench_function("ingest_plus_sync", |b| {
         b.iter_batched(
-            || TempDir::new().unwrap(),
+            || bench_tempdir("snapstore-ingest-sync-"),
             |dir| {
                 let store = PageStore::open(dir.path(), StoreOptions::default()).unwrap();
                 for chunk in all_pages.chunks(BATCH_SIZE) {

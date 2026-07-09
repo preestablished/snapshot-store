@@ -23,7 +23,7 @@ use std::sync::Arc;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use snapstore_pagestore::PageStore;
 use snapstore_types::{PageHash, PAGE_SIZE};
-use tempfile::TempDir;
+use tempfile::{Builder as TempBuilder, TempDir};
 
 // ── Store setup ───────────────────────────────────────────────────────────────
 
@@ -31,13 +31,23 @@ const TOTAL_PAGES: usize = 50_000;
 const PAGES_PER_PACK: u64 = 1_000; // forces ~50 pack files
 const BATCH_INGEST_SIZE: usize = 512;
 
+fn bench_tempdir(prefix: &str) -> TempDir {
+    match std::env::var_os("SNAPSTORE_BENCH_ROOT") {
+        Some(root) => TempBuilder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .expect("create benchmark tempdir in SNAPSTORE_BENCH_ROOT"),
+        None => TempDir::new().unwrap(),
+    }
+}
+
 /// Build a temporary store with TOTAL_PAGES unique pages spread across multiple
 /// sealed packs.  Returns (dir, store, hashes) where dir must be kept alive.
 fn build_warm_store() -> (TempDir, Arc<PageStore>, Vec<PageHash>) {
     use snapstore_pagestore::StoreOptions;
     use snapstore_types::PAGE_SIZE;
 
-    let dir = TempDir::new().unwrap();
+    let dir = bench_tempdir("snapstore-read-path-");
 
     // Force many pack rotations so we exercise cross-pack reads.
     let record_size = 37u64 + PAGE_SIZE as u64; // RECORD_HEADER_SIZE + PAGE_SIZE
