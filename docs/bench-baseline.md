@@ -115,6 +115,37 @@ release test for the 100k-node GC bar and can write `SNAPSTORE_GC_BENCH_JSON`.
 Run those on a qualifying NVMe-class soak host before closing
 `snapstore-28z` or `snapstore-feb`.
 
+## M8 Predecessor Hardware Check - infra-control, 2026-07-09
+
+Evidence root: `target/phase5-readiness-m0u-20260709-local/`
+
+This was a fresh hardware-availability check for `snapshot-store-m0u`, not a
+qualified Phase 5 benchmark run. The expensive benchmark rows were deliberately
+disabled (`RUN_FIO=0 RUN_M5=0 RUN_M7_GC=0 RUN_FLAKE_50X=0`) after confirming
+the checkout still resolves to the SATA-backed local root filesystem rather
+than an NVMe-class soak mount.
+
+| | |
+|---|---|
+| Host | `infra-control` |
+| Scratch root | `target/phase5-m0u-local-scratch` |
+| Mount | `/` on `/dev/mapper/ubuntu--vg--1-ubuntu--lv`, ext4 |
+| Disk class | SATA (`hardware_qualification.disk_class=sata`, backing `/dev/sda`) |
+| Free space | 961,933,717,504 bytes in `evidence.json` |
+| Fio baseline | Skipped (`RUN_FIO=0`) |
+| Soak-host attestation | Unset (`actual_soak_host=UNSET`) |
+| Qualification | `qualified=false`: not NVMe-backed, no soak-host attestation, fio artifacts absent |
+
+This evidence records the current local blocker for the M8 predecessor rows. It
+does not replace the required qualified run:
+
+```bash
+SNAPSTORE_BENCH_ROOT=/path/on/nvme \
+PHASE5_ACTUAL_SOAK_HOST=true \
+RUN_FIO=1 RUN_M5=1 RUN_M7_GC=1 RUN_FLAKE_50X=1 \
+scripts/phase5-readiness-evidence.sh
+```
+
 ## Gate S5 — crash suite (for the record)
 
 1,000 randomized kill cycles + failpoint matrix (9 boundaries) × 50

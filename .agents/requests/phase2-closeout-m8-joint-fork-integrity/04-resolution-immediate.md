@@ -23,8 +23,8 @@ Replacement beads were created:
 | Bead | Purpose | State |
 |---|---|---|
 | `snapshot-store-orm` | M8 joint fork-integrity closeout epic/replacement tracker | open |
-| `snapshot-store-m0u` | Qualified Phase 5 hardware rows predecessor | open |
-| `snapshot-store-gy9` | Replay-commit ref identity harness/evidence work | in progress |
+| `snapshot-store-m0u` | Qualified Phase 5 hardware rows predecessor | in progress |
+| `snapshot-store-gy9` | Replay-commit ref identity harness/evidence work | closed |
 | `snapshot-store-8p9` | Baseline-resident restore and FULL-cadence smoke | closed |
 | `snapshot-store-4ua` | 1000x joint fork ref-identity acceptance | open |
 | `snapshot-store-2dl` | Required M8 regression in both repos | in progress |
@@ -208,6 +208,19 @@ Remaining external closeout for `snapshot-store-2dl`: observe green GitHub runs,
 record branch-protection/required-check status, and record phases-track sign-off
 for bounded required CI plus operator-run 1000x full acceptance.
 
+CI root-cause note: GitHub rejected the latest M8 workflow pushes before
+scheduling jobs because the new bounded M8 jobs used `${{ runner.temp }}` in
+job-level `env`, where the `runner` context is unavailable. The workflows now
+use `${{ github.workspace }}/m8-{store,evidence}-${{ github.run_id }}` instead.
+Local workflow validation passed with:
+
+```bash
+go run github.com/rhysd/actionlint/cmd/actionlint@latest \
+  -ignore 'label "kvm-intel" is unknown' .github/workflows/ci.yaml
+go run github.com/rhysd/actionlint/cmd/actionlint@latest \
+  -ignore 'label "kvm-intel" is unknown' .github/workflows/nightly-drift.yaml
+```
+
 Hypervisor local validation passed:
 
 ```bash
@@ -234,3 +247,23 @@ git diff --check
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
+
+## Hardware Escalation Progress
+
+`snapshot-store-m0u` is now claimed. A fresh local hardware-availability
+preflight was captured at
+`target/phase5-readiness-m0u-20260709-local/evidence.json` with:
+
+```bash
+SNAPSTORE_BENCH_ROOT=target/phase5-m0u-local-scratch \
+RUN_FIO=0 RUN_M5=0 RUN_M7_GC=0 RUN_FLAKE_50X=0 \
+PHASE5_EVIDENCE_ROOT=target/phase5-readiness-m0u-20260709-local \
+scripts/phase5-readiness-evidence.sh
+```
+
+The evidence remains unqualified: `hardware_qualification.qualified=false`,
+`disk_class=sata`, backing device `/dev/sda`, no actual soak-host attestation,
+and the fio/M5/M7 rows were intentionally not run. This is a current blocker
+record, not acceptance evidence. The next required action is to run the full
+Phase 5 readiness command on an NVMe-class soak host with `RUN_FIO=1`,
+`RUN_M5=1`, `RUN_M7_GC=1`, and `PHASE5_ACTUAL_SOAK_HOST=true`.
