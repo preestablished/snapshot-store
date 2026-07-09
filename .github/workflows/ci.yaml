@@ -22,6 +22,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - run: python3 scripts/phase5_readiness_evidence_test.py
+        working-directory: repo
+        env:
+          DD_TRACE_ENABLED: "false"
+          DD_CIVISIBILITY_ENABLED: "false"
+      - run: python3 scripts/m8_joint_fork_integrity_evidence_test.py
+        working-directory: repo
+        env:
+          DD_TRACE_ENABLED: "false"
+          DD_CIVISIBILITY_ENABLED: "false"
       - run: cargo fmt --all -- --check
         working-directory: repo
       - run: cargo clippy --workspace --all-targets -- -D warnings
