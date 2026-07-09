@@ -99,12 +99,45 @@ DD_TRACE_ENABLED=false DD_CIVISIBILITY_ENABLED=false python3 scripts/m8_joint_fo
 DD_TRACE_ENABLED=false DD_CIVISIBILITY_ENABLED=false python3 scripts/phase5_readiness_evidence_test.py
 ```
 
+## Hypervisor Replay-Commit Progress
+
+The sibling `determinism-hypervisor` branch
+`m8-snapshot-store-replay-commit` now adds an explicit M8 replay-commit harness
+path in `crates/dh-worker/tests/m7_fork_verify.rs`.
+
+The new ignored gate is:
+
+```bash
+DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux \
+DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_JOBS=1000 \
+  cargo test -p dh-worker --test m7_fork_verify --release \
+    m8_accept_1000_seeded_forks_replay_commit_ref_identity \
+    -- --ignored --nocapture --test-threads=1
+```
+
+The gate forks the original child, validates its DHILOG lineage, runs
+`VerifyReplay`, then restores the root snapshot, re-drives the same deterministic
+child, calls `TakeSnapshot`, and requires the replay commit to match the
+original snapshot ref, state hash, input log id, counters, frame metadata, and
+Linux PVBLK proof metadata. Slot id is allowed to differ.
+
+Hypervisor local validation passed:
+
+```bash
+rustfmt --edition 2021 --check crates/dh-worker/tests/m7_fork_verify.rs
+cargo test -p dh-worker --test m7_fork_verify replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift
+cargo test -p dh-worker --test m7_fork_verify --no-run
+git diff --check
+```
+
 ## Remaining Immediate Work
 
 - Repair or migrate the beads dependency table so the intended graph can be
   represented with real `bd dep` edges.
-- Extend the hypervisor M7 harness with a real replay-commit ref path.
 - Wire baseline-resident delta restore and FULL-manifest cadence before any
   full M8 run.
+- Add the remaining M8 harness evidence emission, resumability/shared-page
+  accounting, and semantic-negative integration around the new replay-commit
+  path.
 - Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
   qualified NVMe-class store root.
