@@ -59,7 +59,7 @@ dedup measurement tooling (preparable without the guest), run the joint
 acceptance in a coordinated session with the hypervisor (worker wired to
 `snapstore-client` per INTEGRATION.md §1–2 — FULL-manifest cadence,
 baseline-delta restore), install the regression as a required check in
-both CIs, and record the §M8 BM rows on round-1's NVMe box in
+both CIs, and record the §M8 BM rows on the operator-attested reference box in
 `docs/bench-baseline.md`.
 
 ## Files In This Request

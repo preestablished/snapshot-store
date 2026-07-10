@@ -34,8 +34,8 @@ Repo `main` at `3b665a7`, clean tree, assessed 2026-07-07.
    0.64 GB/s vs ≥2.5 GB/s** (`docs/bench-baseline.md`). The recorded
    attribution is **CPU/memory-bus saturation** (double-hashing, BLAKE3
    verify, memfd overhead on dedup-warm rows) — explicitly *not* disk.
-   The bead defers re-measurement to NVMe-class hardware, **alongside the
-   fsync-bound rows** the baseline also defers: the 16-client × 8 MiB
+   The bead defers re-measurement to the attested reference hardware,
+   **alongside the fsync-bound rows** the baseline also defers: the 16-client × 8 MiB
    concurrent-commit row (p99 measured ~1.0 s against a <40 ms bar,
    aggregate ≥1.2 GB/s spec — the single most soak-representative row)
    and the CreateNode/UpdateNodes p50 rows. Unresolved either way.

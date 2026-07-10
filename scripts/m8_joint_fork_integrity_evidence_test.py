@@ -78,7 +78,7 @@ def evidence(run_kind="fake", expected=1, bar_overrides=None):
         },
         "host": {"hostname": "test-host"},
         "guest": {"kind": "fake"},
-        "store_root": {"path": "/nvme/m8", "disk_class": "nvme", "qualified": True},
+        "store_root": {"path": "/reference/m8", "disk_class": "sata", "qualified": True},
         "config": {"jobs": expected, "max_delta_chain": 64},
         "child_table": {"jsonl": "child-ref-table.jsonl", "csv": "child-ref-table.csv"},
         "bars": bars(bar_overrides),

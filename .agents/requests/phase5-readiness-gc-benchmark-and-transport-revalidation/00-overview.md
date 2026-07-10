@@ -42,10 +42,9 @@ first-integration run starts hitting this store for real.
 
 ## The Ask In One Paragraph
 
-Run the deferred M7 GC benchmark and the M5 transport re-validation on
-NVMe-class hardware (first confirming whether the Intel lab box qualifies —
-if no qualifying box exists, say so in the resolution and this request
-converts into a hardware escalation with your measured numbers attached), fix
+Run the deferred M7 GC benchmark and the M5 transport re-validation on the
+operator-attested reference hardware (first confirming whether the Intel lab box
+is that reference host), fix
 or root-cause the `page_channel_fallback` flake, and record the results with
 the same durable-evidence discipline as the M7 acceptance
 (`target/m7-acceptance-20260703T063635Z/`). Pass/fail against the plan's

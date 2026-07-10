@@ -11,13 +11,14 @@ on the fast path is fixed or root-caused:
    SATA reference box in `docs/bench-baseline.md` is itself an Intel
    (i5-8400) machine — determine whether the box Phase 5's soak will run
    on ("the Intel box" in the phase docs) is that same machine or a
-   different NVMe-class one, and say which in the evidence. Record disk
+   different more capable one, and say which in the evidence. Record disk
    class, sequential/random throughput baseline, CPU headroom, and free
-   disk (the GC benchmark needs ~60+ GB working space). If no NVMe-class
-   box is reachable, stop here and write `04-resolution.md` with the
-   preflight numbers, file a P1 bead for the blocked benchmarks, and flag
-   the operator (Matt) directly — the hardware escalation is then a
-   program-plan decision, and that outcome closes this request honestly.
+   disk (the GC benchmark needs ~60+ GB working space). If no
+   operator-attested reference box is reachable, stop here and write
+   `04-resolution.md` with the preflight numbers, file a P1 bead for the
+   blocked benchmarks, and flag the operator (Matt) directly — the hardware
+   escalation is then a program-plan decision, and that outcome closes this
+   request honestly.
 2. **`snapstore-feb` — the M7 GC benchmark bar**, run on the qualifying
    box: 100k-node tree, ~30 GB, 50% garbage → full GC in <60s **while
    ingesting 200 MB/s**, p99 commit latency during GC < 2× the idle p99
@@ -38,7 +39,7 @@ on the fast path is fixed or root-caused:
    **16 parallel clients × 8 MiB deltas: p99 commit <40 ms, aggregate
    ≥1.2 GB/s** (the row most predictive of soak behavior — it measured
    p99 ~1.0 s on the reference box); and the fsync-bound
-   CreateNode/UpdateNodes p50 rows the baseline defers to the same NVMe
+   CreateNode/UpdateNodes p50 rows the baseline defers to the same reference
    pass. Either the bars pass, or the shortfall is attributed (hardware
    ceiling vs code) with profile evidence. Close the bead only if all its
    deferred rows are measured; otherwise re-scope it explicitly.

@@ -25,6 +25,8 @@ PSEUDO_FSTYPES = {
     "tmpfs",
 }
 
+MIN_BENCH_FREE_BYTES = 70 * 1024**3
+
 FIO_ARTIFACTS = [
     {
         "id": "fio_seqwrite",
@@ -372,6 +374,44 @@ def resolve_disk_info(mount_json, lsblk_json):
     }
 
 
+def is_resolved_local_block_device(disk_info):
+    disk_class = clean(disk_info.get("disk_class"))
+    if not disk_class or disk_class == "unknown" or disk_class in PSEUDO_FSTYPES:
+        return False
+    return bool(disk_info.get("backing_transports"))
+
+
+def evaluate_hardware_qualification(disk_info, free_bytes, att, fio_qualification):
+    actual_reference_host = att.get("actual_soak_host") == "true"
+    local_block_device = is_resolved_local_block_device(disk_info)
+    enough_space = free_bytes >= MIN_BENCH_FREE_BYTES
+    qualified = (
+        local_block_device
+        and enough_space
+        and actual_reference_host
+        and fio_qualification["ok"]
+    )
+
+    failures = []
+    if not local_block_device:
+        failures.append("benchmark mount is not a resolved local block device")
+    if not enough_space:
+        failures.append("benchmark mount has <70 GiB free")
+    if not actual_reference_host:
+        failures.append("actual_soak_host attestation is not true")
+    failures.extend(fio_qualification["failure_reasons"])
+
+    return {
+        "qualified": qualified,
+        "reason": "qualified" if qualified else "; ".join(failures),
+        "policy": "operator_attested_reference_host",
+        "local_block_device": local_block_device,
+        "actual_reference_host": actual_reference_host,
+        "min_free_bytes": MIN_BENCH_FREE_BYTES,
+        "failures": failures,
+    }
+
+
 def load_mount_json(root, bench_root):
     mount_json = load_json(root / "hardware" / "mount.json")
     if mount_json:
@@ -415,21 +455,9 @@ def assemble_evidence(root, bench_root):
     disk_info = resolve_disk_info(mount_json, lsblk)
     disk_class = disk_info["disk_class"]
     fio_qualification = evaluate_fio_artifacts(root)
-    qualified = (
-        disk_class == "nvme"
-        and free_bytes >= 70 * 1024**3
-        and att.get("actual_soak_host") == "true"
-        and fio_qualification["ok"]
+    hardware_qualification = evaluate_hardware_qualification(
+        disk_info, free_bytes, att, fio_qualification
     )
-    qualification_failures = []
-    if disk_class != "nvme":
-        qualification_failures.append("benchmark mount is not backed only by NVMe")
-    if free_bytes < 70 * 1024**3:
-        qualification_failures.append("benchmark mount has <70 GiB free")
-    if att.get("actual_soak_host") != "true":
-        qualification_failures.append("actual_soak_host attestation is not true")
-    qualification_failures.extend(fio_qualification["failure_reasons"])
-    qualification_reason = "qualified" if qualified else "; ".join(qualification_failures)
 
     bars = []
     bars.append(
@@ -704,8 +732,13 @@ def assemble_evidence(root, bench_root):
             "free_bytes": free_bytes,
         },
         "hardware_qualification": {
-            "qualified": qualified,
-            "reason": qualification_reason,
+            "qualified": hardware_qualification["qualified"],
+            "reason": hardware_qualification["reason"],
+            "policy": hardware_qualification["policy"],
+            "local_block_device": hardware_qualification["local_block_device"],
+            "actual_reference_host": hardware_qualification["actual_reference_host"],
+            "min_free_bytes": hardware_qualification["min_free_bytes"],
+            "failures": hardware_qualification["failures"],
             "disk_class": disk_class,
             "disk_resolution": disk_info,
             "fio_qualification": fio_qualification,

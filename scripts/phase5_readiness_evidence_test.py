@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from phase5_readiness_evidence import (
     evaluate_fio_artifacts,
+    evaluate_hardware_qualification,
     parse_canonical_int,
     parse_key_values,
     resolve_disk_info,
@@ -277,6 +278,63 @@ class FioQualificationTest(unittest.TestCase):
 
             self.assertFalse(qualification["ok"])
             self.assertIn("fio skipped", qualification["failure_reasons"])
+
+
+class HardwareQualificationTest(unittest.TestCase):
+    def ok_fio(self):
+        return {"ok": True, "failure_reasons": []}
+
+    def test_attested_sata_reference_host_qualifies(self):
+        disk_info = resolve_disk_info(
+            mount("/dev/sda1", "8:1"),
+            lsblk(disk("sda", "sata", [part("sda1", "8:1")])),
+        )
+
+        qualification = evaluate_hardware_qualification(
+            disk_info,
+            100 * 1024**3,
+            {"actual_soak_host": "true"},
+            self.ok_fio(),
+        )
+
+        self.assertTrue(qualification["qualified"], qualification)
+        self.assertEqual(qualification["policy"], "operator_attested_reference_host")
+        self.assertTrue(qualification["local_block_device"])
+
+    def test_tmpfs_does_not_qualify_even_when_attested(self):
+        disk_info = resolve_disk_info(
+            mount("tmpfs", "0:42", "tmpfs"),
+            lsblk(disk("nvme0n1", "nvme", [part("nvme0n1p1", "259:1")])),
+        )
+
+        qualification = evaluate_hardware_qualification(
+            disk_info,
+            100 * 1024**3,
+            {"actual_soak_host": "true"},
+            self.ok_fio(),
+        )
+
+        self.assertFalse(qualification["qualified"])
+        self.assertIn(
+            "benchmark mount is not a resolved local block device",
+            qualification["failures"],
+        )
+
+    def test_missing_actual_host_attestation_does_not_qualify(self):
+        disk_info = resolve_disk_info(
+            mount("/dev/sda1", "8:1"),
+            lsblk(disk("sda", "sata", [part("sda1", "8:1")])),
+        )
+
+        qualification = evaluate_hardware_qualification(
+            disk_info,
+            100 * 1024**3,
+            {"actual_soak_host": "UNSET"},
+            self.ok_fio(),
+        )
+
+        self.assertFalse(qualification["qualified"])
+        self.assertIn("actual_soak_host attestation is not true", qualification["failures"])
 
 
 class SummaryParsingTest(unittest.TestCase):

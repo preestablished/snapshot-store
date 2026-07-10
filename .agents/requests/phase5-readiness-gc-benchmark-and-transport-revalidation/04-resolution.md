@@ -4,11 +4,13 @@
 
 Local work fixed the `page_channel_fallback` flake, added evidence-grade M5 and
 M7 benchmark harnesses, and produced a Phase 5 evidence root with hardware
-preflight. The local host did not qualify for counted transport or GC bars:
-`SNAPSTORE_BENCH_ROOT` resolved to the SATA-backed root filesystem on
-`infra-control`, and no operator attestation identified this machine as the
-actual Phase 5 soak host. The M5 and M7 performance questions remain open until
-they are run on a qualified NVMe-class soak host.
+preflight. The local host did not qualify for counted transport or GC bars in
+this run: `SNAPSTORE_BENCH_ROOT` resolved to the SATA-backed root filesystem on
+`infra-control`, no operator attestation identified this machine as the actual
+Phase 5 soak host, and fio/M5/M7 counted rows were skipped. Policy correction
+2026-07-10: SATA-backed storage is acceptable when this machine is the
+operator-attested reference host. The M5 and M7 performance questions remain
+open until they are run on that qualified reference host with fio baselines.
 
 ## Commits
 
@@ -46,9 +48,9 @@ Evidence root: `target/phase5-readiness-20260708T180021Z/`
 | Bead | Disposition |
 |---|---|
 | `snapstore-nn4` | Closed: root cause was a test-harness metric race; evidence `target/phase5-readiness-20260708T180021Z/flake/postfix-50x-summary.txt` |
-| `snapstore-28z` | Leave open / hardware-blocked. All deferred rows still need a qualified NVMe-class soak-host run. |
-| `snapstore-feb` | Leave open / hardware-blocked. Full 100k-node M7 benchmark still needs a qualified NVMe-class soak-host run. |
-| `snapstore-ba6` | New P1 hardware escalation for a qualified NVMe-class Phase 5 benchmark host. `snapstore-28z` and `snapstore-feb` now depend on it. |
+| `snapstore-28z` | Leave open / evidence-blocked. All deferred rows still need a qualified reference-host run. |
+| `snapstore-feb` | Leave open / evidence-blocked. Full 100k-node M7 benchmark still needs a qualified reference-host run. |
+| `snapstore-ba6` | Superseded by the 2026-07-10 policy correction if the operator attests `infra-control` as the reference host; otherwise it remains the hardware escalation. |
 
 ## Phase 5 Soak Risk
 

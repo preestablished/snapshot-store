@@ -12,8 +12,8 @@ handback agree.
 3. Add fake-backed harness tests, ref-table persistence, shared-page accounting, and
    semantic-corruption negative.
 4. Wire baseline-delta restore and FULL cadence; run a small smoke.
-5. Run or confirm the qualified Phase 5 hardware rows on the same NVMe-class
-   soak host.
+5. Run or confirm the qualified Phase 5 hardware rows on the same
+   operator-attested reference soak host.
 6. Run M8 full 1000x acceptance and write the evidence root.
 7. Install the bounded permanent checks in both repos.
 8. Update `docs/bench-baseline.md` and request resolution files.
@@ -33,7 +33,7 @@ The request calls out shared-box risk. The full M8 session must observe:
 | OOM/capture-engine leak | Do not run long `RunWithFrameCapture` streams during M8 until the hypervisor leak fix is landed or explicitly cleared |
 | Single KVM runner | Use workflow concurrency or operator scheduling so M8 does not starve nightly drift/canary jobs |
 | Dirty repo state | Evidence must record dirty status; final acceptance should use clean revs unless sign-off says otherwise |
-| Hardware qualification | Do not accept SATA/local root numbers as NVMe-class M8 BM rows |
+| Hardware qualification | Do not accept un-attested local root numbers or skipped fio/M5/M7 rows as M8 BM evidence |
 
 ## Request Resolution Files
 

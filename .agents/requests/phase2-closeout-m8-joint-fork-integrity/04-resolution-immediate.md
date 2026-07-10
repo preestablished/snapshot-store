@@ -260,8 +260,8 @@ git diff --check
   and capture bounded-CI/full-acceptance sign-off for `snapshot-store-2dl`.
 - Expose a self-hosted `kvm-intel` runner to `snapshot-store` or confirm the
   intended runner group; the bounded M8 snapshot-store job is currently queued.
-- Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on a
-  qualified NVMe-class store root.
+- Run the hardware-gated Phase 5 rows and the 1000x M8 acceptance on the
+  operator-attested reference store root.
 
 ## Hardware Escalation Progress
 
@@ -279,6 +279,8 @@ scripts/phase5-readiness-evidence.sh
 The evidence remains unqualified: `hardware_qualification.qualified=false`,
 `disk_class=sata`, backing device `/dev/sda`, no actual soak-host attestation,
 and the fio/M5/M7 rows were intentionally not run. This is a current blocker
-record, not acceptance evidence. The next required action is to run the full
-Phase 5 readiness command on an NVMe-class soak host with `RUN_FIO=1`,
-`RUN_M5=1`, `RUN_M7_GC=1`, and `PHASE5_ACTUAL_SOAK_HOST=true`.
+record, not acceptance evidence. As of the 2026-07-10 policy correction, SATA is
+acceptable when this machine is the operator-attested reference host. The next
+required action is to run the full Phase 5 readiness command on that reference
+host with `RUN_FIO=1`, `RUN_M5=1`, `RUN_M7_GC=1`, and
+`PHASE5_ACTUAL_SOAK_HOST=true`.

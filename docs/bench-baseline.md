@@ -1,15 +1,18 @@
 # Bench baseline — reference hardware record
 
-Hardware rule (plan 05, G1 precedent): transport-/CPU-/page-cache-bound
-rows gate at spec values on any hardware; disk- and fsync-bound rows gate
-at the fio/G1-derived floor of this machine, with spec values re-validated
-on NVMe-class hardware before M8 sign-off.
+Hardware rule (plan 05, G1 precedent, revised 2026-07-10): the
+operator-attested reference host is the gate host, even when its storage is
+SATA-backed. Transport-/CPU-/page-cache-bound rows gate at their recorded bars
+on that reference host; disk- and fsync-bound rows gate at the fio/G1-derived
+floor of that host. NVMe-class results may be recorded later as upside
+validation, but they are not required before M8 sign-off.
 
 Phase 5 readiness note (2026-07-08): local preflight evidence on
-`infra-control` did **not** supersede that M8/NVMe deferral. The selected
-scratch root resolved to the existing SATA-backed root filesystem and no
-operator attestation identified it as the actual Phase 5 soak host. See
-`target/phase5-readiness-20260708T180021Z/evidence.json`.
+`infra-control` did **not** supersede the M8 predecessor rows because fio and
+the counted M5/M7 bars were not run and no operator attestation identified it
+as the actual Phase 5 soak host. The selected scratch root resolved to the
+existing SATA-backed root filesystem, which is acceptable for the reference
+host once attested. See `target/phase5-readiness-20260708T180021Z/evidence.json`.
 
 ## Machine identity (the Intel/SATA reference box)
 
@@ -67,15 +70,14 @@ per record on GET, and crosses the memory bus several times; the per-batch
 memfd create/fault/teardown adds a fixed kernel cost spec-class hardware
 absorbs).
 
-The 1.5 / 2.5 GB/s numbers assume the NVMe-class reference box
-(ARCHITECTURE §7.1) — which this machine also is not for CPU/memory
-purposes, exactly the situation of the phase-1 G1 precedent (1.5 GB/s
-spec → 400 MiB/s gate on this box). Posture: actuals recorded here as
-this machine's measured ceiling; **spec-value validation of the
-transport rows moves to the M8 entry items on NVMe-class hardware,
-alongside the fsync-bound rows**. M5 sign-off on this box carries the
-two rows as open hardware-bound risks, explicitly flagged to the program
-(beads follow-up filed), not silently passed.
+The original 1.5 / 2.5 GB/s numbers assumed a more capable reference box
+(ARCHITECTURE §7.1), exactly the situation of the phase-1 G1 precedent
+(1.5 GB/s spec → 400 MiB/s gate on this box). Revised posture as of
+2026-07-10: if this host is operator-attested as the reference/soak host,
+its measured ceiling is the acceptance surface for the current program. The
+M8 predecessor rows still need a counted run with fio, M5, and M7 evidence;
+misses must be attributed and accepted, but a separate NVMe retest is not a
+precondition for closeout.
 
 ## Phase 5 Readiness Preflight - infra-control, 2026-07-08
 
@@ -86,7 +88,7 @@ Evidence root: `target/phase5-readiness-20260708T180021Z/`
 | Host | `infra-control` |
 | Scratch root | `target/phase5-local-scratch` |
 | Mount | `/` on `/dev/mapper/ubuntu--vg--1-ubuntu--lv`, ext4 |
-| Disk class | SATA (`lsblk` transport), not NVMe-class |
+| Disk class | SATA (`lsblk` transport) |
 | Free space | 905 GiB reported by `df`; 971,442,429,952 bytes in `evidence.json` |
 | Fio baseline | Not run in this local preflight (`RUN_FIO=0`) |
 | Soak-host attestation | Unset (`actual_soak_host=UNSET`, `same_as_i5_sata_reference=UNSET`) |
@@ -95,8 +97,8 @@ Evidence root: `target/phase5-readiness-20260708T180021Z/`
 The Phase 5 local run fixed and verified the `page_channel_fallback`
 observability flake, and added evidence-grade harness support for the M5 and
 M7 rows, but it did not run the hardware-gated benchmark bars. The evidence
-qualification is therefore `qualified=false`: the selected mount is SATA and
-there is no proof this is the actual Phase 5 soak host.
+qualification is therefore `qualified=false`: fio and the counted M5/M7 rows
+were skipped and there is no proof this is the actual Phase 5 soak host.
 
 | Area | Target | Measured | Status | Evidence |
 |---|---:|---:|---|---|
@@ -112,7 +114,7 @@ Harness changes landed for the eventual qualified run:
 `evidence.json`; `page_channel_perf` now requires `SNAPSTORE_BENCH_ROOT` and
 can write `SNAPSTORE_M5_BENCH_JSON`; `gc_readiness_bench` is an ignored
 release test for the 100k-node GC bar and can write `SNAPSTORE_GC_BENCH_JSON`.
-Run those on a qualifying NVMe-class soak host before closing
+Run those on an operator-attested reference soak host before closing
 `snapstore-28z` or `snapstore-feb`.
 
 ## M8 Predecessor Hardware Check - infra-control, 2026-07-09
@@ -121,9 +123,8 @@ Evidence root: `target/phase5-readiness-m0u-20260709-local/`
 
 This was a fresh hardware-availability check for `snapshot-store-m0u`, not a
 qualified Phase 5 benchmark run. The expensive benchmark rows were deliberately
-disabled (`RUN_FIO=0 RUN_M5=0 RUN_M7_GC=0 RUN_FLAKE_50X=0`) after confirming
-the checkout still resolves to the SATA-backed local root filesystem rather
-than an NVMe-class soak mount.
+disabled (`RUN_FIO=0 RUN_M5=0 RUN_M7_GC=0 RUN_FLAKE_50X=0`) because the run had
+no operator attestation and was meant only to capture local availability.
 
 | | |
 |---|---|
@@ -134,14 +135,15 @@ than an NVMe-class soak mount.
 | Free space | 961,933,717,504 bytes in `evidence.json` |
 | Fio baseline | Skipped (`RUN_FIO=0`) |
 | Soak-host attestation | Unset (`actual_soak_host=UNSET`) |
-| Qualification | `qualified=false`: not NVMe-backed, no soak-host attestation, fio artifacts absent |
+| Qualification | `qualified=false`: no soak-host attestation, fio artifacts absent |
 
 This evidence records the current local blocker for the M8 predecessor rows. It
 does not replace the required qualified run:
 
 ```bash
-SNAPSTORE_BENCH_ROOT=/path/on/nvme \
+SNAPSTORE_BENCH_ROOT=/path/on/reference-host \
 PHASE5_ACTUAL_SOAK_HOST=true \
+PHASE5_SAME_AS_I5_SATA_REFERENCE=true \
 RUN_FIO=1 RUN_M5=1 RUN_M7_GC=1 RUN_FLAKE_50X=1 \
 scripts/phase5-readiness-evidence.sh
 ```

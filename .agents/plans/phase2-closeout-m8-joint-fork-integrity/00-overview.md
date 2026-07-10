@@ -36,7 +36,7 @@ as the starting point:
 | Beads db | `bd dolt pull` succeeds; `bd list --all` shows only the earlier closed work plus this plan bead; request beads `snapstore-675`, `snapstore-pov`, `snapstore-28z`, `snapstore-feb`, and `snapstore-nn4` are absent from the current db |
 | Phase 5 plan | `.agents/plans/phase5-readiness-gc-benchmark-and-transport-revalidation/` now exists |
 | Phase 5 evidence | `target/phase5-readiness-20260708T180021Z/evidence.json` exists and is marked hardware-unqualified; M5/M7 hardware-gated runs were not run |
-| Bench baseline | `docs/bench-baseline.md` records the Phase 5 local preflight and says NVMe-class transport/GC rows still block before closing `snapstore-28z` / `snapstore-feb` |
+| Bench baseline | `docs/bench-baseline.md` records the Phase 5 local preflight and says counted reference-host transport/GC rows still block before closing `snapstore-28z` / `snapstore-feb` |
 | Store resolve API | `SnapshotStore::resolve_pages` supports `baseline: Option<&SnapshotRef>` and `hashes_only` modes at `crates/snapstore-store/src/lib.rs:553` |
 | Store gRPC/client path | `ResolvePagesRequest.baseline_ref` is parsed and forwarded at `crates/snapstore-server/src/service.rs:306`; client exposes it at `crates/snapstore-client/src/client.rs:251` and blocking wrapper at `crates/snapstore-client/src/blocking.rs:56` |
 | Hypervisor restore gap | `../determinism-hypervisor/crates/dh-worker/src/restore_engine.rs:162` still calls `resolve_pages(snapshot_ref, None, false)` into a full-coverage fresh-slot restore path |

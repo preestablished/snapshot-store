@@ -20,7 +20,7 @@ slot. Both findings were accepted.
 | Baseline-delta restore | Rewrote `03-wiring-and-performance.md` to require baseline-resident RAM, baseline identity validation, delta-page application, mode-specific coverage checks, and full-restore fallback. |
 | Semantic negative | Tightened the negative to require a committed `replay_ref != original_ref`; VerifyReplay divergence alone is only diagnostic. |
 | Shared-page measurement | Renamed `dedup_ratio` to `shared_page_ratio`, defined the denominator, and made manifest page-hash comparison the primary measurement unless new counters are added. |
-| Hardware root | Added `M8_STORE_ROOT` / equivalent and evidence qualification for the actual snapstore data root on the qualified NVMe mount. |
+| Hardware root | Added `M8_STORE_ROOT` / equivalent and evidence qualification for the actual snapstore data root on the qualified reference mount. |
 | CI permanence | Required fresh bounded M8 evidence for the exact snapshot-store SHA in a required check; scheduled-only runs are supplemental, and evidence-validator-only compliance requires signed deviation. |
 | Beads | Split read-only bead revalidation from graph mutation and added concrete replacement bead/dependency commands. |
 | Evidence schema | Added mandatory typed schema/validator fields and pass/fail bars. |

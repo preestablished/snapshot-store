@@ -86,7 +86,7 @@ A qualifying run must have:
 
 | Requirement | Minimum evidence |
 |---|---|
-| NVMe-class target | `lsblk` shows `TRAN=nvme`, or operator-provided proof that the selected mount is the intended Phase 5 NVMe device |
+| Reference storage target | `findmnt`/`lsblk` resolve the selected mount to a local block device on the operator-attested reference host; SATA is acceptable for the current reference host |
 | Free space | at least 70 GiB free at `SNAPSTORE_BENCH_ROOT`; 100 GiB preferred |
 | CPU headroom | enough idle cores to run server, committer workers, and GC; record `lscpu`, load average, CPU governor, and thermal/throttle state |
 | Disk baseline | fio sequential and random results recorded |
@@ -98,9 +98,9 @@ with the preflight data, file a P1 bead for blocked benchmarks, flag Matt, and
 do not close `snapstore-feb` or `snapstore-28z` as passed.
 
 If the operator confirms that the Phase 5 soak host is the i5-8400/SATA
-reference box from `docs/bench-baseline.md`, stop after WI2 and file the
-hardware escalation. The existing M5 misses were attributed to CPU/memory-bus
-saturation as well as storage class, so an NVMe scratch mount on a surrogate is
+reference box from `docs/bench-baseline.md`, continue on that box as the
+reference host. The existing M5 misses were attributed to CPU/memory-bus
+saturation as well as storage class, so a faster scratch mount on a surrogate is
 not equivalent to proving the actual soak host.
 
 ## `evidence.json`

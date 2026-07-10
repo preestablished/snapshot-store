@@ -40,7 +40,7 @@ then add dependency edges. Example command shape:
 
 ```bash
 bd create --title="M8 joint fork-integrity closeout" --description="Correct stale M8 blocker, coordinate Phase 2 joint fork-integrity closeout, and track child work for harness, qualified run, CI permanence, and handback." --type=task --priority=0
-bd create --title="M8 predecessor: qualified Phase 5 hardware rows" --description="Run or record accepted escalation for the NVMe-class M5 transport and M7 GC rows that gate M8 benchmark closeout." --type=task --priority=0
+bd create --title="M8 predecessor: qualified Phase 5 hardware rows" --description="Run or record accepted escalation for the reference-host M5 transport and M7 GC rows that gate M8 benchmark closeout." --type=task --priority=0
 bd create --title="M8 harness: replay-commit ref identity" --description="Inventory the hypervisor M7 harness, add replay-commit ref capture, fake-backed tests, shared-page accounting, resumable child table, and semantic ref-divergence negative." --type=task --priority=0
 bd create --title="M8 smoke: baseline-resident restore and FULL cadence" --description="Wire baseline-resident delta restore and max_delta_chain FULL-manifest cadence, then prove them with a small smoke before the full session." --type=task --priority=0
 bd create --title="M8 acceptance: 1000x joint fork ref identity" --description="Run the coordinated 1000-child joint acceptance on qualified hardware, record refs, replay commits, shared-page ratio, and latency rows." --type=task --priority=0
@@ -72,7 +72,7 @@ Recommended graph semantics:
 | M8 tracker correction / epic | immediate | Records that M8 is Phase 2 debt and the hypervisor M4-M7 blocker is satisfied |
 | M8 harness + fake-backed tests | immediate | No hardware or guest prerequisite; can run with fake store/hypervisor components |
 | M8 restore and FULL-cadence smoke | after harness | Cross-repo code path, small child count |
-| Qualified Phase 5 hardware rows | hardware gate | Must cover the unresolved `28z`/`feb` equivalent rows on NVMe-class soak host |
+| Qualified Phase 5 hardware rows | hardware gate | Must cover the unresolved `28z`/`feb` equivalent rows on the operator-attested reference soak host |
 | M8 joint 1000x acceptance + BM rows | blocked by hardware rows and smoke | Produces the evidence root and `docs/bench-baseline.md` rows |
 | M8 CI permanence + cross-repo handback | blocked by smoke; full run evidence needed for final close | Required in both repos |
 
@@ -114,7 +114,7 @@ Gated lane entry:
 
 | Condition | Required state |
 |---|---|
-| Phase 5 hardware rows | M5 transport and M7 GC rows measured on qualified NVMe-class soak host, or hardware escalation recorded and accepted |
+| Phase 5 hardware rows | M5 transport and M7 GC rows measured on the qualified reference soak host, or hardware escalation recorded and accepted |
 | Flake | `page_channel_fallback` remains green in the current checkout |
 | Restore smoke | Baseline-delta restore and FULL cadence have a small-count proof |
 | Session window | Hypervisor, bridge/runtime owner, and store operator agree on the shared box window |

@@ -99,23 +99,24 @@ hardware-bound predecessors are unresolved. Current state:
 | M7 GC readiness | `docs/bench-baseline.md:108` says not run in the Phase 5 local preflight |
 | Qualification | `docs/bench-baseline.md:95` says the 2026-07-08 run was hardware-unqualified |
 
-On a qualified NVMe-class soak host, run:
+On the operator-attested reference soak host, run:
 
 ```bash
-SNAPSTORE_BENCH_ROOT=/path/on/nvme \
+SNAPSTORE_BENCH_ROOT=/path/on/reference-host \
 PHASE5_ACTUAL_SOAK_HOST=true \
+PHASE5_SAME_AS_I5_SATA_REFERENCE=true \
 RUN_FIO=1 RUN_M5=1 RUN_M7_GC=1 RUN_FLAKE_50X=1 \
 scripts/phase5-readiness-evidence.sh
 ```
 
 Then update `docs/bench-baseline.md` with the measured M5/M7 rows before
-closing the M8 gated lane. If the hardware cannot be provided, record a hardware
-escalation and do not claim M8 benchmark compliance.
+closing the M8 gated lane. SATA-backed storage is acceptable when this host is
+the attested reference host; missing fio/M5/M7 measurements are not.
 
-The M8 snapstore data root must be under the same qualified NVMe mount. The
+The M8 snapstore data root must be under the same qualified reference mount. The
 existing hypervisor M7 harness uses ordinary tempdirs for the store; M8 must add
 `M8_STORE_ROOT` or an equivalent configuration and fail evidence qualification
-if the actual store root resolves outside the qualified mount.
+if the actual store root resolves outside the attested reference mount.
 
 ## M8 Full Run
 
@@ -127,7 +128,7 @@ DH_M7_ACCEPT_JOBS=1000 \
 DH_M7_ACCEPT_SLOT_CORES=2-5 \
 DH_M7_ACCEPT_ALLOW_SKIP=0 \
 DH_M9_ALLOW_SKIP=0 \
-M8_STORE_ROOT=/path/on/qualified-nvme/m8-store \
+M8_STORE_ROOT=/path/on/reference-host/m8-store \
 M8_EVIDENCE_ROOT=target/m8-joint-fork-integrity-<UTC> \
 cargo test -p dh-worker --test m7_fork_verify --release \
   m8_accept_1000_forks_ref_identity \
@@ -141,7 +142,7 @@ The exact test name may differ, but the evidence contract must not:
 | Child count | 1000 original children and 1000 replay commits |
 | Ref identity | 1000/1000 `replay_ref == original_ref` |
 | Replay | 1000/1000 VerifyReplay Done with no Divergence |
-| Store root | `M8_STORE_ROOT` is on the qualified NVMe mount and recorded in evidence |
+| Store root | `M8_STORE_ROOT` is on the qualified reference mount and recorded in evidence |
 | Shared pages | Aggregate `shared_page_ratio >= 0.94` |
 | Fork-to-commit latency | p50/p99 compared to ARCHITECTURE §7.1 commit target |
 | Restore latency | full and delta restore p50/p99 compared to ARCHITECTURE §7.1 restore targets |
