@@ -1,5 +1,8 @@
 # WI5 - Closeout, Handback, And Session Hygiene
 
+> The numbered implementation order below is the original design sequence, not
+> a restart checklist. Use `09-remaining-execution.md` for current execution.
+
 This file is the implementation closeout contract. The work is not done when
 the 1000x command exits; it is done when trackers, docs, CI, and cross-repo
 handback agree.
@@ -72,7 +75,6 @@ any repo that received changes:
 
 ```bash
 git status --short --branch
-bd preflight
 bd dolt pull
 # close or update completed/in-progress beads here
 bd dolt push
@@ -81,11 +83,14 @@ git commit -m "<repo-specific summary>"
 git status --short --branch
 ```
 
-Then follow that repo's current `bd prime` git guidance. In this snapshot-store
-checkout, `bd prime` currently says the branch is ephemeral and code is merged
-to main locally rather than pushed. If a later `bd prime` reports a normal
-upstream-push workflow, follow that newer instruction and verify the branch is
-clean and up to date afterward.
+Then follow that repo's current `AGENTS.md` and `bd prime` guidance. The current
+snapshot-store workflow requires `git pull --rebase`, `bd dolt push`, and
+`git push`; verify the final branch is clean and up to date with its remote.
+Run beads commands sequentially. If the embedded backend reports an exclusive
+lock, wait for the active command to exit and retry; do not treat it as missing
+state. The checkout's configured `bd preflight` uses inappropriate Go defaults,
+so Rust/project-specific gates are authoritative until that configuration is
+fixed; record the known preflight limitation rather than masking a real gate.
 
 ## Handback Summary
 
@@ -100,6 +105,7 @@ The final handback should include:
 | Docs | `docs/bench-baseline.md` section name and request resolution filenames |
 | Residual risk | Any measured misses, hardware caveats, or hypervisor-side follow-up beads |
 
-Closeout must push beads with `bd dolt push`. Follow the current `bd prime`
-session close protocol for code/docs. If the branch remains ephemeral, merge to
-local `main` as that protocol directs rather than inventing a remote push step.
+Closeout must push beads with `bd dolt push`. Follow the current `AGENTS.md` and
+`bd prime` session close protocol for code/docs. In this repository that means
+`git pull --rebase`, `bd dolt push`, `git push`, and a final `git status` that
+shows the branch up to date with its remote.

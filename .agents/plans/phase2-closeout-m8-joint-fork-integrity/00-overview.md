@@ -1,16 +1,17 @@
 # M8 Joint Fork-Integrity Closeout Plan
 
-Plan for `.agents/requests/phase2-closeout-m8-joint-fork-integrity/`, drafted
-2026-07-09 on branch `phase2-closeout-m8-joint-fork-integrity` at
-`11646c4`.
+Plan for `.agents/requests/phase2-closeout-m8-joint-fork-integrity/`, originally
+drafted 2026-07-09 and refreshed 2026-07-11 on `main` at `9f263bd`.
 
-This is a handoff plan for another implementation agent. It does not implement
-M8. It converts the July 7 request into current-state-aware work items and
-keeps the original sequencing rule: guest-free tracker and harness work can
-start immediately; the full joint run waits for the Phase 5 hardware-bound
-predecessors to be resolved or explicitly escalated.
+This is a handoff plan for another implementation agent. The tracker repair,
+fake-backed tooling, cross-repo replay-commit harness, baseline/FULL wiring,
+and workflow definitions have already landed. Do not reimplement those work
+items. The live hardware and CI closeout remains. `09-remaining-execution.md`
+is the authoritative starting point; files `01` through `05` preserve design
+and acceptance detail needed when diagnosing failures.
 
-Tracking bead for this plan artifact: `snapshot-store-dgj`.
+Tracking beads for the plan artifacts: closed original `snapshot-store-dgj`
+and refresh `snapshot-store-7i0`.
 
 ## Files In This Plan
 
@@ -24,25 +25,31 @@ Tracking bead for this plan artifact: `snapshot-store-dgj`.
 | `06-review-technical.md` | Technical-correctness subagent review |
 | `07-review-operability.md` | Operability/completeness subagent review |
 | `08-review-resolution.md` | Accepted findings and changes folded into this plan |
+| `09-remaining-execution.md` | Current, dependency-ordered implementation handoff for unfinished work |
+| `10-review-technical-refresh.md` | 2026-07-11 technical review of the refreshed plan |
+| `11-review-operability-refresh.md` | 2026-07-11 operability review of the refreshed plan |
+| `12-review-resolution-refresh.md` | Accepted fresh-review findings and resulting edits |
 
 ## Current State Verified During Planning
 
-The request's July 7 state has drifted. Use the state below, not the filing text,
-as the starting point:
+The request's July 7 state and the original July 9 plan have drifted. Use the
+state below and `09-remaining-execution.md`, not the filing text, as the
+starting point:
 
 | Surface | Current fact |
 |---|---|
-| Local snapshot-store head | `11646c4` on `phase2-closeout-m8-joint-fork-integrity`, same commit as `main` / `origin/main` |
-| Beads db | `bd dolt pull` succeeds; `bd list --all` shows only the earlier closed work plus this plan bead; request beads `snapstore-675`, `snapstore-pov`, `snapstore-28z`, `snapstore-feb`, and `snapstore-nn4` are absent from the current db |
+| Local snapshot-store head | `9f263bd` on `main`; the implementation merge is locally 16 commits ahead of `origin/main` at refresh time and must be pushed during this planning session |
+| Beads db | Replacement graph is installed: `orm` epic; closed `gy9` harness and `8p9` smoke; in-progress `m0u` hardware and `2dl` CI permanence; open/blocked `4ua` full acceptance |
 | Phase 5 plan | `.agents/plans/phase5-readiness-gc-benchmark-and-transport-revalidation/` now exists |
 | Phase 5 evidence | `target/phase5-readiness-20260708T180021Z/evidence.json` exists and is marked hardware-unqualified; M5/M7 hardware-gated runs were not run |
 | Bench baseline | `docs/bench-baseline.md` records the Phase 5 local preflight and says counted reference-host transport/GC rows still block before closing `snapstore-28z` / `snapstore-feb` |
 | Store resolve API | `SnapshotStore::resolve_pages` supports `baseline: Option<&SnapshotRef>` and `hashes_only` modes at `crates/snapstore-store/src/lib.rs:553` |
 | Store gRPC/client path | `ResolvePagesRequest.baseline_ref` is parsed and forwarded at `crates/snapstore-server/src/service.rs:306`; client exposes it at `crates/snapstore-client/src/client.rs:251` and blocking wrapper at `crates/snapstore-client/src/blocking.rs:56` |
-| Hypervisor restore gap | `../determinism-hypervisor/crates/dh-worker/src/restore_engine.rs:162` still calls `resolve_pages(snapshot_ref, None, false)` into a full-coverage fresh-slot restore path |
-| Replay ref gap | `VerifyReplay` returns `Done{total_icount,end_state_hash}` but no committed snapshot ref in `../determinism-hypervisor/proto/hypervisor.proto:357`; M8 must add an explicit replay-commit path |
-| Hypervisor M7 harness | `../determinism-hypervisor/crates/dh-worker/tests/m7_fork_verify.rs:1557` has the ignored 1000-fork VerifyReplay acceptance; it forks in batches, validates DHILOG lineage, and verifies every child |
-| Hypervisor CI precedent | `../determinism-hypervisor/.github/workflows/nightly-drift.yaml:118` runs a 100-child M7 canary on `kvm-intel`; full 1000-child acceptance remains operator-run |
+| Store M8 tooling | Evidence validator, fake/resume harness, semantic-negative tests, and CI unit-test wiring exist under `scripts/m8_joint_fork_integrity_*` and `.github/workflows/ci.yaml` |
+| Hypervisor implementation | Sibling `main` contains the replay-commit harness, baseline-resident restore, FULL-cadence rollover, resumability, semantic negative, and bounded/nightly workflow definitions |
+| CI blocker | Snapshot-store's bounded job was queued because no `kvm-intel` runner was visible to this repo; it still needs a green live run and required-check/branch-protection evidence |
+| Hardware blocker | `m0u` has only an unqualified local preflight. The operator-attested Intel/SATA host now qualifies by policy, but fio, counted M5, and counted M7 rows must run |
+| Full acceptance | `4ua` remains blocked on `m0u`; no qualified 1000/1000 live evidence or final M8 benchmark rows exist |
 
 Normative anchors:
 
@@ -59,24 +66,12 @@ Normative anchors:
 
 ## Work Item Sequence
 
-`WI1` tracker reconciliation and entry-state verification happens first. It
-must make the current bead situation explicit before anyone edits milestone
-records.
-
-`WI2` harness inventory and fake-testable M8 harness additions can proceed
-without the NVMe hardware gate. It should extend the hypervisor M7 harness
-unless the inventory proves a smaller store-hosted harness is safer.
-
-`WI3` restore/FULL-cadence wiring smoke is the first cross-repo code path and
-should land before the full 1000-child session.
-
-`WI4` qualified Phase 5 hardware rows and the M8 joint run share the same
-reference box session. Do not run M8 numbers on a SATA root and call them the
-gate.
-
-`WI5` CI permanence lands in both repos after the smoke and before closeout.
-The bounded check may be smaller than 1000 children, but any non-CI full 1000x
-shape is a recorded deviation requiring sign-off.
+Follow `09-remaining-execution.md`: first revalidate and claim the active beads;
+then unblock and prove bounded CI; then qualify the attested reference host;
+then run semantic-negative and resumable 1000-child acceptance on the same
+qualified store root; finally record benchmark rows, deviation sign-off,
+tracker closure, commits, and pushes. The CI runner and lab scheduling work can
+proceed in parallel, but `4ua` remains tracker-blocked until `m0u` closes.
 
 ## Pass/Fail Rules
 

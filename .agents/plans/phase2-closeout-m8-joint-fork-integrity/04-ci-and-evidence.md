@@ -1,5 +1,13 @@
 # WI4 - CI Permanence And Evidence Contract
 
+> Mixed status: workflow definitions and evidence tooling exist. Remaining work
+> is operational proof: merge/verify the hypervisor M8 implementation on its
+> default branch, remove the snapshot-store workflow's temporary feature-branch
+> default, authorize a `kvm-intel` runner for snapshot-store, observe green
+> artifact-bearing bounded runs in both repos, verify required-check protection,
+> and record bounded/full deviation sign-off. Follow
+> `09-remaining-execution.md`.
+
 M8 is not only an operator-run acceptance. The implementation must leave a
 permanent determinism regression in both snapshot-store and
 determinism-hypervisor CI, with any bounded/full split made explicit.

@@ -1,6 +1,12 @@
 # WI2 - Harness Inventory And M8 Ref-Identity Tooling
 
-This work is intentionally ungated by the Phase 5 NVMe hardware rows. It should
+> Historical design record: `snapshot-store-gy9` is closed and the described
+> validator, fake harness, replay-commit path, resumability, shared-page
+> accounting, and semantic negative are implemented. Use this file to diagnose
+> live-run failures; do not redesign these surfaces unless current tests expose
+> a defect.
+
+This work was intentionally ungated by the Phase 5 hardware rows. It should
 produce a fake-testable harness and evidence model before anyone schedules the
 full guest session.
 

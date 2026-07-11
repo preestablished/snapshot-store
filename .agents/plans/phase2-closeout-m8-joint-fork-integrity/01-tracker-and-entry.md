@@ -1,5 +1,11 @@
 # WI1 - Tracker Reconciliation And Entry State
 
+> Historical design record: this work is complete. The replacement graph now
+> exists. Do not run the bead-creation commands below. Use the sequential audit
+> in `09-remaining-execution.md` and update only `m0u`, `2dl`, `4ua`, and `orm`.
+> An embedded-Dolt lock error is not evidence that a bead is absent: wait for
+> the lock holder to finish and retry the command.
+
 The first implementer action is to reconcile the request's bead assumptions
 against the current beads database. Do this before editing code or creating M8
 evidence.

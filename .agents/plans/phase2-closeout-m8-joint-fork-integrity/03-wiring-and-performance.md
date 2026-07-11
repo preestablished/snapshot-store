@@ -1,5 +1,11 @@
 # WI3 - Restore Wiring, FULL Cadence, And Performance Runs
 
+> Mixed status: baseline-resident restore and FULL-cadence smoke are implemented
+> and `snapshot-store-8p9` is closed. The qualified predecessor measurements and
+> full live run remain open. Current policy permits the operator-attested
+> Intel/SATA reference host; qualification depends on attestation and counted
+> fio/M5/M7 evidence, not NVMe media.
+
 This work connects the fake-testable harness to the real cross-repo execution
 path, then runs the hardware-gated rows and the M8 acceptance session.
 
