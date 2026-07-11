@@ -201,12 +201,21 @@ Bounded M8 ref-identity workflow lanes have been added in both repos:
   cross-repo job that checks out the current snapshot-store SHA as the sibling
   dependency and runs the bounded M8 hypervisor test against it.
 
-The snapshot-store job is temporarily pinned to the sibling hypervisor branch
-`m8-snapshot-store-replay-commit`, overridable with repository variable
-`M8_HYPERVISOR_REF`, until that branch lands on the hypervisor default branch.
-Remaining external closeout for `snapshot-store-2dl`: observe green GitHub runs,
-record branch-protection/required-check status, and record phases-track sign-off
-for bounded required CI plus operator-run 1000x full acceptance.
+The M8 branch tip `7ad88b3` is now an ancestor of the sibling hypervisor's
+remote `main` (`6e348e5`). Snapshot-store commit `3364d10` therefore changed
+the bounded job to check out hypervisor `main` by default; repository variable
+`M8_HYPERVISOR_REF` remains only as a diagnostic alternate-ref override.
+
+Snapshot-store run
+<https://github.com/preestablished/snapshot-store/actions/runs/29158803035>
+targets exact snapshot-store SHA `3364d10`. The hosted jobs can run, but the
+bounded job remains queued because the snapshot-store runner API reports zero
+visible self-hosted runners. The idle `infra-control-kvm-intel` runner is
+currently repo-scoped to determinism-hypervisor. Remaining external closeout
+for `snapshot-store-2dl`: grant the runner access, obtain a fresh green bounded
+artifact, record branch-protection/required-check status, and record
+phases-track sign-off for bounded required CI plus operator-run 1000x full
+acceptance.
 
 CI root-cause note: GitHub rejected the latest M8 workflow pushes before
 scheduling jobs because the new bounded M8 jobs used `${{ runner.temp }}` in
