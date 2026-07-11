@@ -102,10 +102,9 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/determinism-hypervisor
           path: determinism-hypervisor
-          # Branch pin keeps this cross-repo check runnable while the M8
-          # hypervisor support is still staged outside that repo's default
-          # branch. Set repository variable M8_HYPERVISOR_REF to override.
-          ref: ${{ vars.M8_HYPERVISOR_REF || 'm8-snapshot-store-replay-commit' }}
+          # M8 support is on the hypervisor default branch. Set repository
+          # variable M8_HYPERVISOR_REF only for diagnostic alternate-ref runs.
+          ref: ${{ vars.M8_HYPERVISOR_REF || 'main' }}
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/control-plane
