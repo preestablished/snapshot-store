@@ -85,12 +85,19 @@ Schedule through the bridge/runtime owner. Avoid concurrent long frame-capture
 streams and preserve the same qualified store root and clean repository/image
 identities for the complete session.
 
-In the hypervisor repository, first run the semantic negative into the same
-parent evidence root that the positive run will link. Then run the positive
+In the hypervisor repository, first run the FULL-cadence smoke and write its
+success marker into the parent evidence root. Then run the semantic negative
+into the same root that the positive run will link, followed by the positive
 gate. Use the exact command names present in the current sibling checkout;
 the expected shape is:
 
 ```bash
+mkdir -p target/m8-joint-fork-integrity-<UTC>
+cargo test -p dh-worker --lib \
+  take_snapshot_rolls_full_manifest_and_restore_accepts_baseline_delta \
+  -- --nocapture --test-threads=1
+touch target/m8-joint-fork-integrity-<UTC>/full-cadence-smoke.ok
+
 M8_STORE_ROOT=/absolute/path/on/reference-host \
 M8_EVIDENCE_ROOT=target/m8-joint-fork-integrity-<UTC> \
 M8_STORE_ROOT_QUALIFIED=1 \
