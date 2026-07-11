@@ -206,16 +206,28 @@ remote `main` (`6e348e5`). Snapshot-store commit `3364d10` therefore changed
 the bounded job to check out hypervisor `main` by default; repository variable
 `M8_HYPERVISOR_REF` remains only as a diagnostic alternate-ref override.
 
-Snapshot-store run
-<https://github.com/preestablished/snapshot-store/actions/runs/29158803035>
-targets exact snapshot-store SHA `3364d10`. The hosted jobs can run, but the
-bounded job remains queued because the snapshot-store runner API reports zero
-visible self-hosted runners. The idle `infra-control-kvm-intel` runner is
-currently repo-scoped to determinism-hypervisor. Remaining external closeout
-for `snapshot-store-2dl`: grant the runner access, obtain a fresh green bounded
-artifact, record branch-protection/required-check status, and record
-phases-track sign-off for bounded required CI plus operator-run 1000x full
-acceptance.
+The qualified host now has a separately registered
+`infra-control-snapshot-store-kvm-intel` runner with the required
+`self-hosted,kvm-intel` labels. Snapshot-store run
+<https://github.com/preestablished/snapshot-store/actions/runs/29160909438>
+was the first validator-green run. The superseding run
+<https://github.com/preestablished/snapshot-store/actions/runs/29161501161>
+is green for exact snapshot-store SHA `ef94e5e`, hypervisor SHA `44b0a78`, and
+8/8 replay-commit children. Its downloaded artifact validates mechanically;
+the semantic-negative ref mismatch, baseline-delta restore, FULL-cadence,
+shared-page, and latency bars are all green. An earlier 100-child green test
+was rejected during closeout because its artifact lacked semantic-negative and
+FULL-cadence proof; the workflow now runs those proofs and the validator before
+uploading.
+
+Snapshot-store `main` branch protection is enabled with strict required checks
+`m8-ref-identity-bounded`, `rust (ubuntu-latest)`, and `crash-smoke`, plus
+required conversation resolution. The mirrored hypervisor run
+<https://github.com/preestablished/determinism-hypervisor/actions/runs/29162383017>
+is also fully green, including its required x86, ARM, and KVM checks; its 8/8
+M8 artifact independently passes the snapshot-store validator. Remaining
+external closeout for `snapshot-store-2dl` is phases-track sign-off for bounded
+required CI plus the operator-run full 1000x acceptance.
 
 CI root-cause note: GitHub rejected the latest M8 workflow pushes before
 scheduling jobs because the new bounded M8 jobs used `${{ runner.temp }}` in
