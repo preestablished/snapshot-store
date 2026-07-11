@@ -148,6 +148,52 @@ RUN_FIO=1 RUN_M5=1 RUN_M7_GC=1 RUN_FLAKE_50X=1 \
 scripts/phase5-readiness-evidence.sh
 ```
 
+## Qualified M8 Predecessor - infra-control, 2026-07-11
+
+Evidence root: `target/phase5-readiness-20260711T183613Z/`
+
+This is the counted Phase 5 predecessor on the operator-attested Intel/SATA
+reference host. The evidence was captured from clean snapshot-store commit
+`3218d6b31feb3647fd5c8a74d0197d3c740c752a` with
+`hardware_qualification.qualified=true`. All three fio commands completed with
+status zero, the M5 command completed with status zero, and the 50-run flake
+loop had zero failures. The M7 command deliberately returned nonzero after
+writing its complete result because three performance targets missed; the
+reclaim correctness, sample, and zero-error bars passed.
+
+| Reference-host input | Measured |
+|---|---:|
+| fio sequential write, 1 MiB direct | 413.29 MB/s |
+| fio sequential read, 1 MiB direct | 498.12 MB/s |
+| fio random 70/30 read/write, 4 KiB direct | 14,771.7 / 6,356.2 IOPS |
+| `page_channel_fallback` | 50/50 green |
+
+| Counted M5 row | Architecture target | Measured | Reference-host disposition |
+|---|---:|---:|---|
+| PUT_BATCH warm sustained | >= 1.5 GB/s | 0.397 GB/s | accepted measured CPU/memory ceiling; spec miss |
+| GET_BATCH warm sustained | >= 2.5 GB/s | 0.287 GB/s | accepted measured CPU/memory ceiling; spec miss |
+| 16 x 8 MiB commit p99 | < 40 ms | 1,472.12 ms | accepted SATA/fsync floor; spec miss |
+| 16-client aggregate | >= 1.2 GB/s | 0.132 GB/s | accepted SATA/fsync floor; spec miss |
+| CreateNode + 16 KiB log p50 | < 1.5 ms | 6.815 ms | accepted SATA/fsync floor; spec miss |
+| UpdateNodes(256) p50 | < 3 ms | 17.961 ms | accepted SATA/fsync floor; spec miss |
+
+| Counted M7 row | Target | Measured | Reference-host disposition |
+|---|---:|---:|---|
+| Reclaiming cycle | < 60 s | 1,435.235 s | accepted reference-host floor; target miss |
+| Nodes reaped | 50,000 | 50,000 | met |
+| Garbage reclaimed | predicted 3,900,000 pages / 15.974 GB | 3,878,811 pages / 16.031 GB | met within the harness tolerance |
+| Commit ingest during reclaim | >= 200 MB/s | 95.625 MB/s | accepted reference-host floor; target miss |
+| Commit p99 during reclaim | < 2 x 622.295 ms idle | 3,469.373 ms | accepted reference-host floor; target miss |
+| Commit errors | 0 | 0 across 16,363 reclaim samples | met |
+
+These misses are retained as failures in `evidence.json`; they are not rewritten
+as architecture-target passes. Under the 2026-07-10 decided posture, the
+operator-attested host's measured ceiling is the current acceptance surface,
+and a separate NVMe rerun is upside validation rather than an M8 predecessor.
+The reclaim result also proves functional correctness at the full shape:
+50,000 target nodes were reaped, the predicted garbage was reclaimed, and no
+commit failed while GC was active.
+
 ## Gate S5 — crash suite (for the record)
 
 1,000 randomized kill cycles + failpoint matrix (9 boundaries) × 50
