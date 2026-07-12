@@ -12,6 +12,7 @@ MANIFEST_KINDS = {"FULL", "DELTA"}
 RESULTS = {"pass", "ref_mismatch", "state_mismatch", "replay_divergence", "error"}
 ROW_SOURCES = {"fresh", "resumed"}
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
+RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 LATENCY_GROUPS = [
     "fork_to_original_commit",
     "restore_delta",
@@ -119,7 +120,110 @@ def validate_store_root(evidence, run_kind, errors):
         errors.append("store_root.qualified: must be boolean")
     if run_kind == "full_acceptance" and qualified is not True:
         errors.append("store_root.qualified: full_acceptance requires qualified=true")
+    if run_kind == "full_acceptance":
+        if not Path(store_root.get("path", "")).is_absolute():
+            errors.append("store_root.path: full_acceptance requires an absolute path")
+        if not isinstance(store_root.get("resolved_path"), str) or not Path(
+            store_root.get("resolved_path", "")
+        ).is_absolute():
+            errors.append("store_root.resolved_path: full_acceptance requires an absolute path")
+        if not isinstance(store_root.get("mount"), str) or not store_root["mount"]:
+            errors.append("store_root.mount: full_acceptance requires mount identity")
     return qualified is True
+
+
+def validate_host_and_guest(evidence, run_kind, errors):
+    host = evidence.get("host")
+    guest = evidence.get("guest")
+    if not isinstance(host, dict):
+        errors.append("host: must be an object")
+        return
+    if not isinstance(guest, dict):
+        errors.append("guest: must be an object")
+        return
+    if run_kind != "full_acceptance":
+        return
+    for field in ["hostname", "arch", "kernel", "cpu", "runner_labels", "store_mount"]:
+        if not isinstance(host.get(field), str) or not host[field] or host[field] == "unknown":
+            errors.append(f"host.{field}: full_acceptance requires a captured value")
+    if not isinstance(host.get("memory_bytes"), int) or host["memory_bytes"] <= 0:
+        errors.append("host.memory_bytes: full_acceptance requires a positive integer")
+    if host.get("kvm_read_write") is not True:
+        errors.append("host.kvm_read_write: full_acceptance requires true")
+    if guest.get("kind") != "linux":
+        errors.append("guest.kind: full_acceptance requires linux")
+    if not is_hex32(guest.get("machine_config_hash")):
+        errors.append("guest.machine_config_hash: must be 32-byte lowercase hex")
+    images = guest.get("images")
+    if not isinstance(images, dict):
+        errors.append("guest.images: full_acceptance requires an object")
+    else:
+        for field in [
+            "bzimage_blake3",
+            "initramfs_blake3",
+            "base_image_blake3",
+            "game_image_blake3",
+        ]:
+            if not is_hex32(images.get(field)):
+                errors.append(f"guest.images.{field}: must be 32-byte lowercase hex")
+
+
+def validate_config_commands_artifacts(evidence, run_kind, expected, errors):
+    config = evidence.get("config")
+    if not isinstance(config, dict):
+        errors.append("config: must be an object")
+    elif run_kind == "full_acceptance":
+        if config.get("jobs") != expected:
+            errors.append("config.jobs: must equal expected_child_count")
+        if config.get("restore_mode") != "baseline_delta":
+            errors.append("config.restore_mode: full_acceptance requires baseline_delta")
+        if not isinstance(config.get("max_delta_chain"), int) or config["max_delta_chain"] <= 0:
+            errors.append("config.max_delta_chain: must be a positive integer")
+        if not isinstance(config.get("slot_cores_env"), str) or not config["slot_cores_env"]:
+            errors.append("config.slot_cores_env: full_acceptance requires configured cores")
+    commands = evidence.get("commands")
+    if not isinstance(commands, list):
+        errors.append("commands: must be a list")
+    elif run_kind == "full_acceptance" and (
+        not commands or any(not isinstance(command, str) or not command for command in commands)
+    ):
+        errors.append("commands: full_acceptance requires exact non-empty commands")
+    artifacts = evidence.get("artifacts")
+    if not isinstance(artifacts, list):
+        errors.append("artifacts: must be a list")
+    else:
+        for index, artifact in enumerate(artifacts):
+            if not isinstance(artifact, dict):
+                errors.append(f"artifacts[{index}]: must be an object")
+                continue
+            for field in ["path", "kind"]:
+                if not isinstance(artifact.get(field), str) or not artifact[field]:
+                    errors.append(f"artifacts[{index}].{field}: must be non-empty")
+            path = artifact.get("path")
+            if isinstance(path, str) and (Path(path).is_absolute() or ".." in Path(path).parts):
+                errors.append(f"artifacts[{index}].path: must stay inside evidence root")
+
+
+def validate_deviations(evidence, errors):
+    deviations = evidence.get("deviations")
+    if not isinstance(deviations, list):
+        errors.append("deviations: must be a list")
+        return
+    for index, deviation in enumerate(deviations):
+        if not isinstance(deviation, dict):
+            errors.append(f"deviations[{index}]: must be an object")
+            continue
+        for field in ["id", "reason"]:
+            if not isinstance(deviation.get(field), str) or not deviation[field]:
+                errors.append(f"deviations[{index}].{field}: must be non-empty")
+        signoff = deviation.get("signoff")
+        if signoff is not None:
+            if not isinstance(signoff, dict):
+                errors.append(f"deviations[{index}].signoff: must be an object or null")
+            else:
+                for field in ["owner", "date", "link"]:
+                    if not isinstance(signoff.get(field), str) or not signoff[field]:
+                        errors.append(f"deviations[{index}].signoff.{field}: must be non-empty")
 
 
 def validate_child_row(row, index):
@@ -322,20 +426,15 @@ def validate_evidence(root):
     for field in ["run_id", "started_at", "finished_at"]:
         if not isinstance(evidence.get(field), str) or not evidence[field]:
             errors.append(f"{field}: must be a non-empty string")
+    if run_kind == "full_acceptance":
+        for field in ["started_at", "finished_at"]:
+            if not RFC3339_UTC_RE.match(evidence.get(field, "")):
+                errors.append(f"{field}: full_acceptance requires UTC RFC3339 seconds")
     validate_repos(evidence, errors)
-    if not isinstance(evidence.get("host"), dict):
-        errors.append("host: must be an object")
-    if not isinstance(evidence.get("guest"), dict):
-        errors.append("guest: must be an object")
+    validate_host_and_guest(evidence, run_kind, errors)
     validate_store_root(evidence, run_kind, errors)
-    if not isinstance(evidence.get("config"), dict):
-        errors.append("config: must be an object")
-    if not isinstance(evidence.get("commands"), list):
-        errors.append("commands: must be a list")
-    if not isinstance(evidence.get("artifacts"), list):
-        errors.append("artifacts: must be a list")
-    if not isinstance(evidence.get("deviations"), list):
-        errors.append("deviations: must be a list")
+    validate_config_commands_artifacts(evidence, run_kind, expected, errors)
+    validate_deviations(evidence, errors)
 
     bars = bar_index(evidence, errors)
     for name in REQUIRED_BARS:

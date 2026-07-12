@@ -215,6 +215,29 @@ class M8EvidenceValidatorTest(unittest.TestCase):
         self.assertTrue(any("full_acceptance requires 1000" in error for error in errors), errors)
         self.assertTrue(any("qualified=true" in error for error in errors), errors)
 
+    def test_full_acceptance_requires_complete_host_guest_and_store_identity(self):
+        ev = evidence(run_kind="full_acceptance", expected=1000)
+        errors = self.validate_case(ev, [row(index=i) for i in range(1000)])
+        for field in [
+            "host.kernel",
+            "host.cpu",
+            "host.memory_bytes",
+            "host.kvm_read_write",
+            "guest.machine_config_hash",
+            "guest.images",
+            "store_root.resolved_path",
+            "store_root.mount",
+            "config.restore_mode",
+            "config.slot_cores_env",
+        ]:
+            self.assertTrue(any(field in error for error in errors), (field, errors))
+
+    def test_rejects_unstructured_deviation(self):
+        ev = evidence()
+        ev["deviations"] = [{"id": "partial"}]
+        errors = self.validate_case(ev, [row()])
+        self.assertTrue(any("deviations[0].reason" in error for error in errors), errors)
+
     def test_semantic_negative_requires_committed_ref_mismatch(self):
         ev = evidence(run_kind="semantic_negative", expected=1)
         mismatch = row(replay_ref=H4, original_ref=H1, result="ref_mismatch")
