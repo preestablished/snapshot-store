@@ -15,8 +15,8 @@ status and review files remain historical context.
 | Complete evidence identity/schema | snapshot-store `08aedbf`; full artifact has UTC times, repo states, host/kernel/CPU/RAM/KVM/mount, image hashes, machine-config hash, command/env, artifacts, and `deviations=[]` | complete |
 | Snapshot-store required bounded CI | strict branch protection; exact-SHA run `29174163626` green | complete |
 | Hypervisor bounded/mirrored CI | exact-SHA run `29174139210` green across x86, ARM, and KVM | complete |
-| Full-in-CI wording disposition | bounded required jobs plus operator-run 1,000-child gate is documented, but phases-track approval has not been received | **waiting on external sign-off** |
-| Final epic closure | `snapshot-store-orm` depends only on `snapshot-store-2dl` | waiting on same sign-off |
+| Full-in-CI wording disposition | Matt Spurlin approved bounded required jobs plus the operator-run 1,000-child gate on 2026-07-12; `06-phases-track-verification.md` | complete |
+| Final epic closure | all child requirements and phases-track sign-off complete | complete |
 
 ## Accepted Exact Identities
 
@@ -30,15 +30,7 @@ status and review files remain historical context.
 - hypervisor CI:
   <https://github.com/preestablished/determinism-hypervisor/actions/runs/29174139210>
 
-## Remaining Authorized Action
+## Final Disposition
 
-Do not rerun or redefine completed gates. When phases-track provides an owner,
-date, and approval link/note for the bounded-required/full-operator split:
-
-1. add the verification response file requested by `05-closeout-and-handback.md`;
-2. record the sign-off in `snapshot-store-2dl` and close it;
-3. close `snapshot-store-orm` after confirming its dependency graph is clear;
-4. push beads and Git and verify both remotes.
-
-Without that external approval, the plan explicitly forbids closing `2dl` or
-claiming literal full-in-CI compliance.
+Matt Spurlin supplied the required approval on 2026-07-12. It is recorded in
+`06-phases-track-verification.md`. No plan requirement remains open.

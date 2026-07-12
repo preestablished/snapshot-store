@@ -63,15 +63,16 @@ hosted x86, hosted ARM, and KVM lanes in
 
 The permanent required checks are bounded (eight children per merge, 100 in
 the hypervisor nightly); the full 1,000-child acceptance remains an operator
-run. `snapshot-store-2dl` remains open pending the requested phases-track
-approval of that bounded-required/full-operator split. This resolution does
-not silently treat the split as literal full-in-CI compliance.
+run. Matt Spurlin approved this bounded-required/full-operator split on
+2026-07-12 as satisfying M8 permanence, with any ref-identity or replay
+divergence remaining P0. The approval is recorded in
+`06-phases-track-verification.md`.
 
 ## Tracker Disposition
 
 - `snapshot-store-m0u`: closed after qualified predecessor evidence
   `target/phase5-readiness-20260711T183613Z`.
 - `snapshot-store-4ua`: ready to close on this validated full evidence.
-- `snapshot-store-2dl`: remains open solely for external phases-track sign-off.
-- `snapshot-store-orm`: remains open while `snapshot-store-2dl` is open.
+- `snapshot-store-2dl`: closed after phases-track sign-off.
+- `snapshot-store-orm`: closed after all child requirements completed.
 - `determinism-hypervisor-apd8`: ready to close after exact-SHA CI completes.
