@@ -194,6 +194,41 @@ The reclaim result also proves functional correctness at the full shape:
 50,000 target nodes were reaped, the predicted garbage was reclaimed, and no
 commit failed while GC was active.
 
+## M8 Joint Fork Integrity - infra-control, 2026-07-12
+
+Evidence root:
+`../determinism-hypervisor/target/m8-joint-fork-integrity-20260712T001100Z/`
+
+The full acceptance used clean snapshot-store commit `37f7a8c39f1986434d0bbb9ea161fc37e58d9843`
+and clean determinism-hypervisor commit `5b9dd2d56d4d2a5f17a0f8626abbd0d580a5a4e4`
+on the operator-qualified Intel/SATA host. The Linux fixture used guest-sdk
+`0fcddf455db6a386aa52d12560b1db74fc6cf4b1`, initramfs BLAKE3
+`36f50484f9fc1a8cfe6dd024dccac0a0ce4ab7f504b1e2cea357a00f97390b7d`,
+and game-image BLAKE3
+`96cdaa2380b593e1f3377fc5bf23a16a74e0e277a08ce988ea532b5a91c8c194`.
+
+| M8 acceptance row | Required | Measured | Status |
+|---|---:|---:|---|
+| Replay-commit reference identity | 1,000 / 1,000 | 1,000 / 1,000 | **MET** |
+| Distinct seeded child refs | 1,000 | 1,000 | **MET** |
+| Aggregate sibling shared pages | >= 94% | 94.166% | **MET** |
+| Baseline-delta restore | used for child hot path | 1,000 / 1,000 rows | **MET** |
+| FULL-manifest cadence | smoke passes | passed | **MET** |
+| Semantic input corruption | committed ref mismatch | passed red | **MET** |
+
+| M8 latency telemetry | p50 | p95 | p99 | max |
+|---|---:|---:|---:|---:|
+| Fork to original commit | 203.343 ms | 400.241 ms | 461.490 ms | 977.312 ms |
+| Baseline-delta restore | 1,169.861 ms | 1,631.591 ms | 2,011.930 ms | 2,231.394 ms |
+| Replay restore to commit | 1,249.152 ms | 1,885.071 ms | 2,023.580 ms | 2,205.385 ms |
+
+The validator reports every M8 bar green. The semantic negative changed the
+first pad event before sealing and proved a committed snapshot-ref mismatch;
+it did not rely on corrupting an already checksummed container. Raw per-child
+JSONL/CSV contains exactly 1,000 contiguous rows. The control-plane checkout
+was dirty during fixture discovery, but the snapshot-store, hypervisor, and
+guest-sdk identities used by the run were clean and are recorded above.
+
 ## Gate S5 — crash suite (for the record)
 
 1,000 randomized kill cycles + failpoint matrix (9 boundaries) × 50
