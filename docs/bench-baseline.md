@@ -197,10 +197,10 @@ commit failed while GC was active.
 ## M8 Joint Fork Integrity - infra-control, 2026-07-12
 
 Evidence root:
-`../determinism-hypervisor/target/m8-joint-fork-integrity-20260712T001100Z/`
+`../determinism-hypervisor/target/m8-joint-fork-integrity-20260712T004334Z/`
 
-The full acceptance used clean snapshot-store commit `37f7a8c39f1986434d0bbb9ea161fc37e58d9843`
-and clean determinism-hypervisor commit `5b9dd2d56d4d2a5f17a0f8626abbd0d580a5a4e4`
+The full acceptance used clean snapshot-store commit `08aedbfedbd45a13628f73e4eab669c6a0e21627`
+and clean determinism-hypervisor commit `776a80f4ee1550081612b0b593ea4218a108856d`
 on the operator-qualified Intel/SATA host. The Linux fixture used guest-sdk
 `0fcddf455db6a386aa52d12560b1db74fc6cf4b1`, initramfs BLAKE3
 `36f50484f9fc1a8cfe6dd024dccac0a0ce4ab7f504b1e2cea357a00f97390b7d`,
@@ -218,9 +218,9 @@ and game-image BLAKE3
 
 | M8 latency telemetry | p50 | p95 | p99 | max |
 |---|---:|---:|---:|---:|
-| Fork to original commit | 203.343 ms | 400.241 ms | 461.490 ms | 977.312 ms |
-| Baseline-delta restore | 1,169.861 ms | 1,631.591 ms | 2,011.930 ms | 2,231.394 ms |
-| Replay restore to commit | 1,249.152 ms | 1,885.071 ms | 2,023.580 ms | 2,205.385 ms |
+| Fork to original commit | 212.921 ms | 461.328 ms | 482.244 ms | 936.679 ms |
+| Baseline-delta restore | 1,226.299 ms | 1,725.245 ms | 2,205.566 ms | 2,460.017 ms |
+| Replay restore to commit | 1,412.491 ms | 2,133.227 ms | 2,299.727 ms | 3,022.055 ms |
 
 The validator reports every M8 bar green. The semantic negative changed the
 first pad event before sealing and proved a committed snapshot-ref mismatch;
@@ -228,6 +228,9 @@ it did not rely on corrupting an already checksummed container. Raw per-child
 JSONL/CSV contains exactly 1,000 contiguous rows. The control-plane checkout
 was dirty during fixture discovery, but the snapshot-store, hypervisor, and
 guest-sdk identities used by the run were clean and are recorded above.
+The accepted evidence also records RFC3339 UTC start/finish times, kernel,
+CPU, RAM, KVM read/write status, runner labels, resolved store mount, all four
+guest image hashes, and the machine-config hash; `deviations` is empty.
 
 ## Gate S5 — crash suite (for the record)
 
