@@ -22,10 +22,10 @@ and is delivered now to complete the handshake on the record.
 
 snapshot-store's reverse-direction signal has already arrived: the
 owner-authored stable-schema ready signal was delivered 2026-07-16 as
-`control-plane/.agents/requests/phase4-snapstore-promotion-and-vdev-playbook/05-snapstore-owner-ready-signal.md`
-(owner SHA `a582bee5abfd0f1bd078e645f2eaa9576e3f966f`, v1 stability
-approved). Both directions of the handshake are now on the record; the two
-signals are complementary, per your plan
+`control-plane/.agents/requests/phase4-snapstore-promotion-and-vdev-playbook/05-snapstore-owner-ready-signal.md`.
+That signal is owner-authored and its content is deliberately not restated
+here — it speaks for itself. Both directions of the handshake are now on
+the record; the two signals are complementary, per your plan
 `snapstore-v1-stable-schema-and-ready-signal` — neither side double-sends.
 
 ## Control-plane's next move
