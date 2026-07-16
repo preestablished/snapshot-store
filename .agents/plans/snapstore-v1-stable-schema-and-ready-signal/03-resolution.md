@@ -16,7 +16,7 @@ path**; the ball is now in control-plane's court.
   `// UNIMPLEMENTED until M7` comment is stale doc-only drift. No
   server↔proto divergence exists (tonic codegen makes the trait follow the
   file).
-- **Divergence disposition:** all 13 API.md §1 ↔ code divergences from the
+- **Divergence disposition:** all 14 API.md §1 ↔ code divergences from the
   plan table confirmed as doc drift; **code wins** for every one. Doc-drift
   bead **snapshot-store-wz8** (p2, docs) filed with the full list plus the
   stale TriggerGc comment. API.md untouched in this unit; owner proto file
@@ -80,3 +80,19 @@ landing from the owner SHA, comparator, freeze-ledger flip, facade
 migration, consumer handback. Our later half (snapshot-store-bxg) triggers
 on their handback signal per playbook `:168-179`. The ball is in
 control-plane's court.
+
+## Post-review corrections (2026-07-16, same day)
+
+Two independent review passes verified every SHA, citation, line count, and
+bead against the live repos; no load-bearing defect found. Three corrections
+applied (signal amended in a follow-up control-plane commit): divergence
+count corrected 13 → 14 (TriggerGc's message-shape drift is its own table
+row); the reciprocal-handshake quotation restored to verbatim (elided
+parenthetical reinstated); explicit `owner-ready signal location` /
+`owner v1-freeze approval location` self-reference lines added so every
+evidence-manifest field is copy-pasteable. Noted, no action: the
+exploration-orchestrator SHA checked at signal time (`ffe93f2…`) was rebased
+out of that repo's `main` within hours — the signal's "re-verify pins live"
+caveat governs. The sibling inbound signal
+(`07-controlplane-playbook-ready-signal.md`) landed and was committed
+concurrently (`cb7b5ee`); it corroborates, not contradicts, this delivery.
