@@ -99,7 +99,11 @@ From the handoff env file: `SNAPSTORE_DATA_ROOT`, `SNAPSTORE_CONFIG_PATH`
    the handoff starts its own ephemeral server on the same data root and
    refuses a live socket:
 
-   a. stop the supervised server and confirm the UDS is gone;
+   a. stop the supervised server (SIGTERM) and confirm the **process** has
+      exited, not just that a signal was sent: graceful shutdown can wait
+      indefinitely on a connected client (`dh-workerd` holds the UDS open).
+      If it has not exited after ~30 s and the stack is idle, SIGKILL it —
+      the store is crash-safe — and only then start a new server;
    b. run the handoff (hypervisor runbook); it must not leave its own
       long-lived server running;
    c. repeat steps 1–2 (env values may have changed);

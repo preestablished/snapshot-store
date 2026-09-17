@@ -52,8 +52,10 @@ bytes and this procedure defines no separate map.
    curl -fsS http://127.0.0.1:7411/metrics | grep '^snapstore_gc_manifests_deleted_total'
    ```
 
-   The manifest must be FULL (`delta = false`) with the demo guest's
-   `guest_ram_bytes`. The deleted count may rise for unrelated garbage; the
+   The manifest must report the demo guest's `guest_ram_bytes`. The handoff's
+   READY snapshot is normally a DELTA over a FULL parent (the pin roots the
+   whole parent chain): also `dump-manifest` the `parent` ref it prints and
+   confirm that resolves. The deleted count may rise for unrelated garbage; the
    READY manifest must not be among it. **If `dump-manifest` fails: stop.**
    Recovery is a fresh handoff run; file a P0 issue.
 
