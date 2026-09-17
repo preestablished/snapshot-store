@@ -1,0 +1,32 @@
+# snapstore-server overlay config for the Intel box.
+#
+# Overlay of the config the hypervisor handoff (dh-m9-ready-handoff) writes:
+# same data_root and grpc_uds_path, plus stable ports, the page channel, and
+# explicit tuning. See docs/ops/intel-box-deploy.md. Every key here is an
+# implemented ServerConfig key (unknown keys are a hard startup error).
+#
+# Copy data_root and grpc_uds_path from the handoff env
+# (SNAPSTORE_DATA_ROOT, SNAPSTORE_GRPC_UDS_PATH).
+data_root = "<SNAPSTORE_DATA_ROOT>"
+grpc_uds_path = "<SNAPSTORE_GRPC_UDS_PATH>"
+grpc_tcp_addr = "127.0.0.1:7410"
+http_addr = "127.0.0.1:7411"
+page_channel_path = "<SNAPSTORE_DATA_ROOT>/pages.sock"
+
+[pagestore]
+write_buf_size = 4194304
+max_pack_bytes = 1073741824
+read_handle_cap = 256
+
+[meta]
+input_log_max_bytes = 16777216
+
+[page_channel]
+ingest_queue_pages = 65536
+
+[gc]
+auto = false            # flip to true only after the READY pin (docs/ops/ready-root-pin.md) is verified
+trigger_disk_pct = 80
+check_interval_secs = 60
+compact_threshold = 0.5
+tombstone_grace_cycles = 1

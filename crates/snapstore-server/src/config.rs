@@ -329,4 +329,27 @@ grpc_uds_path = "/var/run/snapstore.sock"
             std::path::PathBuf::from("/var/run/snapstore.sock")
         );
     }
+
+    /// Keeps `deploy/intel-box/config.toml.example` honest against
+    /// `deny_unknown_fields`: the committed template must parse once its
+    /// placeholders are substituted.
+    #[test]
+    fn template_example_parses() {
+        let raw = include_str!("../../../deploy/intel-box/config.toml.example")
+            .replace("<SNAPSTORE_DATA_ROOT>", "/srv/snapstore/data")
+            .replace("<SNAPSTORE_GRPC_UDS_PATH>", "/srv/snapstore/snapstore.sock");
+        let cfg = parse(&raw).unwrap();
+        assert_eq!(cfg.data_root, PathBuf::from("/srv/snapstore/data"));
+        assert_eq!(
+            cfg.resolved_uds_path(),
+            PathBuf::from("/srv/snapstore/snapstore.sock")
+        );
+        assert_eq!(
+            cfg.page_channel_path,
+            Some(PathBuf::from("/srv/snapstore/data/pages.sock"))
+        );
+        assert_eq!(cfg.grpc_tcp_addr.port(), 7410);
+        assert_eq!(cfg.http_addr.port(), 7411);
+        assert!(!cfg.gc.auto, "bring-up template must ship gc.auto = false");
+    }
 }

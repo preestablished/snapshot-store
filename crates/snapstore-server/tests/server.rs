@@ -910,6 +910,69 @@ async fn trigger_gc_reclaims_pruned_manifest() {
     assert!(stats.store.unwrap().gc_runs_total >= 1);
 }
 
+/// The READY root relies on this: a snapshot with NO node survives an
+/// aggressive cycle purely because it is pinned, and is swept once unpinned.
+#[tokio::test]
+async fn pinned_orphan_snapshot_survives_gc() {
+    let (_handle, mut client, _dir) = start_server().await;
+
+    let pinned = put_a_snapshot_seeded(&mut client, 333).await;
+    let pin_resp = client
+        .pin(PinRequest {
+            snapshot_ref: pinned.clone(),
+            note: "ready-root test".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(pin_resp.newly_pinned);
+
+    let resp = client
+        .trigger_gc(TriggerGcRequest {
+            compact_aggressively: true,
+            detach: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.started);
+    assert_eq!(resp.manifests_deleted, 0, "the pin roots the manifest");
+
+    client
+        .get_snapshot(GetSnapshotRequest {
+            snapshot_ref: pinned.clone(),
+        })
+        .await
+        .expect("pinned node-less snapshot must survive aggressive GC");
+
+    let unpin_resp = client
+        .unpin(UnpinRequest {
+            snapshot_ref: pinned.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unpin_resp.was_pinned);
+
+    let resp = client
+        .trigger_gc(TriggerGcRequest {
+            compact_aggressively: true,
+            detach: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.manifests_deleted, 1, "unpinned orphan is swept");
+
+    let err = client
+        .get_snapshot(GetSnapshotRequest {
+            snapshot_ref: pinned,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
 #[tokio::test]
 async fn pin_unknown_ref_failed_precondition() {
     let (_handle, mut client, _dir) = start_server().await;

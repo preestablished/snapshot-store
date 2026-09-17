@@ -1,0 +1,20 @@
+# systemd unit for snapstore-server on the Intel box (user or system scope).
+# Replace <checkout> and <handoff-env> before installing. The handoff env file
+# must already carry SNAPSTORE_CONFIG_OVERLAY (docs/ops/intel-box-deploy.md
+# step 2). Hosts without a usable systemd scope use the nohup/pid-file form in
+# the deploy doc instead.
+[Unit]
+Description=snapstore-server (Intel box, handoff data root)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=<checkout>
+EnvironmentFile=<handoff-env>
+ExecStart=<checkout>/target/release/snapstore-server --config ${SNAPSTORE_CONFIG_OVERLAY}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
