@@ -246,3 +246,57 @@ scenario × 10: zero invariant violations, zero fsck violations.
 - S2: PROPTEST_CASES=4096 manifest suite green; new golden vector
   committed with the format change; fuzz target 4.4 M execs/16 s clean
   locally, 10-minute run wired into nightly CI.
+
+## Requalification - infra-control, 2026-09-17
+
+Evidence root: `target/phase5-readiness-20260917T053354Z/`
+
+Counted rerun of the Phase 5 predecessor at snapshot-store commit `3c0e02c`
+(the 2026-07-11 numbers predate the M8 joint work). Storage class: the box has
+no NVMe device; `lsblk` shows `sda`/`sdc` Samsung SSD 860 and `sdb` Samsung
+SSD 850, all `TRAN=sata`, `ROTA=0`. The bench root and the deployed data root
+are both on `/` (`ubuntu--vg--1-ubuntu--lv`, ext4, backed by `sda`), so this is
+the operator-attested SATA reference host again
+(`hardware_qualification.qualified=true`, policy
+`operator_attested_reference_host`). The live `snapstore-server` was stopped
+for the whole run and CI on the self-hosted runner was idle. No tuning runs
+were made (no NVMe; the operator did not request SATA tuning).
+
+| Reference-host input | Measured |
+|---|---:|
+| fio sequential write, 1 MiB direct | 437.92 MB/s |
+| fio sequential read, 1 MiB direct | 494.33 MB/s |
+| fio random 70/30 read/write, 4 KiB direct | 20,657.7 / 8,886.9 IOPS |
+| `page_channel_fallback` | 50/50 green |
+
+| Counted M5 row | Architecture target | Measured | Disposition |
+|---|---:|---:|---|
+| PUT_BATCH warm sustained | >= 1.5 GB/s | 0.859 GB/s | miss (accepted floor, operator decision 2026-09-17) |
+| GET_BATCH warm sustained | >= 2.5 GB/s | 0.571 GB/s | miss (accepted floor, operator decision 2026-09-17) |
+| 16 x 8 MiB commit p99 | < 40 ms | 1,185.02 ms | miss (accepted floor, operator decision 2026-09-17) |
+| 16-client aggregate | >= 1.2 GB/s | 0.166 GB/s | miss (accepted floor, operator decision 2026-09-17) |
+| CreateNode + 16 KiB log p50 | < 1.5 ms | 7.634 ms | miss (accepted floor, operator decision 2026-09-17) |
+| UpdateNodes(256) p50 | < 3 ms | 15.666 ms | miss (accepted floor, operator decision 2026-09-17) |
+
+| Counted M7 row | Target | Measured | Disposition |
+|---|---:|---:|---|
+| Reclaiming cycle | < 60 s | 1,486.996 s | miss (accepted floor, operator decision 2026-09-17) |
+| Nodes reaped | 50,000 | 50,000 | met |
+| Garbage reclaimed | predicted 3,900,000 pages / 15.974 GB | 3,878,811 pages / 16.031 GB | met within the harness tolerance |
+| Commit ingest during reclaim | >= 200 MB/s | 111.050 MB/s | miss (accepted floor, operator decision 2026-09-17) |
+| Commit p99 during reclaim | < 2 x 401.359 ms idle | 3,527.673 ms | miss (accepted floor, operator decision 2026-09-17) |
+| Commit errors | 0 | 0 across 19,690 reclaim samples | met |
+
+The misses stay failures in `evidence.json`; none is rewritten as a pass.
+Relative to 2026-07-11 the transport rows roughly doubled (PUT 0.397 -> 0.859
+GB/s, GET 0.287 -> 0.571 GB/s) and idle commit p99 improved (622 -> 401 ms),
+while the reclaiming cycle is unchanged within noise (1,435 -> 1,487 s): GC
+remains bound by the SATA device, not by code that changed since July.
+
+Provenance note: the M5/M7 `results.json` files were first written under
+`crates/snapstore-server/target/...` because the script passed a relative
+evidence path to test binaries whose cwd is the crate directory. They were
+moved into the evidence root unchanged and `evidence.json` was re-assembled;
+the pre-relocation assembly is kept at
+`raw/evidence-before-results-relocation.json`. The script now resolves the
+evidence root to an absolute path.

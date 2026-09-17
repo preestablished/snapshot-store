@@ -24,6 +24,11 @@ RUN_FLAKE_50X="${RUN_FLAKE_50X:-0}"
 RUN_FIO="${RUN_FIO:-1}"
 OVERALL_STATUS=0
 
+# Absolute: cargo runs test binaries with the crate directory as cwd, so a
+# relative SNAPSTORE_*_BENCH_JSON path would land under crates/<crate>/.
+mkdir -p "$EVIDENCE_ROOT"
+EVIDENCE_ROOT="$(cd "$EVIDENCE_ROOT" && pwd -P)"
+
 mkdir -p \
   "$EVIDENCE_ROOT/hardware" \
   "$EVIDENCE_ROOT/logs" \
