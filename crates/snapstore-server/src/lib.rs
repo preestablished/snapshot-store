@@ -7,6 +7,9 @@
 /// Single re-export seam: when control-plane fulfils the
 /// adopt-snapstore-proto-v1 request, this module body swaps to a re-export
 /// of the published crate and nothing else changes (phase-2 plan, risk 2).
+// tonic codegen returns `Result<_, tonic::Status>`; the lint fires inside the
+// generated server traits, which we cannot edit.
+#[allow(clippy::result_large_err)]
 pub mod snapstore_proto {
     tonic::include_proto!("determinism.snapstore.v1");
 }

@@ -240,7 +240,7 @@ impl PageChannelClient {
                     }
                     let pages_for_this_reply: Vec<(u64, Vec<u8>)> = echoed
                         .iter()
-                        .zip(all.chunks_exact(PAGE_SIZE))
+                        .zip(all.as_chunks::<PAGE_SIZE>().0)
                         .map(|(req, page)| (req.dst_slot, page.to_vec()))
                         .collect();
                     reply_pages.insert(hdr.seq, pages_for_this_reply);

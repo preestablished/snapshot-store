@@ -396,10 +396,7 @@ fn handle_put_batch(
     };
     let buf: &[u8] = &mapped;
 
-    let page_refs: Vec<&[u8; PAGE_SIZE]> = buf
-        .chunks_exact(PAGE_SIZE)
-        .map(|c| <&[u8; PAGE_SIZE]>::try_from(c).unwrap())
-        .collect();
+    let page_refs: Vec<&[u8; PAGE_SIZE]> = buf.as_chunks::<PAGE_SIZE>().0.iter().collect();
 
     // Ingest via PageStore (hashes internally with rayon).
     let outcomes = match page_store.ingest(&page_refs) {

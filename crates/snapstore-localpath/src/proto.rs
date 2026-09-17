@@ -336,7 +336,7 @@ fn decode_get_reqs(hdr: &PcHdr, body: &[u8], ctx: &'static str) -> Result<Vec<Ge
         });
     }
     let mut reqs = Vec::with_capacity(hdr.count as usize);
-    for chunk in body.chunks_exact(GET_REQ_SIZE) {
+    for chunk in body.as_chunks::<GET_REQ_SIZE>().0 {
         reqs.push(GetReq {
             page_hash: PageHash::from_bytes(chunk[0..32].try_into().unwrap()),
             dst_slot: u64::from_le_bytes(chunk[32..40].try_into().unwrap()),
